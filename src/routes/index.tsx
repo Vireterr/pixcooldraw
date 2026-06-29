@@ -441,7 +441,10 @@ function Index() {
       setRecordProgress((i + 1) / total);
     }
     gif.finish();
-    const blob = new Blob([gif.bytesView()], { type: "image/gif" });
+    const bytes = gif.bytesView();
+    const buf = new Uint8Array(bytes.byteLength);
+    buf.set(bytes);
+    const blob = new Blob([buf.buffer], { type: "image/gif" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
