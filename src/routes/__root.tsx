@@ -77,14 +77,18 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "Lovable App" },
-      { name: "description", content: "Lovable Generated Project" },
+      { title: "Drawup" },
+      { name: "description", content: "Pixel Brush Studio is a drawing application for creating art with dynamic brushes and animated pixels." },
       { name: "author", content: "Lovable" },
-      { property: "og:title", content: "Lovable App" },
-      { property: "og:description", content: "Lovable Generated Project" },
+      { property: "og:title", content: "Drawup" },
+      { property: "og:description", content: "Pixel Brush Studio is a drawing application for creating art with dynamic brushes and animated pixels." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary" },
       { name: "twitter:site", content: "@Lovable" },
+      { name: "twitter:title", content: "Drawup" },
+      { name: "twitter:description", content: "Pixel Brush Studio is a drawing application for creating art with dynamic brushes and animated pixels." },
+      { property: "og:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/3b86d1c5-0345-416d-859d-5c524d830c98/id-preview-e64f4ef1--727ef357-55c4-49f1-a7d6-1a1646d68d2c.lovable.app-1782738717889.png" },
+      { name: "twitter:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/3b86d1c5-0345-416d-859d-5c524d830c98/id-preview-e64f4ef1--727ef357-55c4-49f1-a7d6-1a1646d68d2c.lovable.app-1782738717889.png" },
     ],
     links: [
       {
