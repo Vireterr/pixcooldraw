@@ -179,6 +179,7 @@ function Index() {
   const [recordProgress, setRecordProgress] = useState(0);
   const [gifQ, setGifQ] = useState<GifQ>("medium");
   const [mp4Q, setMp4Q] = useState<Mp4Q>("medium");
+  const [zoom, setZoom] = useState(1);
 
   const refs = {
     brush: useRef(brush), mode: useRef(mode), hue: useRef(hue), size: useRef(size),
@@ -264,80 +265,98 @@ function Index() {
     const pts = s.points;
 
     if (s.kind === "ink") {
-      // Simple animated line: smooth path with gentle wave breathing along it
+      // Pixelated animated line — pixel dots along smooth path with breathing thickness
       if (!s.ink) s.ink = { phase: Math.random() * 100 };
       s.ink.phase += dt * 0.002;
+      const grid = Math.max(2, Math.round(s.size / 8));
       const hueI = (s.hue + modeHueShift) % 360;
-      const lw = s.size * (0.5 + s.intensity * 0.6) * modePulse;
-      ctx.lineCap = "round";
-      ctx.lineJoin = "round";
-      // Soft outer glow
-      ctx.strokeStyle = `hsla(${hueI}, 80%, 55%, ${alphaMul * 0.25})`;
-      ctx.lineWidth = lw * 2.2 * modeSpray;
-      drawSmoothPath(ctx, pts, s.ink.phase, s.size * 0.15 * s.dynamics, s.noise);
-      // Core line
-      ctx.strokeStyle = `hsla(${hueI}, 85%, 65%, ${alphaMul})`;
-      ctx.lineWidth = lw;
-      drawSmoothPath(ctx, pts, s.ink.phase, s.size * 0.15 * s.dynamics, s.noise);
-      // Highlight
-      ctx.strokeStyle = `hsla(${hueI}, 100%, 85%, ${alphaMul * 0.55})`;
-      ctx.lineWidth = Math.max(1, lw * 0.35);
-      drawSmoothPath(ctx, pts, s.ink.phase, s.size * 0.15 * s.dynamics, s.noise);
+      const thickness = Math.max(grid, s.size * (0.45 + s.intensity * 0.55) * modePulse * modeSpray);
+      const half = thickness / 2;
+      const phaseI = s.ink.phase;
+      for (let i = 0; i < pts.length - 1; i++) {
+        const p = pts[i], nxt = pts[i + 1];
+        const dx = nxt.x - p.x, dy = nxt.y - p.y;
+        const len = Math.hypot(dx, dy) || 1;
+        const nx = -dy / len, ny = dx / len;
+        const num = Math.max(1, Math.floor(len / grid));
+        for (let k = 0; k <= num; k++) {
+          const f = k / num;
+          const cx = p.x + dx * f, cy = p.y + dy * f;
+          const wob = Math.sin((i + f) * 0.3 + phaseI * 6) * s.size * 0.12 * s.dynamics
+                    + hash(i + f + phaseI * 10) * s.noise * grid * 2;
+          for (let t2 = -half; t2 <= half; t2 += grid) {
+            const gx = Math.round((cx + nx * (t2 + wob)) / grid) * grid;
+            const gy = Math.round((cy + ny * (t2 + wob)) / grid) * grid;
+            const edge = 1 - Math.abs(t2) / (half + 1);
+            const l = 55 + edge * 25;
+            ctx.fillStyle = `hsla(${hueI}, 85%, ${l}%, ${alphaMul * edge})`;
+            ctx.fillRect(gx, gy, grid, grid);
+          }
+        }
+      }
     }
 
     else if (s.kind === "ribbon") {
-      const passes = Math.max(1, Math.floor(1 + s.density * 4));
+      const grid = Math.max(2, Math.round(s.size / 8));
+      const passes = Math.max(1, Math.floor(1 + s.density * 3));
       for (let pass = 0; pass < passes; pass++) {
         const phase = tt * 2 + pass * 0.7;
         const amp = s.size * 0.6 * (0.3 + s.dynamics) + Math.sin(tt + pass) * s.size * 0.2;
-        ctx.lineWidth = s.size * (0.15 + s.intensity * 0.4) * modePulse;
-        ctx.lineCap = "round";
-        ctx.lineJoin = "round";
         const hueR = (s.hue + pass * 20 + modeHueShift) % 360;
-        ctx.strokeStyle = `hsla(${hueR}, 100%, 65%, ${alphaMul * 0.55})`;
-        ctx.beginPath();
-        for (let i = 0; i < pts.length; i++) {
-          const p = pts[i];
-          const next = pts[i + 1] || p;
-          const dx = next.x - p.x, dy = next.y - p.y;
+        ctx.fillStyle = `hsla(${hueR}, 100%, 65%, ${alphaMul * 0.75})`;
+        for (let i = 0; i < pts.length - 1; i++) {
+          const p = pts[i], nxt = pts[i + 1];
+          const dx = nxt.x - p.x, dy = nxt.y - p.y;
           const len = Math.hypot(dx, dy) || 1;
           const nx = -dy / len, ny = dx / len;
-          const wave = Math.sin(p.t * 3 + phase + i * 0.15) * amp + hash(i + tt) * s.noise * s.size * 0.5;
-          const x = p.x + nx * wave;
-          const y = p.y + ny * wave;
-          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+          const num = Math.max(1, Math.floor(len / grid));
+          for (let k = 0; k <= num; k++) {
+            const f = k / num;
+            const wave = Math.sin(p.t * 3 + phase + (i + f) * 0.15) * amp
+                       + hash(i + f + tt) * s.noise * s.size * 0.5;
+            const gx = Math.round((p.x + dx * f + nx * wave) / grid) * grid;
+            const gy = Math.round((p.y + dy * f + ny * wave) / grid) * grid;
+            ctx.fillRect(gx, gy, grid, grid);
+          }
         }
-        ctx.stroke();
       }
     }
 
     else if (s.kind === "lightning") {
+      const grid = Math.max(2, Math.round(s.size / 6));
       const arcs = Math.max(1, Math.floor(1 + s.density * 5));
-      ctx.globalCompositeOperation = "lighter";
       const hueL = (s.hue + modeHueShift) % 360;
-      ctx.shadowColor = `hsl(${hueL}, 100%, 70%)`;
-      ctx.shadowBlur = 12 * s.intensity;
-      ctx.strokeStyle = `hsla(${hueL}, 100%, 80%, ${alphaMul})`;
-      ctx.lineWidth = 1 + s.intensity * 2;
+      const coreCol = `hsla(${hueL}, 100%, 82%, ${alphaMul})`;
+      const glowCol = `hsla(${hueL}, 100%, 60%, ${alphaMul * 0.45})`;
       for (let a = 0; a < arcs; a++) {
         if (Math.random() > 0.3 + s.intensity * 0.6) continue;
         const i0 = Math.floor(Math.random() * pts.length);
         const i1 = Math.min(pts.length - 1, i0 + 1 + Math.floor(Math.random() * (5 + s.dynamics * 30)));
         const p0 = pts[i0], p1 = pts[i1];
         const segs = 6 + Math.floor(s.dynamics * 10);
-        ctx.beginPath();
-        ctx.moveTo(p0.x, p0.y);
-        for (let i = 1; i < segs; i++) {
+        let ppx = p0.x, ppy = p0.y;
+        for (let i = 1; i <= segs; i++) {
           const f = i / segs;
-          const x = p0.x + (p1.x - p0.x) * f + (Math.random() - 0.5) * s.size * (0.5 + s.noise * 1.5);
-          const y = p0.y + (p1.y - p0.y) * f + (Math.random() - 0.5) * s.size * (0.5 + s.noise * 1.5);
-          ctx.lineTo(x, y);
+          const nxx = p0.x + (p1.x - p0.x) * f + (Math.random() - 0.5) * s.size * (0.5 + s.noise * 1.5);
+          const nyy = p0.y + (p1.y - p0.y) * f + (Math.random() - 0.5) * s.size * (0.5 + s.noise * 1.5);
+          const ddx = nxx - ppx, ddy = nyy - ppy;
+          const dlen = Math.hypot(ddx, ddy) || 1;
+          const num = Math.max(1, Math.floor(dlen / grid));
+          for (let k = 0; k <= num; k++) {
+            const f2 = k / num;
+            const gx = Math.round((ppx + ddx * f2) / grid) * grid;
+            const gy = Math.round((ppy + ddy * f2) / grid) * grid;
+            ctx.fillStyle = glowCol;
+            ctx.fillRect(gx - grid, gy, grid, grid);
+            ctx.fillRect(gx + grid, gy, grid, grid);
+            ctx.fillRect(gx, gy - grid, grid, grid);
+            ctx.fillRect(gx, gy + grid, grid, grid);
+            ctx.fillStyle = coreCol;
+            ctx.fillRect(gx, gy, grid, grid);
+          }
+          ppx = nxx; ppy = nyy;
         }
-        ctx.lineTo(p1.x, p1.y);
-        ctx.stroke();
       }
-      ctx.shadowBlur = 0;
-      ctx.globalCompositeOperation = "source-over";
     }
 
     else if (s.kind === "pixelRain") {
@@ -616,38 +635,59 @@ function Index() {
     setRecording(null); setRecordProgress(0);
   };
 
+  // Render the full scene into an arbitrary context (used by export at full quality)
+  const renderScene = useCallback((tctx: CanvasRenderingContext2D, w: number, h: number, now: number, dtRaw: number) => {
+    tctx.fillStyle = "#080a12";
+    tctx.fillRect(0, 0, w, h);
+    const t = now / 1000;
+    for (const layer of layersRef.current) {
+      if (!layer.visible) continue;
+      for (const s of layer.strokes) {
+        if (s.points.length === 0) continue;
+        renderStroke(tctx, s, w, h, t, dtRaw, now);
+      }
+    }
+  }, []);
+
   const exportGif = async () => {
-    const c = canvasRef.current;
-    if (!c || recording) return;
+    if (recording) return;
     const preset = GIF_PRESETS[gifQ];
     setRecording("gif"); setRecordProgress(0);
-    const fps = preset.fps, seconds = preset.sec, total = fps * seconds;
-    const gifW = Math.min(preset.w, canvasSize.w);
-    const gifH = Math.round(canvasSize.h * (gifW / canvasSize.w));
-    const tmp = document.createElement("canvas");
-    tmp.width = gifW; tmp.height = gifH;
-    const tctx = tmp.getContext("2d", { willReadFrequently: true })!;
-    const gif = GIFEncoder();
-    const delay = Math.round(1000 / fps);
-    for (let i = 0; i < total; i++) {
-      await new Promise(requestAnimationFrame);
-      tctx.drawImage(c, 0, 0, gifW, gifH);
-      const data = tctx.getImageData(0, 0, gifW, gifH).data;
-      const palette = quantize(data, 256);
-      const index = applyPalette(data, palette);
-      gif.writeFrame(index, gifW, gifH, { palette, delay });
-      setRecordProgress((i + 1) / total);
+    try {
+      const fps = preset.fps, seconds = preset.sec, total = fps * seconds;
+      const gifW = Math.min(preset.w, canvasSize.w);
+      const gifH = Math.round(canvasSize.h * (gifW / canvasSize.w));
+      const tmp = document.createElement("canvas");
+      tmp.width = gifW; tmp.height = gifH;
+      const tctx = tmp.getContext("2d", { willReadFrequently: true })!;
+      tctx.setTransform(gifW / canvasSize.w, 0, 0, gifH / canvasSize.h, 0, 0);
+      const gif = GIFEncoder();
+      const delay = Math.round(1000 / fps);
+      const dtRaw = 1000 / fps;
+      const startNow = performance.now();
+      for (let i = 0; i < total; i++) {
+        renderScene(tctx, canvasSize.w, canvasSize.h, startNow + i * dtRaw, dtRaw);
+        const data = tctx.getImageData(0, 0, gifW, gifH).data;
+        const palette = quantize(data, 256);
+        const index = applyPalette(data, palette);
+        gif.writeFrame(index, gifW, gifH, { palette, delay });
+        setRecordProgress((i + 1) / total);
+        if ((i & 3) === 0) await new Promise(r => setTimeout(r, 0));
+      }
+      gif.finish();
+      const bytes = gif.bytesView();
+      const buf = new Uint8Array(bytes.byteLength); buf.set(bytes);
+      const blob = new Blob([buf], { type: "image/gif" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `living-pixels-${Date.now()}.gif`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+      // free encoder memory
+      (gif as unknown as { bytes?: () => Uint8Array }).bytes?.();
+    } finally {
+      setRecording(null); setRecordProgress(0);
     }
-    gif.finish();
-    const bytes = gif.bytesView();
-    const buf = new Uint8Array(bytes.byteLength); buf.set(bytes);
-    const blob = new Blob([buf.buffer], { type: "image/gif" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = `living-pixels-${Date.now()}.gif`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    setRecording(null); setRecordProgress(0);
   };
 
   // Keyboard: Ctrl+Z / Ctrl+Shift+Z
@@ -801,16 +841,31 @@ function Index() {
       </aside>
 
       {/* Canvas area */}
-      <div ref={wrapRef} className="relative flex flex-1 items-center justify-center overflow-hidden p-4">
-        <canvas
-          ref={canvasRef}
-          onPointerDown={onDown}
-          onPointerMove={onMove}
-          onPointerUp={onUp}
-          onPointerCancel={onUp}
-          style={{ aspectRatio: `${canvasSize.w} / ${canvasSize.h}` }}
-          className="block max-h-full max-w-full touch-none rounded-lg border border-white/10 bg-[#080a12] shadow-2xl cursor-crosshair"
-        />
+      <div
+        ref={wrapRef}
+        onWheel={(e) => {
+          if (!(e.ctrlKey || e.metaKey)) return;
+          e.preventDefault();
+          setZoom((z) => Math.min(6, Math.max(0.1, z * (e.deltaY < 0 ? 1.1 : 1 / 1.1))));
+        }}
+        className="relative flex flex-1 items-center justify-center overflow-auto p-4"
+      >
+        <div style={{ width: canvasSize.w * zoom, height: canvasSize.h * zoom }} className="flex items-center justify-center">
+          <canvas
+            ref={canvasRef}
+            onPointerDown={onDown}
+            onPointerMove={onMove}
+            onPointerUp={onUp}
+            onPointerCancel={onUp}
+            style={{ width: canvasSize.w * zoom, height: canvasSize.h * zoom, imageRendering: "pixelated" }}
+            className="block touch-none rounded-lg border border-white/10 bg-[#080a12] shadow-2xl cursor-crosshair"
+          />
+        </div>
+        <div className="pointer-events-none absolute bottom-3 right-3 flex items-center gap-1 rounded-md border border-white/10 bg-black/60 p-1 text-[11px] backdrop-blur">
+          <button onClick={() => setZoom((z) => Math.max(0.1, z / 1.2))} className="pointer-events-auto rounded px-2 py-0.5 hover:bg-white/10">−</button>
+          <button onClick={() => setZoom(1)} className="pointer-events-auto rounded px-2 py-0.5 tabular-nums hover:bg-white/10">{Math.round(zoom * 100)}%</button>
+          <button onClick={() => setZoom((z) => Math.min(6, z * 1.2))} className="pointer-events-auto rounded px-2 py-0.5 hover:bg-white/10">+</button>
+        </div>
       </div>
     </main>
   );
