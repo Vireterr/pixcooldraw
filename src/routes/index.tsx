@@ -5,8 +5,8 @@ import { GIFEncoder, quantize, applyPalette } from "gifenc";
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "Living Pixels — Animated Brush Studio" },
-      { name: "description", content: "Draw with living animated brushes, layers, undo/redo and quality export to GIF/MP4." },
+      { title: "Living Pixels — Infinite Animated Brush Studio" },
+      { name: "description", content: "Infinite canvas with pan, zoom, touch drawing, image import, draggable layers and animated brushes." },
     ],
   }),
   component: Index,
@@ -38,9 +38,15 @@ interface Stroke {
   dynamics: number;
   points: StrokePoint[];
   born: number;
-  // transient per-brush buckets (not serialized in history)
+  originY?: number; // used by pixelRain for infinite canvas culling
   ink?: { phase: number };
-  rain?: { x: number; y: number; vy: number; hue: number; len: number; seed: number }[];
+  rain?: { x: number; y: number; vy: number; hue: number; len: number; seed: number; spawnY: number }[];
+}
+
+interface ImageItem {
+  id: number;
+  src: string;      // data URL
+  x: number; y: number; w: number; h: number;
 }
 
 interface Layer {
@@ -48,6 +54,7 @@ interface Layer {
   name: string;
   visible: boolean;
   strokes: Stroke[];
+  images: ImageItem[];
 }
 
 const BRUSHES: { id: BrushKind; label: string }[] = [
@@ -82,8 +89,10 @@ const MP4_PRESETS = {
 } as const;
 type Mp4Q = keyof typeof MP4_PRESETS;
 
-const HISTORY_LIMIT = 60;
+const HISTORY_LIMIT = 40;
 const MAX_POINTS_PER_STROKE = 600;
+const MIN_ZOOM = 0.1;
+const MAX_ZOOM = 8;
 
 function hash(n: number) {
   n = (n << 13) ^ n;
@@ -92,8 +101,8 @@ function hash(n: number) {
 
 let strokeIdCounter = 0;
 let layerIdCounter = 0;
+let imageIdCounter = 0;
 
-// Strip transient fields for history snapshots
 function serializeLayers(layers: Layer[]): string {
   return JSON.stringify(layers.map(l => ({
     id: l.id, name: l.name, visible: l.visible,
@@ -101,30 +110,48 @@ function serializeLayers(layers: Layer[]): string {
       id: s.id, kind: s.kind, mode: s.mode, size: s.size, hue: s.hue,
       speed: s.speed, density: s.density, noise: s.noise,
       intensity: s.intensity, dynamics: s.dynamics,
-      points: s.points, born: s.born,
+      points: s.points, born: s.born, originY: s.originY,
     })),
+    images: l.images,
   })));
 }
 function deserializeLayers(str: string): Layer[] {
-  return JSON.parse(str) as Layer[];
+  const parsed = JSON.parse(str) as Layer[];
+  return parsed.map(l => ({ ...l, images: l.images || [] }));
 }
 
 function Index() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
 
-  // canvas size config
-  const [canvasSize, setCanvasSize] = useState<{ w: number; h: number }>({ w: 1280, h: 800 });
+  // viewport (screen) size — canvas is fullscreen
+  const [viewport, setViewport] = useState({ w: 800, h: 600 });
+  // view (pan+zoom): screen = world * zoom + pan
+  const viewRef = useRef({ panX: 0, panY: 0, zoom: 1 });
+  const [zoomDisplay, setZoomDisplay] = useState(1);
 
   // layers
   const [layers, setLayers] = useState<Layer[]>(() => [{
-    id: ++layerIdCounter, name: "Слой 1", visible: true, strokes: [],
+    id: ++layerIdCounter, name: "Слой 1", visible: true, strokes: [], images: [],
   }]);
   const [activeLayerId, setActiveLayerId] = useState<number>(() => layerIdCounter);
   const layersRef = useRef(layers);
   const activeLayerIdRef = useRef(activeLayerId);
   useEffect(() => { layersRef.current = layers; }, [layers]);
   useEffect(() => { activeLayerIdRef.current = activeLayerId; }, [activeLayerId]);
+
+  // image bitmap cache
+  const imgCache = useRef<Map<string, HTMLImageElement>>(new Map());
+  const ensureImg = (src: string): HTMLImageElement | null => {
+    const c = imgCache.current;
+    let img = c.get(src);
+    if (!img) {
+      img = new Image();
+      img.src = src;
+      c.set(src, img);
+    }
+    return img.complete && img.naturalWidth ? img : null;
+  };
 
   // history
   const historyRef = useRef<string[]>([serializeLayers(layers)]);
@@ -164,7 +191,6 @@ function Index() {
   void historyVer;
 
   const currentStrokeRef = useRef<Stroke | null>(null);
-  const pointerRef = useRef({ x: 0, y: 0, down: false, px: 0, py: 0 });
 
   const [brush, setBrush] = useState<BrushKind>("ribbon");
   const [mode, setMode] = useState<ModeKind>("normal");
@@ -179,7 +205,8 @@ function Index() {
   const [recordProgress, setRecordProgress] = useState(0);
   const [gifQ, setGifQ] = useState<GifQ>("medium");
   const [mp4Q, setMp4Q] = useState<Mp4Q>("medium");
-  const [zoom, setZoom] = useState(1);
+  const [spaceDown, setSpaceDown] = useState(false);
+  const spaceRef = useRef(false);
 
   const refs = {
     brush: useRef(brush), mode: useRef(mode), hue: useRef(hue), size: useRef(size),
@@ -196,27 +223,38 @@ function Index() {
   useEffect(() => { refs.intensity.current = intensity; });
   useEffect(() => { refs.dynamics.current = dynamics; });
 
-  // resize canvas backing store to logical canvasSize
+  // resize canvas to viewport
+  useEffect(() => {
+    const onResize = () => {
+      const el = wrapRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      setViewport({ w: Math.max(100, Math.floor(r.width)), h: Math.max(100, Math.floor(r.height)) });
+    };
+    onResize();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
   useEffect(() => {
     const c = canvasRef.current;
     if (!c) return;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    c.width = canvasSize.w * dpr;
-    c.height = canvasSize.h * dpr;
-    c.getContext("2d")!.setTransform(dpr, 0, 0, dpr, 0, 0);
-  }, [canvasSize]);
+    c.width = viewport.w * dpr;
+    c.height = viewport.h * dpr;
+  }, [viewport]);
 
-  const eraseAt = useCallback((x: number, y: number, r: number) => {
+  const eraseAt = useCallback((wx: number, wy: number, r: number) => {
     const r2 = r * r;
     const id = activeLayerIdRef.current;
     const layer = layersRef.current.find(l => l.id === id);
     if (!layer) return;
     for (const s of layer.strokes) {
       s.points = s.points.filter(p => {
-        const dx = p.x - x, dy = p.y - y;
+        const dx = p.x - wx, dy = p.y - wy;
         return dx * dx + dy * dy > r2;
       });
-      if (s.rain) s.rain = s.rain.filter(i => (i.x - x) ** 2 + (i.y - y) ** 2 > r2);
+      if (s.rain) s.rain = s.rain.filter(i => (i.x - wx) ** 2 + (i.y - wy) ** 2 > r2);
     }
     layer.strokes = layer.strokes.filter(s => s.points.length > 0);
   }, []);
@@ -232,18 +270,43 @@ function Index() {
       const c = canvasRef.current;
       if (!c) { raf = requestAnimationFrame(tick); return; }
       const ctx = c.getContext("2d")!;
-      const w = canvasSize.w, h = canvasSize.h;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const vw = viewport.w, vh = viewport.h;
 
-      ctx.fillStyle = "#080a12";
-      ctx.fillRect(0, 0, w, h);
+      // background (in identity)
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = "#05060c";
+      ctx.fillRect(0, 0, vw, vh);
+
+      // dotted grid to convey infinite space
+      const view = viewRef.current;
+      const gridBase = 80;
+      let gridPx = gridBase * view.zoom;
+      let gridWorld = gridBase;
+      while (gridPx < 30) { gridPx *= 2; gridWorld *= 2; }
+      while (gridPx > 160) { gridPx /= 2; gridWorld /= 2; }
+      const startX = Math.floor(-view.panX / gridPx) * gridPx + (view.panX % gridPx);
+      const startY = Math.floor(-view.panY / gridPx) * gridPx + (view.panY % gridPx);
+      ctx.fillStyle = "rgba(255,255,255,0.05)";
+      for (let x = startX; x < vw; x += gridPx) {
+        for (let y = startY; y < vh; y += gridPx) {
+          ctx.fillRect(x, y, 1, 1);
+        }
+      }
+
+      // world transform
+      ctx.setTransform(dpr * view.zoom, 0, 0, dpr * view.zoom, dpr * view.panX, dpr * view.panY);
 
       const t = now / 1000;
-
       for (const layer of layersRef.current) {
         if (!layer.visible) continue;
+        for (const im of layer.images) {
+          const img = ensureImg(im.src);
+          if (img) ctx.drawImage(img, im.x, im.y, im.w, im.h);
+        }
         for (const s of layer.strokes) {
           if (s.points.length === 0) continue;
-          renderStroke(ctx, s, w, h, t, dtRaw, now);
+          renderStroke(ctx, s, t, dtRaw, now);
         }
       }
 
@@ -251,10 +314,9 @@ function Index() {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [canvasSize]);
+  }, [viewport]);
 
-  // === Stroke renderer ===
-  function renderStroke(ctx: CanvasRenderingContext2D, s: Stroke, w: number, h: number, t: number, dtRaw: number, now: number) {
+  function renderStroke(ctx: CanvasRenderingContext2D, s: Stroke, t: number, dtRaw: number, now: number) {
     const dt = dtRaw * (0.3 + s.speed * 2.4);
     const tt = t * (0.3 + s.speed * 2.4);
     const lifeMs = now - s.born;
@@ -265,7 +327,6 @@ function Index() {
     const pts = s.points;
 
     if (s.kind === "ink") {
-      // Pixelated animated line — pixel dots along smooth path with breathing thickness
       if (!s.ink) s.ink = { phase: Math.random() * 100 };
       s.ink.phase += dt * 0.002;
       const grid = Math.max(2, Math.round(s.size / 8));
@@ -295,7 +356,6 @@ function Index() {
         }
       }
     }
-
     else if (s.kind === "ribbon") {
       const grid = Math.max(2, Math.round(s.size / 8));
       const passes = Math.max(1, Math.floor(1 + s.density * 3));
@@ -321,7 +381,6 @@ function Index() {
         }
       }
     }
-
     else if (s.kind === "lightning") {
       const grid = Math.max(2, Math.round(s.size / 6));
       const arcs = Math.max(1, Math.floor(1 + s.density * 5));
@@ -358,7 +417,6 @@ function Index() {
         }
       }
     }
-
     else if (s.kind === "pixelRain") {
       const grid = Math.max(3, Math.round(s.size / 4));
       const target = Math.min(200, Math.floor(10 + s.density * 80));
@@ -372,27 +430,27 @@ function Index() {
           hue: s.hue + (Math.random() - 0.5) * 40,
           len: 3 + Math.floor(Math.random() * 8 * (0.3 + s.dynamics)),
           seed: Math.random() * 1000,
+          spawnY: p.y,
         });
       }
+      const fallLimit = 1400; // infinite canvas: cull by distance from spawn
       for (let i = s.rain.length - 1; i >= 0; i--) {
         const r = s.rain[i];
         r.y += r.vy * dt * 0.1;
         r.x += hash(tt + r.seed) * s.noise * 0.8;
-        if (r.y > h + 40) { s.rain.splice(i, 1); continue; }
+        if (r.y - r.spawnY > fallLimit) { s.rain.splice(i, 1); continue; }
         const hueP = (r.hue + modeHueShift) % 360;
         for (let k = 0; k < r.len; k++) {
           const a = alphaMul * (1 - k / r.len);
           ctx.fillStyle = `hsla(${hueP}, 95%, ${55 + k * 3}%, ${a})`;
-          ctx.fillRect(Math.round((r.x) / grid) * grid, Math.round((r.y - k * grid) / grid) * grid, grid, grid);
+          ctx.fillRect(Math.round(r.x / grid) * grid, Math.round((r.y - k * grid) / grid) * grid, grid, grid);
         }
       }
     }
-
     else if (s.kind === "pixelDither") {
       const grid = Math.max(4, Math.round(s.size / 4));
       const hueD = (s.hue + modeHueShift) % 360;
       const sweep = (tt * (0.5 + s.speed * 2)) % 1;
-      // Sample every Nth point for performance
       const step = Math.max(1, Math.floor(pts.length / 40));
       for (let pi = 0; pi < pts.length; pi += step) {
         const p = pts[pi];
@@ -415,7 +473,6 @@ function Index() {
         }
       }
     }
-
     else if (s.kind === "pixelGlitch") {
       const grid = Math.max(2, Math.round(s.size / 6));
       const hueG = (s.hue + modeHueShift) % 360;
@@ -444,70 +501,19 @@ function Index() {
     }
   }
 
-  function drawSmoothPath(ctx: CanvasRenderingContext2D, pts: StrokePoint[], phase: number, wobble: number, noiseAmt: number) {
-    if (pts.length < 2) {
-      if (pts.length === 1) {
-        ctx.beginPath();
-        ctx.arc(pts[0].x, pts[0].y, ctx.lineWidth / 2, 0, Math.PI * 2);
-        ctx.fillStyle = ctx.strokeStyle as string;
-        ctx.fill();
-      }
-      return;
-    }
-    ctx.beginPath();
-    for (let i = 0; i < pts.length; i++) {
-      const p = pts[i];
-      const next = pts[i + 1] || p;
-      const dx = next.x - p.x, dy = next.y - p.y;
-      const len = Math.hypot(dx, dy) || 1;
-      const nx = -dy / len, ny = dx / len;
-      const w = Math.sin(i * 0.3 + phase * 6) * wobble + hash(i + phase * 10) * noiseAmt * wobble * 0.5;
-      const x = p.x + nx * w;
-      const y = p.y + ny * w;
-      if (i === 0) ctx.moveTo(x, y);
-      else {
-        const prev = pts[i - 1];
-        const mx = (prev.x + p.x) / 2;
-        const my = (prev.y + p.y) / 2;
-        ctx.quadraticCurveTo(mx, my, x, y);
-      }
-    }
-    ctx.stroke();
-  }
-
-  // === Pointer ===
-  const getPoint = (e: React.PointerEvent) => {
-    const c = canvasRef.current!;
-    const r = c.getBoundingClientRect();
-    const sx = canvasSize.w / r.width;
-    const sy = canvasSize.h / r.height;
-    return { x: (e.clientX - r.left) * sx, y: (e.clientY - r.top) * sy };
+  // === Pointer / touch: pan + zoom + draw ===
+  const screenToWorld = (sx: number, sy: number) => {
+    const v = viewRef.current;
+    return { x: (sx - v.panX) / v.zoom, y: (sy - v.panY) / v.zoom };
   };
 
-  const addPoint = (x: number, y: number) => {
-    const s = currentStrokeRef.current;
-    if (!s) return;
-    const now = performance.now();
-    s.points.push({ x, y, t: (now - s.born) / 1000 });
-    if (s.mode === "mirror") {
-      s.points.push({ x: canvasSize.w - x, y, t: (now - s.born) / 1000 });
-    }
-    if (s.points.length > MAX_POINTS_PER_STROKE) {
-      // decimate: keep every other point from the older half
-      const half = Math.floor(MAX_POINTS_PER_STROKE / 2);
-      const old = s.points.slice(0, s.points.length - half);
-      const recent = s.points.slice(s.points.length - half);
-      const dec: StrokePoint[] = [];
-      for (let i = 0; i < old.length; i += 2) dec.push(old[i]);
-      s.points = dec.concat(recent);
-    }
-  };
+  const activePointers = useRef<Map<number, { x: number; y: number }>>(new Map());
+  const drawingPointerId = useRef<number | null>(null);
+  const panState = useRef<{ id: number; sx: number; sy: number; panX: number; panY: number } | null>(null);
+  const pinchState = useRef<{ dist: number; midX: number; midY: number; zoom: number; panX: number; panY: number } | null>(null);
+  const lastDrawScreen = useRef({ x: 0, y: 0 });
 
-  const onDown = (e: React.PointerEvent) => {
-    (e.target as Element).setPointerCapture(e.pointerId);
-    const { x, y } = getPoint(e);
-    pointerRef.current = { x, y, px: x, py: y, down: true };
-    if (refs.brush.current === "eraser") { eraseAt(x, y, refs.size.current); return; }
+  const beginStroke = (wx: number, wy: number) => {
     const layer = layersRef.current.find(l => l.id === activeLayerIdRef.current);
     if (!layer || !layer.visible) return;
     const stroke: Stroke = {
@@ -523,34 +529,192 @@ function Index() {
       dynamics: refs.dynamics.current,
       points: [],
       born: performance.now(),
+      originY: wy,
     };
     currentStrokeRef.current = stroke;
     layer.strokes.push(stroke);
-    addPoint(x, y);
+    addPoint(wx, wy);
   };
+
+  const addPoint = (x: number, y: number) => {
+    const s = currentStrokeRef.current;
+    if (!s) return;
+    const now = performance.now();
+    s.points.push({ x, y, t: (now - s.born) / 1000 });
+    if (s.mode === "mirror") {
+      // mirror around stroke origin X for infinite canvas
+      const ox = s.points[0].x;
+      s.points.push({ x: 2 * ox - x, y, t: (now - s.born) / 1000 });
+    }
+    if (s.points.length > MAX_POINTS_PER_STROKE) {
+      const half = Math.floor(MAX_POINTS_PER_STROKE / 2);
+      const old = s.points.slice(0, s.points.length - half);
+      const recent = s.points.slice(s.points.length - half);
+      const dec: StrokePoint[] = [];
+      for (let i = 0; i < old.length; i += 2) dec.push(old[i]);
+      s.points = dec.concat(recent);
+    }
+  };
+
+  const localPoint = (e: React.PointerEvent) => {
+    const r = canvasRef.current!.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  };
+
+  const onDown = (e: React.PointerEvent) => {
+    (e.target as Element).setPointerCapture(e.pointerId);
+    const local = localPoint(e);
+    activePointers.current.set(e.pointerId, local);
+
+    // If second pointer touches down, switch to pinch (cancel any stroke)
+    if (activePointers.current.size >= 2 && e.pointerType === "touch") {
+      if (drawingPointerId.current !== null) {
+        currentStrokeRef.current = null;
+        drawingPointerId.current = null;
+      }
+      const pts = [...activePointers.current.values()];
+      const dx = pts[0].x - pts[1].x, dy = pts[0].y - pts[1].y;
+      pinchState.current = {
+        dist: Math.hypot(dx, dy),
+        midX: (pts[0].x + pts[1].x) / 2,
+        midY: (pts[0].y + pts[1].y) / 2,
+        zoom: viewRef.current.zoom,
+        panX: viewRef.current.panX,
+        panY: viewRef.current.panY,
+      };
+      return;
+    }
+
+    // Pan modes: middle-mouse, space held, or explicit pan brush
+    const wantPan = (e.pointerType === "mouse" && e.button === 1) || spaceRef.current;
+    if (wantPan) {
+      panState.current = { id: e.pointerId, sx: local.x, sy: local.y, panX: viewRef.current.panX, panY: viewRef.current.panY };
+      return;
+    }
+
+    // Draw
+    if (refs.brush.current === "eraser") {
+      const w = screenToWorld(local.x, local.y);
+      eraseAt(w.x, w.y, refs.size.current);
+      drawingPointerId.current = e.pointerId;
+      lastDrawScreen.current = local;
+      return;
+    }
+    drawingPointerId.current = e.pointerId;
+    lastDrawScreen.current = local;
+    const w = screenToWorld(local.x, local.y);
+    beginStroke(w.x, w.y);
+  };
+
   const onMove = (e: React.PointerEvent) => {
-    const { x, y } = getPoint(e);
-    pointerRef.current.x = x; pointerRef.current.y = y;
-    if (!pointerRef.current.down) return;
-    if (refs.brush.current === "eraser") { eraseAt(x, y, refs.size.current); pointerRef.current.px = x; pointerRef.current.py = y; return; }
-    const px = pointerRef.current.px, py = pointerRef.current.py;
-    const dx = x - px, dy = y - py;
+    const local = localPoint(e);
+    if (!activePointers.current.has(e.pointerId)) return;
+    activePointers.current.set(e.pointerId, local);
+
+    if (pinchState.current && activePointers.current.size >= 2) {
+      const pts = [...activePointers.current.values()];
+      const dx = pts[0].x - pts[1].x, dy = pts[0].y - pts[1].y;
+      const dist = Math.hypot(dx, dy) || 1;
+      const midX = (pts[0].x + pts[1].x) / 2;
+      const midY = (pts[0].y + pts[1].y) / 2;
+      const ps = pinchState.current;
+      const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, ps.zoom * (dist / ps.dist)));
+      // Zoom about the initial midpoint, then translate for midpoint drift
+      const scale = newZoom / ps.zoom;
+      viewRef.current.zoom = newZoom;
+      viewRef.current.panX = ps.midX - (ps.midX - ps.panX) * scale + (midX - ps.midX);
+      viewRef.current.panY = ps.midY - (ps.midY - ps.panY) * scale + (midY - ps.midY);
+      setZoomDisplay(newZoom);
+      return;
+    }
+
+    if (panState.current && panState.current.id === e.pointerId) {
+      const ps = panState.current;
+      viewRef.current.panX = ps.panX + (local.x - ps.sx);
+      viewRef.current.panY = ps.panY + (local.y - ps.sy);
+      return;
+    }
+
+    if (drawingPointerId.current !== e.pointerId) return;
+    if (refs.brush.current === "eraser") {
+      const w = screenToWorld(local.x, local.y);
+      eraseAt(w.x, w.y, refs.size.current);
+      lastDrawScreen.current = local;
+      return;
+    }
+    // interpolate in screen space, convert to world
+    const px = lastDrawScreen.current.x, py = lastDrawScreen.current.y;
+    const dx = local.x - px, dy = local.y - py;
     const dist = Math.hypot(dx, dy);
     const steps = Math.max(1, Math.floor(dist / 5));
-    for (let i = 1; i <= steps; i++) addPoint(px + dx * (i / steps), py + dy * (i / steps));
-    pointerRef.current.px = x; pointerRef.current.py = y;
+    for (let i = 1; i <= steps; i++) {
+      const sx = px + dx * (i / steps), sy = py + dy * (i / steps);
+      const w = screenToWorld(sx, sy);
+      addPoint(w.x, w.y);
+    }
+    lastDrawScreen.current = local;
   };
-  const onUp = () => {
-    if (!pointerRef.current.down) return;
-    pointerRef.current.down = false;
-    currentStrokeRef.current = null;
-    pushHistory();
+
+  const onUp = (e: React.PointerEvent) => {
+    activePointers.current.delete(e.pointerId);
+    if (activePointers.current.size < 2) pinchState.current = null;
+    if (panState.current && panState.current.id === e.pointerId) panState.current = null;
+    if (drawingPointerId.current === e.pointerId) {
+      drawingPointerId.current = null;
+      if (currentStrokeRef.current) {
+        currentStrokeRef.current = null;
+        pushHistory();
+      } else if (refs.brush.current === "eraser") {
+        pushHistory();
+      }
+    }
   };
+
+  // Wheel: zoom about cursor (no Ctrl needed on trackpads), or Ctrl+wheel for mouse
+  const onWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    const r = canvasRef.current!.getBoundingClientRect();
+    const sx = e.clientX - r.left, sy = e.clientY - r.top;
+    if (e.ctrlKey || e.metaKey || Math.abs(e.deltaY) < 50) {
+      // pinch-zoom on trackpad reports ctrlKey; small deltas usually zoom smoothly
+      const factor = Math.exp(-e.deltaY * 0.01);
+      const v = viewRef.current;
+      const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, v.zoom * factor));
+      const scale = newZoom / v.zoom;
+      v.panX = sx - (sx - v.panX) * scale;
+      v.panY = sy - (sy - v.panY) * scale;
+      v.zoom = newZoom;
+      setZoomDisplay(newZoom);
+    } else {
+      // pan with two-finger scroll
+      viewRef.current.panX -= e.deltaX;
+      viewRef.current.panY -= e.deltaY;
+    }
+  };
+
+  // Space to pan
+  useEffect(() => {
+    const dn = (e: KeyboardEvent) => {
+      if (e.code === "Space" && !spaceRef.current) {
+        spaceRef.current = true;
+        setSpaceDown(true);
+      }
+      const meta = e.ctrlKey || e.metaKey;
+      if (meta && e.key.toLowerCase() === "z") { e.preventDefault(); if (e.shiftKey) redo(); else undo(); }
+      else if (meta && e.key.toLowerCase() === "y") { e.preventDefault(); redo(); }
+    };
+    const up = (e: KeyboardEvent) => {
+      if (e.code === "Space") { spaceRef.current = false; setSpaceDown(false); }
+    };
+    window.addEventListener("keydown", dn);
+    window.addEventListener("keyup", up);
+    return () => { window.removeEventListener("keydown", dn); window.removeEventListener("keyup", up); };
+  }, [undo, redo]);
 
   // === Layer ops ===
   const addLayer = () => {
     const id = ++layerIdCounter;
-    const next = [...layersRef.current, { id, name: `Слой ${layersRef.current.length + 1}`, visible: true, strokes: [] }];
+    const next = [...layersRef.current, { id, name: `Слой ${layersRef.current.length + 1}`, visible: true, strokes: [], images: [] }];
     layersRef.current = next;
     setLayers(next);
     setActiveLayerId(id);
@@ -570,32 +734,74 @@ function Index() {
     setLayers(next);
   };
   const clearActive = () => {
-    const next = layersRef.current.map(l => l.id === activeLayerIdRef.current ? { ...l, strokes: [] } : l);
+    const next = layersRef.current.map(l => l.id === activeLayerIdRef.current ? { ...l, strokes: [], images: [] } : l);
     layersRef.current = next;
     setLayers(next);
     pushHistory();
   };
   const clearAll = () => {
-    const next = layersRef.current.map(l => ({ ...l, strokes: [] }));
+    const next = layersRef.current.map(l => ({ ...l, strokes: [], images: [] }));
     layersRef.current = next;
     setLayers(next);
     pushHistory();
   };
-
-  // === New canvas ===
-  const [newW, setNewW] = useState(1280);
-  const [newH, setNewH] = useState(800);
-  const newCanvas = () => {
-    setCanvasSize({ w: newW, h: newH });
-    const layer: Layer = { id: ++layerIdCounter, name: "Слой 1", visible: true, strokes: [] };
-    const next = [layer];
+  const renameLayer = (id: number, name: string) => {
+    const next = layersRef.current.map(l => l.id === id ? { ...l, name } : l);
     layersRef.current = next;
     setLayers(next);
-    setActiveLayerId(layer.id);
-    historyRef.current = [serializeLayers(next)];
-    historyIdxRef.current = 0;
-    setHistoryVer(v => v + 1);
   };
+  const reorderLayers = (dragId: number, dropId: number) => {
+    if (dragId === dropId) return;
+    const arr = [...layersRef.current];
+    const fromIdx = arr.findIndex(l => l.id === dragId);
+    const toIdx = arr.findIndex(l => l.id === dropId);
+    if (fromIdx < 0 || toIdx < 0) return;
+    const [moved] = arr.splice(fromIdx, 1);
+    arr.splice(toIdx, 0, moved);
+    layersRef.current = arr;
+    setLayers(arr);
+    pushHistory();
+  };
+
+  const resetView = () => {
+    viewRef.current = { panX: 0, panY: 0, zoom: 1 };
+    setZoomDisplay(1);
+  };
+
+  // === Import images ===
+  const importFiles = (files: FileList | File[]) => {
+    const arr = Array.from(files).filter(f => f.type.startsWith("image/"));
+    for (const file of arr) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const src = reader.result as string;
+        const img = new Image();
+        img.onload = () => {
+          const maxDim = 800;
+          const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+          const w = img.width * scale, h = img.height * scale;
+          // Place at viewport center in world coords
+          const v = viewRef.current;
+          const cx = (viewport.w / 2 - v.panX) / v.zoom;
+          const cy = (viewport.h / 2 - v.panY) / v.zoom;
+          const image: ImageItem = { id: ++imageIdCounter, src, x: cx - w / 2, y: cy - h / 2, w, h };
+          imgCache.current.set(src, img);
+          const id = ++layerIdCounter;
+          const layer: Layer = { id, name: file.name.slice(0, 24), visible: true, strokes: [], images: [image] };
+          const next = [...layersRef.current, layer];
+          layersRef.current = next;
+          setLayers(next);
+          setActiveLayerId(id);
+          pushHistory();
+        };
+        img.src = src;
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [dragOver, setDragOver] = useState(false);
 
   // === Export ===
   const savePng = () => {
@@ -613,7 +819,7 @@ function Index() {
     const preset = MP4_PRESETS[mp4Q];
     const stream = c.captureStream(30);
     const mimes = ["video/mp4;codecs=avc1", "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
-    const mime = mimes.find(m => (window as any).MediaRecorder?.isTypeSupported?.(m)) || "video/webm";
+    const mime = mimes.find(m => (window as unknown as { MediaRecorder?: { isTypeSupported?: (m: string) => boolean } }).MediaRecorder?.isTypeSupported?.(m)) || "video/webm";
     const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: preset.bps });
     const chunks: Blob[] = [];
     rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
@@ -635,38 +841,41 @@ function Index() {
     setRecording(null); setRecordProgress(0);
   };
 
-  // Render the full scene into an arbitrary context (used by export at full quality)
-  const renderScene = useCallback((tctx: CanvasRenderingContext2D, w: number, h: number, now: number, dtRaw: number) => {
-    tctx.fillStyle = "#080a12";
-    tctx.fillRect(0, 0, w, h);
-    const t = now / 1000;
-    for (const layer of layersRef.current) {
-      if (!layer.visible) continue;
-      for (const s of layer.strokes) {
-        if (s.points.length === 0) continue;
-        renderStroke(tctx, s, w, h, t, dtRaw, now);
-      }
-    }
-  }, []);
-
   const exportGif = async () => {
     if (recording) return;
     const preset = GIF_PRESETS[gifQ];
     setRecording("gif"); setRecordProgress(0);
     try {
       const fps = preset.fps, seconds = preset.sec, total = fps * seconds;
-      const gifW = Math.min(preset.w, canvasSize.w);
-      const gifH = Math.round(canvasSize.h * (gifW / canvasSize.w));
+      const gifW = preset.w;
+      const gifH = Math.round(viewport.h * (gifW / viewport.w));
       const tmp = document.createElement("canvas");
       tmp.width = gifW; tmp.height = gifH;
       const tctx = tmp.getContext("2d", { willReadFrequently: true })!;
-      tctx.setTransform(gifW / canvasSize.w, 0, 0, gifH / canvasSize.h, 0, 0);
       const gif = GIFEncoder();
       const delay = Math.round(1000 / fps);
       const dtRaw = 1000 / fps;
       const startNow = performance.now();
+      const scaleX = gifW / viewport.w, scaleY = gifH / viewport.h;
+      const v = viewRef.current;
       for (let i = 0; i < total; i++) {
-        renderScene(tctx, canvasSize.w, canvasSize.h, startNow + i * dtRaw, dtRaw);
+        // render current viewport into tmp
+        tctx.setTransform(1, 0, 0, 1, 0, 0);
+        tctx.fillStyle = "#05060c";
+        tctx.fillRect(0, 0, gifW, gifH);
+        tctx.setTransform(scaleX * v.zoom, 0, 0, scaleY * v.zoom, scaleX * v.panX, scaleY * v.panY);
+        const t = (startNow + i * dtRaw) / 1000;
+        for (const layer of layersRef.current) {
+          if (!layer.visible) continue;
+          for (const im of layer.images) {
+            const img = ensureImg(im.src);
+            if (img) tctx.drawImage(img, im.x, im.y, im.w, im.h);
+          }
+          for (const s of layer.strokes) {
+            if (s.points.length === 0) continue;
+            renderStroke(tctx, s, t, dtRaw, startNow + i * dtRaw);
+          }
+        }
         const data = tctx.getImageData(0, 0, gifW, gifH).data;
         const palette = quantize(data, 256);
         const index = applyPalette(data, palette);
@@ -683,28 +892,10 @@ function Index() {
       a.href = url; a.download = `living-pixels-${Date.now()}.gif`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 1500);
-      // free encoder memory
-      (gif as unknown as { bytes?: () => Uint8Array }).bytes?.();
     } finally {
       setRecording(null); setRecordProgress(0);
     }
   };
-
-  // Keyboard: Ctrl+Z / Ctrl+Shift+Z
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const meta = e.ctrlKey || e.metaKey;
-      if (!meta) return;
-      if (e.key.toLowerCase() === "z") {
-        e.preventDefault();
-        if (e.shiftKey) redo(); else undo();
-      } else if (e.key.toLowerCase() === "y") {
-        e.preventDefault(); redo();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [undo, redo]);
 
   const ParamSlider = ({ label, value, set }: { label: string; value: number; set: (n: number) => void }) => (
     <label className="flex flex-col gap-1 text-[10px] uppercase tracking-widest text-white/50">
@@ -716,44 +907,72 @@ function Index() {
     </label>
   );
 
+  // drag & drop layer state
+  const draggingLayer = useRef<number | null>(null);
+  const [dragOverLayer, setDragOverLayer] = useState<number | null>(null);
+
+  const cursor = spaceDown || panState.current ? "grab" : brush === "eraser" ? "cell" : "crosshair";
+
   return (
     <main className="relative h-screen w-screen overflow-hidden bg-[#05060c] text-white flex">
       {/* Sidebar */}
       <aside className="z-20 flex h-full w-72 shrink-0 flex-col gap-3 overflow-y-auto border-r border-white/10 bg-black/70 p-3 backdrop-blur-xl">
         <div className="flex items-center justify-between">
-          <h1 className="select-none text-[11px] font-medium tracking-[0.3em] text-white/70">LIVING PIXELS</h1>
+          <h1 className="select-none text-[11px] font-medium tracking-[0.3em] text-white/70">LIVING PIXELS ∞</h1>
         </div>
 
-        {/* Undo / Redo */}
         <div className="flex gap-1.5">
           <button onClick={undo} disabled={!canUndo || !!recording} className="flex-1 rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/10 disabled:opacity-30">↶ Отменить</button>
           <button onClick={redo} disabled={!canRedo || !!recording} className="flex-1 rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/10 disabled:opacity-30">Вернуть ↷</button>
         </div>
 
-        {/* New canvas */}
+        {/* Import */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
-          <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Холст</div>
-          <div className="mb-2 flex items-center gap-1.5 text-[11px]">
-            <input type="number" min={64} max={4096} value={newW} onChange={(e) => setNewW(+e.target.value || 0)} className="w-full rounded border border-white/10 bg-black/40 px-1.5 py-1 text-white" />
-            <span className="text-white/40">×</span>
-            <input type="number" min={64} max={4096} value={newH} onChange={(e) => setNewH(+e.target.value || 0)} className="w-full rounded border border-white/10 bg-black/40 px-1.5 py-1 text-white" />
-          </div>
-          <button onClick={newCanvas} className="w-full rounded-md border border-white/15 bg-white/10 px-2 py-1.5 text-[11px] tracking-wider hover:bg-white/15">+ Новый холст</button>
-          <div className="mt-1.5 text-[9px] text-white/40">Текущий: {canvasSize.w}×{canvasSize.h}</div>
+          <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Импорт</div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            className="hidden"
+            onChange={(e) => { if (e.target.files) importFiles(e.target.files); e.target.value = ""; }}
+          />
+          <button onClick={() => fileInputRef.current?.click()} className="w-full rounded-md border border-white/15 bg-white/10 px-2 py-1.5 text-[11px] tracking-wider hover:bg-white/15">📁 Загрузить изображение</button>
+          <div className="mt-1.5 text-[9px] text-white/40">Или перетащите файлы на холст</div>
         </section>
 
-        {/* Layers */}
+        {/* Layers (draggable) */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-2 flex items-center justify-between">
-            <div className="text-[9px] uppercase tracking-widest text-white/40">Слои</div>
+            <div className="text-[9px] uppercase tracking-widest text-white/40">Слои (перетащи ⋮⋮)</div>
             <button onClick={addLayer} className="rounded border border-white/15 bg-white/10 px-2 py-0.5 text-[10px] hover:bg-white/20">+ Слой</button>
           </div>
           <ul className="flex flex-col gap-1">
             {[...layers].reverse().map((l) => (
-              <li key={l.id} className={`flex items-center gap-1.5 rounded-md border px-1.5 py-1 ${activeLayerId === l.id ? "border-white/40 bg-white/10" : "border-white/5 bg-transparent hover:bg-white/[0.04]"}`}>
+              <li
+                key={l.id}
+                draggable
+                onDragStart={() => { draggingLayer.current = l.id; }}
+                onDragEnd={() => { draggingLayer.current = null; setDragOverLayer(null); }}
+                onDragOver={(e) => { e.preventDefault(); setDragOverLayer(l.id); }}
+                onDragLeave={() => setDragOverLayer(prev => prev === l.id ? null : prev)}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const dragId = draggingLayer.current;
+                  if (dragId !== null) reorderLayers(dragId, l.id);
+                  setDragOverLayer(null);
+                }}
+                className={`flex items-center gap-1.5 rounded-md border px-1.5 py-1 ${activeLayerId === l.id ? "border-white/40 bg-white/10" : "border-white/5 bg-transparent hover:bg-white/[0.04]"} ${dragOverLayer === l.id ? "ring-1 ring-cyan-400/60" : ""}`}
+              >
+                <span className="cursor-grab text-white/30 select-none" title="Перетащить">⋮⋮</span>
                 <button onClick={() => toggleLayer(l.id)} className="text-[12px] leading-none text-white/70 hover:text-white" title="Видимость">{l.visible ? "👁" : "—"}</button>
-                <button onClick={() => setActiveLayerId(l.id)} className="flex-1 truncate text-left text-[11px]">{l.name}</button>
-                <span className="text-[9px] text-white/30">{l.strokes.length}</span>
+                <input
+                  value={l.name}
+                  onChange={(e) => renameLayer(l.id, e.target.value)}
+                  onFocus={() => setActiveLayerId(l.id)}
+                  className={`flex-1 min-w-0 bg-transparent text-[11px] outline-none ${activeLayerId === l.id ? "text-white" : "text-white/70"}`}
+                />
+                <span className="text-[9px] text-white/30">{l.strokes.length + l.images.length}</span>
                 <button onClick={() => removeLayer(l.id)} disabled={layers.length === 1} className="text-[11px] text-white/40 hover:text-red-400 disabled:opacity-20" title="Удалить">✕</button>
               </li>
             ))}
@@ -764,7 +983,6 @@ function Index() {
           </div>
         </section>
 
-        {/* Brushes */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Кисть</div>
           <div className="grid grid-cols-2 gap-1">
@@ -774,7 +992,6 @@ function Index() {
           </div>
         </section>
 
-        {/* Modes */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Режим</div>
           <div className="grid grid-cols-3 gap-1">
@@ -784,7 +1001,6 @@ function Index() {
           </div>
         </section>
 
-        {/* Size / Hue */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
           <label className="block text-[10px] uppercase tracking-widest text-white/50">
             <span className="mb-1 flex justify-between"><span>Размер</span><span className="text-white/80">{size}</span></span>
@@ -799,7 +1015,6 @@ function Index() {
           </label>
         </section>
 
-        {/* Params */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
           <div className="mb-1 text-[9px] uppercase tracking-widest text-white/40">Параметры</div>
           <ParamSlider label="Скорость" value={speed} set={setSpeed} />
@@ -809,7 +1024,6 @@ function Index() {
           <ParamSlider label="Динамика" value={dynamics} set={setDynamics} />
         </section>
 
-        {/* Export */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
           <div className="text-[9px] uppercase tracking-widest text-white/40">Экспорт</div>
           <button onClick={savePng} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">PNG</button>
@@ -837,34 +1051,67 @@ function Index() {
           </div>
         </section>
 
-        <div className="text-center text-[9px] text-white/30">Ctrl+Z / Ctrl+Shift+Z</div>
+        <div className="text-center text-[9px] leading-relaxed text-white/30">
+          Ctrl+Z / Shift+Ctrl+Z<br/>
+          Space + drag · Middle-click = pan<br/>
+          Wheel = zoom · Pinch on touch
+        </div>
       </aside>
 
-      {/* Canvas area */}
+      {/* Canvas area — infinite */}
       <div
         ref={wrapRef}
-        onWheel={(e) => {
-          if (!(e.ctrlKey || e.metaKey)) return;
-          e.preventDefault();
-          setZoom((z) => Math.min(6, Math.max(0.1, z * (e.deltaY < 0 ? 1.1 : 1 / 1.1))));
+        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(e) => {
+          e.preventDefault(); setDragOver(false);
+          if (e.dataTransfer?.files.length) importFiles(e.dataTransfer.files);
         }}
-        className="relative flex flex-1 items-center justify-center overflow-auto p-4"
+        className="relative flex-1 overflow-hidden"
       >
-        <div style={{ width: canvasSize.w * zoom, height: canvasSize.h * zoom }} className="flex items-center justify-center">
-          <canvas
-            ref={canvasRef}
-            onPointerDown={onDown}
-            onPointerMove={onMove}
-            onPointerUp={onUp}
-            onPointerCancel={onUp}
-            style={{ width: canvasSize.w * zoom, height: canvasSize.h * zoom, imageRendering: "pixelated" }}
-            className="block touch-none rounded-lg border border-white/10 bg-[#080a12] shadow-2xl cursor-crosshair"
-          />
-        </div>
+        <canvas
+          ref={canvasRef}
+          onPointerDown={onDown}
+          onPointerMove={onMove}
+          onPointerUp={onUp}
+          onPointerCancel={onUp}
+          onContextMenu={(e) => e.preventDefault()}
+          onWheel={onWheel}
+          style={{ width: viewport.w, height: viewport.h, cursor, touchAction: "none" }}
+          className="block select-none"
+        />
+        {dragOver && (
+          <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center bg-cyan-400/10 ring-2 ring-inset ring-cyan-400/60 text-cyan-200 text-sm tracking-widest">
+            ⬇ Отпустите изображения на холст
+          </div>
+        )}
         <div className="pointer-events-none absolute bottom-3 right-3 flex items-center gap-1 rounded-md border border-white/10 bg-black/60 p-1 text-[11px] backdrop-blur">
-          <button onClick={() => setZoom((z) => Math.max(0.1, z / 1.2))} className="pointer-events-auto rounded px-2 py-0.5 hover:bg-white/10">−</button>
-          <button onClick={() => setZoom(1)} className="pointer-events-auto rounded px-2 py-0.5 tabular-nums hover:bg-white/10">{Math.round(zoom * 100)}%</button>
-          <button onClick={() => setZoom((z) => Math.min(6, z * 1.2))} className="pointer-events-auto rounded px-2 py-0.5 hover:bg-white/10">+</button>
+          <button
+            onClick={() => {
+              const v = viewRef.current;
+              const sx = viewport.w / 2, sy = viewport.h / 2;
+              const nz = Math.max(MIN_ZOOM, v.zoom / 1.2);
+              const scale = nz / v.zoom;
+              v.panX = sx - (sx - v.panX) * scale;
+              v.panY = sy - (sy - v.panY) * scale;
+              v.zoom = nz; setZoomDisplay(nz);
+            }}
+            className="pointer-events-auto rounded px-2 py-0.5 hover:bg-white/10">−</button>
+          <button onClick={resetView} className="pointer-events-auto rounded px-2 py-0.5 tabular-nums hover:bg-white/10">{Math.round(zoomDisplay * 100)}%</button>
+          <button
+            onClick={() => {
+              const v = viewRef.current;
+              const sx = viewport.w / 2, sy = viewport.h / 2;
+              const nz = Math.min(MAX_ZOOM, v.zoom * 1.2);
+              const scale = nz / v.zoom;
+              v.panX = sx - (sx - v.panX) * scale;
+              v.panY = sy - (sy - v.panY) * scale;
+              v.zoom = nz; setZoomDisplay(nz);
+            }}
+            className="pointer-events-auto rounded px-2 py-0.5 hover:bg-white/10">+</button>
+        </div>
+        <div className="pointer-events-none absolute bottom-3 left-3 rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[10px] text-white/50 backdrop-blur">
+          Бесконечный холст · перетащите ⋮⋮ слои
         </div>
       </div>
     </main>
