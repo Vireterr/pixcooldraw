@@ -179,6 +179,7 @@ function Index() {
   const [recordProgress, setRecordProgress] = useState(0);
   const [gifQ, setGifQ] = useState<GifQ>("medium");
   const [mp4Q, setMp4Q] = useState<Mp4Q>("medium");
+  const [zoom, setZoom] = useState(1);
 
   const refs = {
     brush: useRef(brush), mode: useRef(mode), hue: useRef(hue), size: useRef(size),
