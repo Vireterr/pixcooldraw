@@ -634,38 +634,59 @@ function Index() {
     setRecording(null); setRecordProgress(0);
   };
 
+  // Render the full scene into an arbitrary context (used by export at full quality)
+  const renderScene = useCallback((tctx: CanvasRenderingContext2D, w: number, h: number, now: number, dtRaw: number) => {
+    tctx.fillStyle = "#080a12";
+    tctx.fillRect(0, 0, w, h);
+    const t = now / 1000;
+    for (const layer of layersRef.current) {
+      if (!layer.visible) continue;
+      for (const s of layer.strokes) {
+        if (s.points.length === 0) continue;
+        renderStroke(tctx, s, w, h, t, dtRaw, now);
+      }
+    }
+  }, []);
+
   const exportGif = async () => {
-    const c = canvasRef.current;
-    if (!c || recording) return;
+    if (recording) return;
     const preset = GIF_PRESETS[gifQ];
     setRecording("gif"); setRecordProgress(0);
-    const fps = preset.fps, seconds = preset.sec, total = fps * seconds;
-    const gifW = Math.min(preset.w, canvasSize.w);
-    const gifH = Math.round(canvasSize.h * (gifW / canvasSize.w));
-    const tmp = document.createElement("canvas");
-    tmp.width = gifW; tmp.height = gifH;
-    const tctx = tmp.getContext("2d", { willReadFrequently: true })!;
-    const gif = GIFEncoder();
-    const delay = Math.round(1000 / fps);
-    for (let i = 0; i < total; i++) {
-      await new Promise(requestAnimationFrame);
-      tctx.drawImage(c, 0, 0, gifW, gifH);
-      const data = tctx.getImageData(0, 0, gifW, gifH).data;
-      const palette = quantize(data, 256);
-      const index = applyPalette(data, palette);
-      gif.writeFrame(index, gifW, gifH, { palette, delay });
-      setRecordProgress((i + 1) / total);
+    try {
+      const fps = preset.fps, seconds = preset.sec, total = fps * seconds;
+      const gifW = Math.min(preset.w, canvasSize.w);
+      const gifH = Math.round(canvasSize.h * (gifW / canvasSize.w));
+      const tmp = document.createElement("canvas");
+      tmp.width = gifW; tmp.height = gifH;
+      const tctx = tmp.getContext("2d", { willReadFrequently: true })!;
+      tctx.setTransform(gifW / canvasSize.w, 0, 0, gifH / canvasSize.h, 0, 0);
+      const gif = GIFEncoder();
+      const delay = Math.round(1000 / fps);
+      const dtRaw = 1000 / fps;
+      const startNow = performance.now();
+      for (let i = 0; i < total; i++) {
+        renderScene(tctx, canvasSize.w, canvasSize.h, startNow + i * dtRaw, dtRaw);
+        const data = tctx.getImageData(0, 0, gifW, gifH).data;
+        const palette = quantize(data, 256);
+        const index = applyPalette(data, palette);
+        gif.writeFrame(index, gifW, gifH, { palette, delay });
+        setRecordProgress((i + 1) / total);
+        if ((i & 3) === 0) await new Promise(r => setTimeout(r, 0));
+      }
+      gif.finish();
+      const bytes = gif.bytesView();
+      const buf = new Uint8Array(bytes.byteLength); buf.set(bytes);
+      const blob = new Blob([buf], { type: "image/gif" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `living-pixels-${Date.now()}.gif`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+      // free encoder memory
+      (gif as unknown as { bytes?: () => Uint8Array }).bytes?.();
+    } finally {
+      setRecording(null); setRecordProgress(0);
     }
-    gif.finish();
-    const bytes = gif.bytesView();
-    const buf = new Uint8Array(bytes.byteLength); buf.set(bytes);
-    const blob = new Blob([buf.buffer], { type: "image/gif" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = `living-pixels-${Date.now()}.gif`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    setRecording(null); setRecordProgress(0);
   };
 
   // Keyboard: Ctrl+Z / Ctrl+Shift+Z
