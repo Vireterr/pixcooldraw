@@ -969,7 +969,7 @@ function Index() {
 
     interface CaptureCanvas extends HTMLCanvasElement { captureStream(fps?: number): MediaStream }
     const stream = (tmp as CaptureCanvas).captureStream(0);
-    const track = stream.getVideoTracks()[0] as MediaStreamVideoTrack & { requestFrame?: () => void };
+    const track = stream.getVideoTracks()[0] as MediaStreamTrack & { requestFrame?: () => void };
 
     const mimes = ["video/mp4;codecs=avc1", "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
     const isSupported = (m: string) => (window as unknown as { MediaRecorder?: { isTypeSupported?: (m: string) => boolean } }).MediaRecorder?.isTypeSupported?.(m) ?? false;
