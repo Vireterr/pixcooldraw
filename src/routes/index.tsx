@@ -19,11 +19,45 @@ type BrushKind =
   | "pixelRain"
   | "pixelDither"
   | "pixelGlitch"
+  | "gradient"
   | "eraser";
 
 type ModeKind = "normal" | "rainbow" | "pulse" | "spray" | "mirror";
 
+type Tool = "brush" | "select-rect" | "select-object" | "transform";
+
+type BlendMode =
+  | "source-over"
+  | "multiply" | "screen" | "overlay"
+  | "darken" | "lighten"
+  | "color-dodge" | "color-burn"
+  | "hard-light" | "soft-light"
+  | "difference" | "exclusion"
+  | "hue" | "saturation" | "color" | "luminosity";
+
+const BLEND_MODES: { id: BlendMode; label: string }[] = [
+  { id: "source-over", label: "Обычный" },
+  { id: "multiply", label: "Умножение" },
+  { id: "screen", label: "Экран" },
+  { id: "overlay", label: "Наложение" },
+  { id: "darken", label: "Темнее" },
+  { id: "lighten", label: "Светлее" },
+  { id: "color-dodge", label: "Осветл." },
+  { id: "color-burn", label: "Затемн." },
+  { id: "hard-light", label: "Жёсткий" },
+  { id: "soft-light", label: "Мягкий" },
+  { id: "difference", label: "Разница" },
+  { id: "exclusion", label: "Исключ." },
+  { id: "hue", label: "Тон" },
+  { id: "saturation", label: "Насыщ." },
+  { id: "color", label: "Цвет" },
+  { id: "luminosity", label: "Ярк." },
+];
+
 interface StrokePoint { x: number; y: number; t: number }
+
+interface GradientStop { offset: number; h: number; s: number; l: number; a: number }
+interface StrokeGradient { stops: GradientStop[]; angle: number; animate: boolean; speed: number }
 
 interface Stroke {
   id: number;
@@ -31,6 +65,7 @@ interface Stroke {
   mode: ModeKind;
   size: number;
   hue: number;
+  sat?: number; lit?: number; alpha?: number;
   speed: number;
   density: number;
   noise: number;
@@ -41,18 +76,22 @@ interface Stroke {
   originY?: number;
   ink?: { phase: number };
   rain?: { x: number; y: number; vy: number; hue: number; len: number; seed: number; spawnY: number }[];
+  gradient?: StrokeGradient;
 }
 
 interface ImageItem {
   id: number;
   src: string;
   x: number; y: number; w: number; h: number;
+  rotation?: number;
 }
 
 interface Layer {
   id: number;
   name: string;
   visible: boolean;
+  blendMode?: BlendMode;
+  opacity?: number;
   strokes: Stroke[];
   images: ImageItem[];
 }
@@ -64,6 +103,7 @@ const BRUSHES: { id: BrushKind; label: string }[] = [
   { id: "pixelRain", label: "Пикс. дождь" },
   { id: "pixelDither", label: "Дизеринг" },
   { id: "pixelGlitch", label: "Глитч" },
+  { id: "gradient", label: "Градиент" },
   { id: "eraser", label: "Ластик" },
 ];
 
@@ -83,6 +123,12 @@ const MAX_POINTS_PER_STROKE = 600;
 const MIN_ZOOM = 0.05;
 const MAX_ZOOM = 8;
 
+// Preset color swatches
+const PRESET_SWATCHES = [
+  "#ffffff", "#000000", "#f43f5e", "#f97316", "#eab308", "#22c55e",
+  "#06b6d4", "#3b82f6", "#8b5cf6", "#ec4899", "#a3a3a3", "#78716c",
+];
+
 function hash(n: number) {
   n = (n << 13) ^ n;
   return 1.0 - (((n * (n * n * 15731 + 789221) + 1376312589) & 0x7fffffff) / 1073741823.5);
@@ -92,24 +138,105 @@ let strokeIdCounter = 0;
 let layerIdCounter = 0;
 let imageIdCounter = 0;
 
+/* ---------- Color helpers ---------- */
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  s /= 100; l /= 100;
+  const k = (n: number) => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n: number) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  return [Math.round(f(0) * 255), Math.round(f(8) * 255), Math.round(f(4) * 255)];
+}
+function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+  const l = (mx + mn) / 2;
+  let h = 0, s = 0;
+  if (mx !== mn) {
+    const d = mx - mn;
+    s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+    switch (mx) {
+      case r: h = ((g - b) / d + (g < b ? 6 : 0)); break;
+      case g: h = ((b - r) / d + 2); break;
+      case b: h = ((r - g) / d + 4); break;
+    }
+    h *= 60;
+  }
+  return [Math.round(h), Math.round(s * 100), Math.round(l * 100)];
+}
+function toHex(h: number, s: number, l: number): string {
+  const [r, g, b] = hslToRgb(h, s, l);
+  const to = (n: number) => n.toString(16).padStart(2, "0");
+  return `#${to(r)}${to(g)}${to(b)}`;
+}
+function fromHex(hex: string): [number, number, number] | null {
+  const m = /^#?([a-f0-9]{6})$/i.exec(hex.trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return rgbToHsl((n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff);
+}
+
 function serializeLayers(layers: Layer[]): string {
   return JSON.stringify(layers.map(l => ({
     id: l.id, name: l.name, visible: l.visible,
+    blendMode: l.blendMode || "source-over",
+    opacity: l.opacity ?? 1,
     strokes: l.strokes.map(s => ({
       id: s.id, kind: s.kind, mode: s.mode, size: s.size, hue: s.hue,
+      sat: s.sat, lit: s.lit, alpha: s.alpha,
       speed: s.speed, density: s.density, noise: s.noise,
       intensity: s.intensity, dynamics: s.dynamics,
       points: s.points, born: s.born, originY: s.originY,
+      gradient: s.gradient,
     })),
     images: l.images,
   })));
 }
 function deserializeLayers(str: string): Layer[] {
   const parsed = JSON.parse(str) as Layer[];
-  return parsed.map(l => ({ ...l, images: l.images || [] }));
+  return parsed.map(l => ({
+    ...l,
+    blendMode: l.blendMode || "source-over",
+    opacity: l.opacity ?? 1,
+    images: l.images || [],
+  }));
 }
 
-// Renders one stroke into ctx (assumes ctx transform already in canvas-world space)
+/* ---------- Stroke bounding box + hit tests ---------- */
+function strokeBBox(s: Stroke) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of s.points) {
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+  }
+  const pad = s.size;
+  return { x: minX - pad, y: minY - pad, w: (maxX - minX) + pad * 2, h: (maxY - minY) + pad * 2 };
+}
+function rectIntersects(a: { x: number; y: number; w: number; h: number }, b: { x: number; y: number; w: number; h: number }) {
+  return !(a.x + a.w < b.x || b.x + b.w < a.x || a.y + a.h < b.y || b.y + b.h < a.y);
+}
+function pointInRect(px: number, py: number, r: { x: number; y: number; w: number; h: number }) {
+  return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+}
+function hitTestStroke(s: Stroke, x: number, y: number): boolean {
+  const bb = strokeBBox(s);
+  if (!pointInRect(x, y, bb)) return false;
+  const tol = s.size * 0.6 + 4;
+  for (let i = 0; i < s.points.length - 1; i++) {
+    const p = s.points[i], q = s.points[i + 1];
+    const dx = q.x - p.x, dy = q.y - p.y;
+    const L2 = dx * dx + dy * dy || 1;
+    let t = ((x - p.x) * dx + (y - p.y) * dy) / L2;
+    t = Math.max(0, Math.min(1, t));
+    const cx = p.x + dx * t, cy = p.y + dy * t;
+    if (Math.hypot(cx - x, cy - y) <= tol) return true;
+  }
+  if (s.points.length === 1) return Math.hypot(s.points[0].x - x, s.points[0].y - y) <= tol;
+  return false;
+}
+
+/* ---------- Stroke renderer ---------- */
 function renderStroke(ctx: CanvasRenderingContext2D, s: Stroke, t: number, dtRaw: number, now: number) {
   const dt = dtRaw * (0.3 + s.speed * 2.4);
   const tt = t * (0.3 + s.speed * 2.4);
@@ -117,7 +244,9 @@ function renderStroke(ctx: CanvasRenderingContext2D, s: Stroke, t: number, dtRaw
   const modeHueShift = s.mode === "rainbow" ? (lifeMs * 0.05) % 360 : 0;
   const modePulse = s.mode === "pulse" ? 0.6 + 0.5 * Math.sin(tt * 2) : 1;
   const modeSpray = s.mode === "spray" ? 2.2 : 1;
-  const alphaMul = (0.25 + s.intensity * 0.9) * modePulse;
+  const SAT = s.sat ?? 90;
+  const A_MUL = s.alpha ?? 1;
+  const alphaMul = (0.25 + s.intensity * 0.9) * modePulse * A_MUL;
   const pts = s.points;
 
   if (s.kind === "ink") {
@@ -143,8 +272,8 @@ function renderStroke(ctx: CanvasRenderingContext2D, s: Stroke, t: number, dtRaw
           const gx = Math.round((cx + nx * (t2 + wob)) / grid) * grid;
           const gy = Math.round((cy + ny * (t2 + wob)) / grid) * grid;
           const edge = 1 - Math.abs(t2) / (half + 1);
-          const l = 55 + edge * 25;
-          ctx.fillStyle = `hsla(${hueI}, 85%, ${l}%, ${alphaMul * edge})`;
+          const l = (s.lit ?? 55) + edge * 25;
+          ctx.fillStyle = `hsla(${hueI}, ${SAT}%, ${l}%, ${alphaMul * edge})`;
           ctx.fillRect(gx, gy, grid, grid);
         }
       }
@@ -157,7 +286,7 @@ function renderStroke(ctx: CanvasRenderingContext2D, s: Stroke, t: number, dtRaw
       const phase = tt * 2 + pass * 0.7;
       const amp = s.size * 0.6 * (0.3 + s.dynamics) + Math.sin(tt + pass) * s.size * 0.2;
       const hueR = (s.hue + pass * 20 + modeHueShift) % 360;
-      ctx.fillStyle = `hsla(${hueR}, 100%, 65%, ${alphaMul * 0.75})`;
+      ctx.fillStyle = `hsla(${hueR}, ${SAT}%, ${s.lit ?? 65}%, ${alphaMul * 0.75})`;
       for (let i = 0; i < pts.length - 1; i++) {
         const p = pts[i], nxt = pts[i + 1];
         const dx = nxt.x - p.x, dy = nxt.y - p.y;
@@ -179,8 +308,8 @@ function renderStroke(ctx: CanvasRenderingContext2D, s: Stroke, t: number, dtRaw
     const grid = Math.max(2, Math.round(s.size / 6));
     const arcs = Math.max(1, Math.floor(1 + s.density * 5));
     const hueL = (s.hue + modeHueShift) % 360;
-    const coreCol = `hsla(${hueL}, 100%, 82%, ${alphaMul})`;
-    const glowCol = `hsla(${hueL}, 100%, 60%, ${alphaMul * 0.45})`;
+    const coreCol = `hsla(${hueL}, ${SAT}%, ${s.lit ?? 82}%, ${alphaMul})`;
+    const glowCol = `hsla(${hueL}, ${SAT}%, ${(s.lit ?? 82) - 22}%, ${alphaMul * 0.45})`;
     for (let a = 0; a < arcs; a++) {
       if (Math.random() > 0.3 + s.intensity * 0.6) continue;
       const i0 = Math.floor(Math.random() * pts.length);
@@ -236,7 +365,7 @@ function renderStroke(ctx: CanvasRenderingContext2D, s: Stroke, t: number, dtRaw
       const hueP = (r.hue + modeHueShift) % 360;
       for (let k = 0; k < r.len; k++) {
         const a = alphaMul * (1 - k / r.len);
-        ctx.fillStyle = `hsla(${hueP}, 95%, ${55 + k * 3}%, ${a})`;
+        ctx.fillStyle = `hsla(${hueP}, ${SAT}%, ${55 + k * 3}%, ${a})`;
         ctx.fillRect(Math.round(r.x / grid) * grid, Math.round((r.y - k * grid) / grid) * grid, grid, grid);
       }
     }
@@ -261,7 +390,7 @@ function renderStroke(ctx: CanvasRenderingContext2D, s: Stroke, t: number, dtRaw
           if (dist > threshold) continue;
           if (Math.random() > 0.05 + s.density * 0.4) continue;
           const lit = 50 + (1 - dist) * 30;
-          ctx.fillStyle = `hsla(${hueD + (bayer ? 30 : 0)}, 95%, ${lit}%, ${alphaMul * (1 - dist)})`;
+          ctx.fillStyle = `hsla(${hueD + (bayer ? 30 : 0)}, ${SAT}%, ${lit}%, ${alphaMul * (1 - dist)})`;
           ctx.fillRect(gx, gy, grid, grid);
         }
       }
@@ -284,7 +413,7 @@ function renderStroke(ctx: CanvasRenderingContext2D, s: Stroke, t: number, dtRaw
         const offs = [-grid, 0, grid];
         const hues = [hueG % 360, (hueG + 120) % 360, (hueG + 240) % 360];
         for (let c2 = 0; c2 < 3; c2++) {
-          ctx.fillStyle = `hsla(${hues[c2]}, 100%, 55%, ${alphaMul * 0.55})`;
+          ctx.fillStyle = `hsla(${hues[c2]}, ${SAT}%, 55%, ${alphaMul * 0.55})`;
           for (let xb = 0; xb < widthLine; xb += grid) {
             if (Math.random() > 0.4 + s.intensity * 0.5) continue;
             ctx.fillRect(Math.round((x0 + xb + offs[c2]) / grid) * grid, y0, grid, grid);
@@ -293,10 +422,97 @@ function renderStroke(ctx: CanvasRenderingContext2D, s: Stroke, t: number, dtRaw
       }
     }
   }
+  else if (s.kind === "gradient") {
+    // Animated gradient stroke along the path
+    if (pts.length < 2) return;
+    const g = s.gradient || { stops: [
+      { offset: 0, h: s.hue, s: SAT, l: 55, a: 1 },
+      { offset: 1, h: (s.hue + 120) % 360, s: SAT, l: 60, a: 1 },
+    ], angle: 0, animate: true, speed: 0.4 };
+    const flow = g.animate ? (tt * g.speed) : 0;
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.lineWidth = s.size * modePulse * modeSpray;
+    const segLen = 40;
+    // integrate cumulative length
+    const cum: number[] = [0];
+    for (let i = 1; i < pts.length; i++) {
+      cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
+    }
+    const total = cum[cum.length - 1] || 1;
+    // draw sub-segments
+    let acc = 0;
+    let i = 1;
+    let prev = { x: pts[0].x, y: pts[0].y };
+    while (i < pts.length) {
+      const p = pts[i];
+      const dx = p.x - prev.x, dy = p.y - prev.y;
+      const d = Math.hypot(dx, dy);
+      if (d < segLen) { prev = p; acc += d; i++; continue; }
+      const steps = Math.ceil(d / segLen);
+      for (let k = 0; k < steps; k++) {
+        const a0 = k / steps, a1 = (k + 1) / steps;
+        const sx0 = prev.x + dx * a0, sy0 = prev.y + dy * a0;
+        const sx1 = prev.x + dx * a1, sy1 = prev.y + dy * a1;
+        const grad = ctx.createLinearGradient(sx0, sy0, sx1, sy1);
+        const base = (acc + d * a0) / total;
+        for (const stp of g.stops) {
+          const off = ((stp.offset + base + flow) % 1 + 1) % 1;
+          const [r, gg, bb] = hslToRgb(stp.h, stp.s, stp.l);
+          grad.addColorStop(off, `rgba(${r},${gg},${bb},${stp.a * alphaMul})`);
+        }
+        // also add first stop at 0 to avoid gaps
+        {
+          const stp = g.stops[0];
+          const [r, gg, bb] = hslToRgb(stp.h, stp.s, stp.l);
+          grad.addColorStop(0, `rgba(${r},${gg},${bb},${stp.a * alphaMul})`);
+          grad.addColorStop(1, `rgba(${r},${gg},${bb},${stp.a * alphaMul})`);
+        }
+        ctx.strokeStyle = grad;
+        ctx.beginPath();
+        ctx.moveTo(sx0, sy0);
+        ctx.lineTo(sx1, sy1);
+        ctx.stroke();
+      }
+      prev = p; acc += d; i++;
+    }
+    ctx.restore();
+  }
 }
 
-// Render a full frame of the fixed canvas (world 0..canvasW × 0..canvasH) into a target ctx sized targetW×targetH.
-// Handles background, image layers, strokes. No pan/zoom (used for exports).
+/* ---------- Draw image with rotation ---------- */
+function drawImageItem(ctx: CanvasRenderingContext2D, img: HTMLImageElement, im: ImageItem) {
+  const rot = im.rotation || 0;
+  if (rot === 0) {
+    ctx.drawImage(img, im.x, im.y, im.w, im.h);
+    return;
+  }
+  ctx.save();
+  ctx.translate(im.x + im.w / 2, im.y + im.h / 2);
+  ctx.rotate(rot);
+  ctx.drawImage(img, -im.w / 2, -im.h / 2, im.w, im.h);
+  ctx.restore();
+}
+
+/* ---------- Render layer content (into a ctx assumed to be at world space) ---------- */
+function renderLayerContent(
+  ctx: CanvasRenderingContext2D,
+  layer: Layer,
+  imgCache: Map<string, HTMLImageElement>,
+  t: number, dtRaw: number, now: number,
+) {
+  for (const im of layer.images) {
+    const img = imgCache.get(im.src);
+    if (img && img.complete && img.naturalWidth) drawImageItem(ctx, img, im);
+  }
+  for (const s of layer.strokes) {
+    if (s.points.length === 0) continue;
+    renderStroke(ctx, s, t, dtRaw, now);
+  }
+}
+
+/* ---------- Full frame render (exports, no pan/zoom) ---------- */
 function renderFrameToCanvas(
   tctx: CanvasRenderingContext2D,
   targetW: number, targetH: number,
@@ -304,6 +520,7 @@ function renderFrameToCanvas(
   layers: Layer[],
   imgCache: Map<string, HTMLImageElement>,
   t: number, dtRaw: number, now: number,
+  layerBuffer?: HTMLCanvasElement,
 ) {
   const sx = targetW / canvasW, sy = targetH / canvasH;
   tctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -315,38 +532,55 @@ function renderFrameToCanvas(
   tctx.clip();
   for (const layer of layers) {
     if (!layer.visible) continue;
-    for (const im of layer.images) {
-      const img = imgCache.get(im.src);
-      if (img && img.complete && img.naturalWidth) tctx.drawImage(img, im.x, im.y, im.w, im.h);
-    }
-    for (const s of layer.strokes) {
-      if (s.points.length === 0) continue;
-      renderStroke(tctx, s, t, dtRaw, now);
+    const bm: BlendMode = layer.blendMode || "source-over";
+    const op = layer.opacity ?? 1;
+    if (bm !== "source-over" && layerBuffer) {
+      layerBuffer.width = canvasW; layerBuffer.height = canvasH;
+      const lctx = layerBuffer.getContext("2d")!;
+      lctx.setTransform(1, 0, 0, 1, 0, 0);
+      lctx.clearRect(0, 0, canvasW, canvasH);
+      renderLayerContent(lctx, layer, imgCache, t, dtRaw, now);
+      const prev = tctx.globalCompositeOperation;
+      const prevA = tctx.globalAlpha;
+      tctx.globalCompositeOperation = bm;
+      tctx.globalAlpha = op;
+      tctx.drawImage(layerBuffer, 0, 0);
+      tctx.globalCompositeOperation = prev;
+      tctx.globalAlpha = prevA;
+    } else {
+      const prevA = tctx.globalAlpha;
+      tctx.globalAlpha = op;
+      renderLayerContent(tctx, layer, imgCache, t, dtRaw, now);
+      tctx.globalAlpha = prevA;
     }
   }
   tctx.setTransform(1, 0, 0, 1, 0, 0);
 }
 
+/* ---------- Selection / Transform types ---------- */
+type SelectionRect = { x: number; y: number; w: number; h: number };
+type SelectedObject =
+  | { kind: "stroke"; layerId: number; strokeId: number }
+  | { kind: "image"; layerId: number; imageId: number };
+
+type TransformHandle = "move" | "rotate" | "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
+
 function Index() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
 
-  // viewport (screen) size — fills workspace
   const [viewport, setViewport] = useState({ w: 800, h: 600 });
-  // fixed canvas world dimensions
   const [canvasSize, setCanvasSize] = useState({ w: 1200, h: 800 });
   const canvasSizeRef = useRef(canvasSize);
   useEffect(() => { canvasSizeRef.current = canvasSize; }, [canvasSize]);
   const [pendingW, setPendingW] = useState("1200");
   const [pendingH, setPendingH] = useState("800");
 
-  // view (pan+zoom): screen = world * zoom + pan
   const viewRef = useRef({ panX: 0, panY: 0, zoom: 1 });
   const [zoomDisplay, setZoomDisplay] = useState(1);
 
-  // layers
   const [layers, setLayers] = useState<Layer[]>(() => [{
-    id: ++layerIdCounter, name: "Слой 1", visible: true, strokes: [], images: [],
+    id: ++layerIdCounter, name: "Слой 1", visible: true, blendMode: "source-over", opacity: 1, strokes: [], images: [],
   }]);
   const [activeLayerId, setActiveLayerId] = useState<number>(() => layerIdCounter);
   const layersRef = useRef(layers);
@@ -354,24 +588,27 @@ function Index() {
   useEffect(() => { layersRef.current = layers; }, [layers]);
   useEffect(() => { activeLayerIdRef.current = activeLayerId; }, [activeLayerId]);
 
-  // image bitmap cache
   const imgCache = useRef<Map<string, HTMLImageElement>>(new Map());
+  const layerBufferRef = useRef<HTMLCanvasElement | null>(null);
+  const getLayerBuffer = () => {
+    if (!layerBufferRef.current) layerBufferRef.current = document.createElement("canvas");
+    return layerBufferRef.current;
+  };
   const ensureImg = (src: string): HTMLImageElement | null => {
     const c = imgCache.current;
     let img = c.get(src);
     if (!img) {
       img = new Image();
+      img.onload = () => markDirty();
       img.src = src;
       c.set(src, img);
     }
     return img.complete && img.naturalWidth ? img : null;
   };
 
-  // dirty flag — only redraw when animated strokes exist or scene changed
   const dirtyRef = useRef(true);
   const markDirty = () => { dirtyRef.current = true; };
 
-  // history
   const historyRef = useRef<string[]>([serializeLayers(layers)]);
   const historyIdxRef = useRef(0);
   const [historyVer, setHistoryVer] = useState(0);
@@ -413,19 +650,45 @@ function Index() {
 
   const currentStrokeRef = useRef<Stroke | null>(null);
 
+  // Tool state
+  const [tool, setTool] = useState<Tool>("brush");
+  const toolRef = useRef(tool);
+  useEffect(() => { toolRef.current = tool; markDirty(); }, [tool]);
+
   const [brush, setBrush] = useState<BrushKind>("ribbon");
   const [mode, setMode] = useState<ModeKind>("normal");
-  const [hue, setHue] = useState(200);
+
+  // Extended color
+  const [color, setColor] = useState({ h: 200, s: 90, l: 55, a: 1 });
+  const colorRef = useRef(color);
+  useEffect(() => { colorRef.current = color; }, [color]);
+
+  // Saved palette
+  const [savedSwatches, setSavedSwatches] = useState<string[]>([]);
+  // Eyedropper
+  const [eyedropper, setEyedropper] = useState(false);
+
   const [size, setSize] = useState(28);
   const [speed, setSpeed] = useState(0.5);
   const [density, setDensity] = useState(0.5);
   const [noise, setNoise] = useState(0.4);
   const [intensity, setIntensity] = useState(0.7);
   const [dynamics, setDynamics] = useState(0.5);
+
+  // Gradient brush config
+  const [gradientCfg, setGradientCfg] = useState<StrokeGradient>({
+    stops: [
+      { offset: 0, h: 200, s: 90, l: 55, a: 1 },
+      { offset: 1, h: 320, s: 90, l: 60, a: 1 },
+    ],
+    angle: 0, animate: true, speed: 0.4,
+  });
+  const gradientRef = useRef(gradientCfg);
+  useEffect(() => { gradientRef.current = gradientCfg; }, [gradientCfg]);
+
   const [recording, setRecording] = useState<null | "gif" | "mp4">(null);
   const [recordProgress, setRecordProgress] = useState(0);
 
-  // Export settings
   const [gifScale, setGifScale] = useState<ExportScale>(1);
   const [gifSeconds, setGifSeconds] = useState(3);
   const [gifFps, setGifFps] = useState(15);
@@ -438,13 +701,12 @@ function Index() {
   const spaceRef = useRef(false);
 
   const refs = {
-    brush: useRef(brush), mode: useRef(mode), hue: useRef(hue), size: useRef(size),
+    brush: useRef(brush), mode: useRef(mode), size: useRef(size),
     speed: useRef(speed), density: useRef(density), noise: useRef(noise),
     intensity: useRef(intensity), dynamics: useRef(dynamics),
   };
   useEffect(() => { refs.brush.current = brush; });
   useEffect(() => { refs.mode.current = mode; });
-  useEffect(() => { refs.hue.current = hue; });
   useEffect(() => { refs.size.current = size; });
   useEffect(() => { refs.speed.current = speed; });
   useEffect(() => { refs.density.current = density; });
@@ -452,7 +714,56 @@ function Index() {
   useEffect(() => { refs.intensity.current = intensity; });
   useEffect(() => { refs.dynamics.current = dynamics; });
 
-  // resize viewport to workspace
+  /* ---------- Selection / transform state ---------- */
+  const [selectionRect, setSelectionRect] = useState<SelectionRect | null>(null);
+  const selectionRectRef = useRef<SelectionRect | null>(null);
+  useEffect(() => { selectionRectRef.current = selectionRect; markDirty(); }, [selectionRect]);
+
+  const [selectedObj, setSelectedObj] = useState<SelectedObject | null>(null);
+  const selectedObjRef = useRef<SelectedObject | null>(null);
+  useEffect(() => { selectedObjRef.current = selectedObj; markDirty(); }, [selectedObj]);
+
+  const rectDragRef = useRef<{ startX: number; startY: number } | null>(null);
+  const transformRef = useRef<{
+    handle: TransformHandle;
+    startW: { x: number; y: number };
+    origBBox: { x: number; y: number; w: number; h: number };
+    origData: string; // serialized snapshot of active layer for rollback if needed (unused)
+  } | null>(null);
+  void transformRef; // suppress
+  const activeTransform = useRef<{
+    handle: TransformHandle;
+    startW: { x: number; y: number };
+    origBBox: { x: number; y: number; w: number; h: number };
+    origPoints?: StrokePoint[];
+    origImage?: { x: number; y: number; w: number; h: number; rotation: number };
+    origSize?: number;
+    center?: { x: number; y: number };
+    startAngle?: number;
+  } | null>(null);
+
+  /* ---------- Helpers ---------- */
+  const getSelectedBBox = useCallback((): { x: number; y: number; w: number; h: number } | null => {
+    const sel = selectedObjRef.current;
+    if (!sel) {
+      const r = selectionRectRef.current;
+      if (r && r.w > 2 && r.h > 2) return r;
+      return null;
+    }
+    const layer = layersRef.current.find(l => l.id === sel.layerId);
+    if (!layer) return null;
+    if (sel.kind === "stroke") {
+      const s = layer.strokes.find(x => x.id === sel.strokeId);
+      if (!s) return null;
+      return strokeBBox(s);
+    } else {
+      const im = layer.images.find(x => x.id === sel.imageId);
+      if (!im) return null;
+      return { x: im.x, y: im.y, w: im.w, h: im.h };
+    }
+  }, []);
+
+  /* ---------- Resize ---------- */
   useEffect(() => {
     const onResize = () => {
       const el = wrapRef.current;
@@ -475,7 +786,6 @@ function Index() {
     markDirty();
   }, [viewport]);
 
-  // Fit view when canvas size changes
   const fitView = useCallback(() => {
     const vw = viewport.w, vh = viewport.h;
     const cs = canvasSizeRef.current;
@@ -517,25 +827,27 @@ function Index() {
     markDirty();
   }, []);
 
-  // Render loop — skip when nothing animated and nothing dirty
+  /* ---------- Render loop ---------- */
   useEffect(() => {
     let raf = 0;
     let last = performance.now();
+    let dashOffset = 0;
 
     const tick = (now: number) => {
       const dtRaw = Math.min(50, now - last);
       last = now;
       const c = canvasRef.current;
       if (!c) { raf = requestAnimationFrame(tick); return; }
-      const animated = hasAnimatedContent();
+      const hasSelectionAnim = selectionRectRef.current || selectedObjRef.current;
+      const animated = hasAnimatedContent() || hasSelectionAnim;
       if (!animated && !dirtyRef.current) { raf = requestAnimationFrame(tick); return; }
       dirtyRef.current = false;
+      dashOffset = (dashOffset + 0.5) % 12;
 
       const ctx = c.getContext("2d")!;
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const vw = viewport.w, vh = viewport.h;
 
-      // clear workspace
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.fillStyle = "#0a0b12";
       ctx.fillRect(0, 0, vw, vh);
@@ -543,19 +855,15 @@ function Index() {
       const view = viewRef.current;
       const cs = canvasSizeRef.current;
 
-      // canvas drop shadow
       const cxp = view.panX, cyp = view.panY, cwp = cs.w * view.zoom, chp = cs.h * view.zoom;
       ctx.fillStyle = "rgba(0,0,0,0.5)";
       ctx.fillRect(cxp + 6, cyp + 8, cwp, chp);
-      // canvas background
       ctx.fillStyle = "#05060c";
       ctx.fillRect(cxp, cyp, cwp, chp);
-      // border
       ctx.strokeStyle = "rgba(255,255,255,0.15)";
       ctx.lineWidth = 1;
       ctx.strokeRect(cxp + 0.5, cyp + 0.5, cwp, chp);
 
-      // world transform + clip to canvas rect
       ctx.setTransform(dpr * view.zoom, 0, 0, dpr * view.zoom, dpr * view.panX, dpr * view.panY);
       ctx.save();
       ctx.beginPath();
@@ -565,24 +873,83 @@ function Index() {
       const t = now / 1000;
       for (const layer of layersRef.current) {
         if (!layer.visible) continue;
-        for (const im of layer.images) {
-          const img = ensureImg(im.src);
-          if (img) ctx.drawImage(img, im.x, im.y, im.w, im.h);
-        }
-        for (const s of layer.strokes) {
-          if (s.points.length === 0) continue;
-          renderStroke(ctx, s, t, dtRaw, now);
+        // Preload images
+        for (const im of layer.images) ensureImg(im.src);
+        const bm: BlendMode = layer.blendMode || "source-over";
+        const op = layer.opacity ?? 1;
+        if (bm !== "source-over") {
+          const buf = getLayerBuffer();
+          if (buf.width !== cs.w || buf.height !== cs.h) { buf.width = cs.w; buf.height = cs.h; }
+          const lctx = buf.getContext("2d")!;
+          lctx.setTransform(1, 0, 0, 1, 0, 0);
+          lctx.clearRect(0, 0, cs.w, cs.h);
+          renderLayerContent(lctx, layer, imgCache.current, t, dtRaw, now);
+          const prev = ctx.globalCompositeOperation;
+          const prevA = ctx.globalAlpha;
+          ctx.globalCompositeOperation = bm;
+          ctx.globalAlpha = op;
+          ctx.drawImage(buf, 0, 0);
+          ctx.globalCompositeOperation = prev;
+          ctx.globalAlpha = prevA;
+        } else {
+          const prevA = ctx.globalAlpha;
+          ctx.globalAlpha = op;
+          renderLayerContent(ctx, layer, imgCache.current, t, dtRaw, now);
+          ctx.globalAlpha = prevA;
         }
       }
       ctx.restore();
+
+      /* Selection / transform overlays (screen space) */
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const selBB = getSelectedBBox();
+      if (selBB) {
+        const rx = view.panX + selBB.x * view.zoom;
+        const ry = view.panY + selBB.y * view.zoom;
+        const rw = selBB.w * view.zoom;
+        const rh = selBB.h * view.zoom;
+        ctx.save();
+        ctx.strokeStyle = "rgba(0, 200, 255, 0.9)";
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([6, 4]);
+        ctx.lineDashOffset = -dashOffset;
+        ctx.strokeRect(rx, ry, rw, rh);
+        ctx.restore();
+
+        if (toolRef.current === "transform" || selectedObjRef.current) {
+          // handles
+          const hs = 8;
+          const cxs = [rx, rx + rw / 2, rx + rw];
+          const cys = [ry, ry + rh / 2, ry + rh];
+          ctx.fillStyle = "#0a0b12";
+          ctx.strokeStyle = "rgba(0,200,255,0.9)";
+          ctx.lineWidth = 1.5;
+          for (const hx of cxs) for (const hy of cys) {
+            if (hx === rx + rw / 2 && hy === ry + rh / 2) continue;
+            ctx.fillRect(hx - hs / 2, hy - hs / 2, hs, hs);
+            ctx.strokeRect(hx - hs / 2, hy - hs / 2, hs, hs);
+          }
+          // rotate handle above
+          const rcx = rx + rw / 2, rcy = ry - 24;
+          ctx.beginPath();
+          ctx.moveTo(rx + rw / 2, ry);
+          ctx.lineTo(rcx, rcy);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.arc(rcx, rcy, 5, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+        }
+      }
 
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [viewport]);
+  }, [viewport, getSelectedBBox]);
 
-  // === Pointer / touch: pan + zoom + draw ===
+  /* ---------- Pointer helpers ---------- */
   const screenToWorld = (sx: number, sy: number) => {
     const v = viewRef.current;
     return { x: (sx - v.panX) / v.zoom, y: (sy - v.panY) / v.zoom };
@@ -597,12 +964,16 @@ function Index() {
   const beginStroke = (wx: number, wy: number) => {
     const layer = layersRef.current.find(l => l.id === activeLayerIdRef.current);
     if (!layer || !layer.visible) return;
+    const col = colorRef.current;
     const stroke: Stroke = {
       id: ++strokeIdCounter,
       kind: refs.brush.current,
       mode: refs.mode.current,
       size: refs.size.current,
-      hue: refs.hue.current,
+      hue: col.h,
+      sat: col.s,
+      lit: col.l,
+      alpha: col.a,
       speed: refs.speed.current,
       density: refs.density.current,
       noise: refs.noise.current,
@@ -611,6 +982,7 @@ function Index() {
       points: [],
       born: performance.now(),
       originY: wy,
+      gradient: refs.brush.current === "gradient" ? JSON.parse(JSON.stringify(gradientRef.current)) : undefined,
     };
     currentStrokeRef.current = stroke;
     layer.strokes.push(stroke);
@@ -643,6 +1015,144 @@ function Index() {
     return { x: e.clientX - r.left, y: e.clientY - r.top };
   };
 
+  /* ---------- Transform handle hit-test (screen space) ---------- */
+  const hitHandle = (sx: number, sy: number): TransformHandle | null => {
+    const bb = getSelectedBBox();
+    if (!bb) return null;
+    const v = viewRef.current;
+    const rx = v.panX + bb.x * v.zoom;
+    const ry = v.panY + bb.y * v.zoom;
+    const rw = bb.w * v.zoom;
+    const rh = bb.h * v.zoom;
+    const hs = 10;
+    const rcx = rx + rw / 2, rcy = ry - 24;
+    if (Math.hypot(sx - rcx, sy - rcy) < 10) return "rotate";
+    const inRange = (x: number, y: number) => Math.abs(sx - x) < hs && Math.abs(sy - y) < hs;
+    if (inRange(rx, ry)) return "nw";
+    if (inRange(rx + rw / 2, ry)) return "n";
+    if (inRange(rx + rw, ry)) return "ne";
+    if (inRange(rx + rw, ry + rh / 2)) return "e";
+    if (inRange(rx + rw, ry + rh)) return "se";
+    if (inRange(rx + rw / 2, ry + rh)) return "s";
+    if (inRange(rx, ry + rh)) return "sw";
+    if (inRange(rx, ry + rh / 2)) return "w";
+    if (sx >= rx && sx <= rx + rw && sy >= ry && sy <= ry + rh) return "move";
+    return null;
+  };
+
+  const findObjectAt = (wx: number, wy: number): SelectedObject | null => {
+    // top-most first — walk all layers reverse
+    const layersR = [...layersRef.current].reverse();
+    for (const l of layersR) {
+      if (!l.visible) continue;
+      // images last-drawn are last in list; check reverse
+      for (let i = l.images.length - 1; i >= 0; i--) {
+        const im = l.images[i];
+        if (pointInRect(wx, wy, { x: im.x, y: im.y, w: im.w, h: im.h })) {
+          return { kind: "image", layerId: l.id, imageId: im.id };
+        }
+      }
+      for (let i = l.strokes.length - 1; i >= 0; i--) {
+        const s = l.strokes[i];
+        if (hitTestStroke(s, wx, wy)) return { kind: "stroke", layerId: l.id, strokeId: s.id };
+      }
+    }
+    return null;
+  };
+
+  const applyTransformDelta = (curW: { x: number; y: number }) => {
+    const tr = activeTransform.current;
+    if (!tr) return;
+    const sel = selectedObjRef.current;
+    const bb = tr.origBBox;
+
+    let dx = curW.x - tr.startW.x;
+    let dy = curW.y - tr.startW.y;
+
+    if (tr.handle === "move") {
+      // move all
+      if (sel) {
+        const layer = layersRef.current.find(l => l.id === sel.layerId);
+        if (!layer) return;
+        if (sel.kind === "image" && tr.origImage) {
+          const im = layer.images.find(x => x.id === sel.imageId);
+          if (im) { im.x = tr.origImage.x + dx; im.y = tr.origImage.y + dy; }
+        } else if (sel.kind === "stroke" && tr.origPoints) {
+          const s = layer.strokes.find(x => x.id === sel.strokeId);
+          if (s) s.points = tr.origPoints.map(p => ({ x: p.x + dx, y: p.y + dy, t: p.t }));
+        }
+      } else if (selectionRectRef.current) {
+        // move selection rectangle (visual only)
+        const r = selectionRectRef.current;
+        setSelectionRect({ x: r.x + dx, y: r.y + dy, w: r.w, h: r.h });
+        activeTransform.current = null; // one-shot start; simplest: rebase
+      }
+      markDirty();
+      return;
+    }
+
+    if (tr.handle === "rotate" && sel && tr.center) {
+      const a0 = tr.startAngle ?? 0;
+      const a1 = Math.atan2(curW.y - tr.center.y, curW.x - tr.center.x);
+      const da = a1 - a0;
+      const cx = tr.center.x, cy = tr.center.y;
+      const layer = layersRef.current.find(l => l.id === sel.layerId);
+      if (!layer) return;
+      const cos = Math.cos(da), sin = Math.sin(da);
+      if (sel.kind === "image" && tr.origImage) {
+        const im = layer.images.find(x => x.id === sel.imageId);
+        if (im) im.rotation = (tr.origImage.rotation || 0) + da;
+      } else if (sel.kind === "stroke" && tr.origPoints) {
+        const s = layer.strokes.find(x => x.id === sel.strokeId);
+        if (s) s.points = tr.origPoints.map(p => {
+          const px = p.x - cx, py = p.y - cy;
+          return { x: cx + px * cos - py * sin, y: cy + px * sin + py * cos, t: p.t };
+        });
+      }
+      markDirty();
+      return;
+    }
+
+    // Scale
+    if (!sel) return;
+    let sx = 1, sy = 1;
+    let ax = bb.x, ay = bb.y; // anchor
+    switch (tr.handle) {
+      case "e":  sx = (bb.w + dx) / bb.w; sy = 1; ax = bb.x; ay = bb.y; break;
+      case "w":  sx = (bb.w - dx) / bb.w; sy = 1; ax = bb.x + bb.w; ay = bb.y; break;
+      case "s":  sx = 1; sy = (bb.h + dy) / bb.h; ax = bb.x; ay = bb.y; break;
+      case "n":  sx = 1; sy = (bb.h - dy) / bb.h; ax = bb.x; ay = bb.y + bb.h; break;
+      case "se": sx = (bb.w + dx) / bb.w; sy = (bb.h + dy) / bb.h; ax = bb.x; ay = bb.y; break;
+      case "ne": sx = (bb.w + dx) / bb.w; sy = (bb.h - dy) / bb.h; ax = bb.x; ay = bb.y + bb.h; break;
+      case "sw": sx = (bb.w - dx) / bb.w; sy = (bb.h + dy) / bb.h; ax = bb.x + bb.w; ay = bb.y; break;
+      case "nw": sx = (bb.w - dx) / bb.w; sy = (bb.h - dy) / bb.h; ax = bb.x + bb.w; ay = bb.y + bb.h; break;
+      default: return;
+    }
+    if (!isFinite(sx) || !isFinite(sy) || sx === 0 || sy === 0) return;
+    const layer = layersRef.current.find(l => l.id === sel.layerId);
+    if (!layer) return;
+    if (sel.kind === "image" && tr.origImage) {
+      const im = layer.images.find(x => x.id === sel.imageId);
+      if (im) {
+        im.x = ax + (tr.origImage.x - ax) * sx;
+        im.y = ay + (tr.origImage.y - ay) * sy;
+        im.w = tr.origImage.w * sx;
+        im.h = tr.origImage.h * sy;
+      }
+    } else if (sel.kind === "stroke" && tr.origPoints) {
+      const s = layer.strokes.find(x => x.id === sel.strokeId);
+      if (s) {
+        s.points = tr.origPoints.map(p => ({
+          x: ax + (p.x - ax) * sx,
+          y: ay + (p.y - ay) * sy,
+          t: p.t,
+        }));
+        if (tr.origSize) s.size = tr.origSize * (Math.abs(sx) + Math.abs(sy)) / 2;
+      }
+    }
+    markDirty();
+  };
+
   const onDown = (e: React.PointerEvent) => {
     (e.target as Element).setPointerCapture(e.pointerId);
     const local = localPoint(e);
@@ -672,17 +1182,107 @@ function Index() {
       return;
     }
 
+    // Eyedropper: sample color from canvas
+    if (eyedropper) {
+      const c = canvasRef.current!;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const ctx = c.getContext("2d")!;
+      try {
+        const pix = ctx.getImageData(Math.floor(local.x * dpr), Math.floor(local.y * dpr), 1, 1).data;
+        const [h, s, l] = rgbToHsl(pix[0], pix[1], pix[2]);
+        setColor({ h, s, l, a: pix[3] / 255 || 1 });
+      } catch { /* CORS if img */ }
+      setEyedropper(false);
+      return;
+    }
+
+    const wpt = screenToWorld(local.x, local.y);
+    const tl = toolRef.current;
+
+    if (tl === "transform" && selectedObjRef.current) {
+      const h = hitHandle(local.x, local.y);
+      if (h) {
+        const bb = getSelectedBBox()!;
+        const sel = selectedObjRef.current;
+        const layer = layersRef.current.find(l => l.id === sel.layerId)!;
+        let origPoints: StrokePoint[] | undefined;
+        let origImage: { x: number; y: number; w: number; h: number; rotation: number } | undefined;
+        let origSize: number | undefined;
+        if (sel.kind === "stroke") {
+          const s = layer.strokes.find(x => x.id === sel.strokeId)!;
+          origPoints = s.points.map(p => ({ ...p }));
+          origSize = s.size;
+        } else {
+          const im = layer.images.find(x => x.id === sel.imageId)!;
+          origImage = { x: im.x, y: im.y, w: im.w, h: im.h, rotation: im.rotation || 0 };
+        }
+        const center = { x: bb.x + bb.w / 2, y: bb.y + bb.h / 2 };
+        activeTransform.current = {
+          handle: h,
+          startW: wpt,
+          origBBox: bb,
+          origPoints, origImage, origSize,
+          center,
+          startAngle: h === "rotate" ? Math.atan2(wpt.y - center.y, wpt.x - center.x) : undefined,
+        };
+        drawingPointerId.current = e.pointerId;
+        lastDrawScreen.current = local;
+        return;
+      }
+      // else fall through to object pick
+    }
+
+    if (tl === "select-object") {
+      const obj = findObjectAt(wpt.x, wpt.y);
+      setSelectedObj(obj);
+      setSelectionRect(null);
+      if (obj) {
+        // enable transform right away
+        const bb = getSelectedBBox()!;
+        const layer = layersRef.current.find(l => l.id === obj.layerId)!;
+        let origPoints: StrokePoint[] | undefined;
+        let origImage: { x: number; y: number; w: number; h: number; rotation: number } | undefined;
+        let origSize: number | undefined;
+        if (obj.kind === "stroke") {
+          const s = layer.strokes.find(x => x.id === obj.strokeId)!;
+          origPoints = s.points.map(p => ({ ...p }));
+          origSize = s.size;
+        } else {
+          const im = layer.images.find(x => x.id === obj.imageId)!;
+          origImage = { x: im.x, y: im.y, w: im.w, h: im.h, rotation: im.rotation || 0 };
+        }
+        activeTransform.current = {
+          handle: "move",
+          startW: wpt,
+          origBBox: bb,
+          origPoints, origImage, origSize,
+          center: { x: bb.x + bb.w / 2, y: bb.y + bb.h / 2 },
+        };
+        drawingPointerId.current = e.pointerId;
+        lastDrawScreen.current = local;
+      }
+      return;
+    }
+
+    if (tl === "select-rect") {
+      setSelectedObj(null);
+      rectDragRef.current = { startX: wpt.x, startY: wpt.y };
+      setSelectionRect({ x: wpt.x, y: wpt.y, w: 0, h: 0 });
+      drawingPointerId.current = e.pointerId;
+      lastDrawScreen.current = local;
+      return;
+    }
+
+    // brush / eraser
     if (refs.brush.current === "eraser") {
-      const w = screenToWorld(local.x, local.y);
-      eraseAt(w.x, w.y, refs.size.current);
+      eraseAt(wpt.x, wpt.y, refs.size.current);
       drawingPointerId.current = e.pointerId;
       lastDrawScreen.current = local;
       return;
     }
     drawingPointerId.current = e.pointerId;
     lastDrawScreen.current = local;
-    const w = screenToWorld(local.x, local.y);
-    beginStroke(w.x, w.y);
+    beginStroke(wpt.x, wpt.y);
   };
 
   const onMove = (e: React.PointerEvent) => {
@@ -716,9 +1316,28 @@ function Index() {
     }
 
     if (drawingPointerId.current !== e.pointerId) return;
+
+    const wpt = screenToWorld(local.x, local.y);
+    const tl = toolRef.current;
+
+    if (activeTransform.current) {
+      applyTransformDelta(wpt);
+      return;
+    }
+    if (tl === "select-rect" && rectDragRef.current) {
+      const s = rectDragRef.current;
+      setSelectionRect({
+        x: Math.min(s.startX, wpt.x),
+        y: Math.min(s.startY, wpt.y),
+        w: Math.abs(wpt.x - s.startX),
+        h: Math.abs(wpt.y - s.startY),
+      });
+      return;
+    }
+    if (tl === "select-object") return;
+
     if (refs.brush.current === "eraser") {
-      const w = screenToWorld(local.x, local.y);
-      eraseAt(w.x, w.y, refs.size.current);
+      eraseAt(wpt.x, wpt.y, refs.size.current);
       lastDrawScreen.current = local;
       return;
     }
@@ -727,8 +1346,8 @@ function Index() {
     const dist = Math.hypot(dx, dy);
     const steps = Math.max(1, Math.floor(dist / 5));
     for (let i = 1; i <= steps; i++) {
-      const sx = px + dx * (i / steps), sy = py + dy * (i / steps);
-      const w = screenToWorld(sx, sy);
+      const sx2 = px + dx * (i / steps), sy2 = py + dy * (i / steps);
+      const w = screenToWorld(sx2, sy2);
       addPoint(w.x, w.y);
     }
     lastDrawScreen.current = local;
@@ -740,7 +1359,13 @@ function Index() {
     if (panState.current && panState.current.id === e.pointerId) panState.current = null;
     if (drawingPointerId.current === e.pointerId) {
       drawingPointerId.current = null;
-      if (currentStrokeRef.current) {
+      if (activeTransform.current) {
+        activeTransform.current = null;
+        pushHistory();
+      } else if (rectDragRef.current) {
+        rectDragRef.current = null;
+        // keep selection rect
+      } else if (currentStrokeRef.current) {
         currentStrokeRef.current = null;
         pushHistory();
       } else if (refs.brush.current === "eraser") {
@@ -769,15 +1394,86 @@ function Index() {
     markDirty();
   };
 
+  /* ---------- Selection actions ---------- */
+  const deleteSelection = useCallback(() => {
+    const sel = selectedObjRef.current;
+    if (sel) {
+      const next = layersRef.current.map(l => {
+        if (l.id !== sel.layerId) return l;
+        if (sel.kind === "stroke") return { ...l, strokes: l.strokes.filter(s => s.id !== sel.strokeId) };
+        return { ...l, images: l.images.filter(i => i.id !== sel.imageId) };
+      });
+      layersRef.current = next;
+      setLayers(next);
+      setSelectedObj(null);
+      pushHistory();
+      return;
+    }
+    const rect = selectionRectRef.current;
+    if (rect && rect.w > 2 && rect.h > 2) {
+      const next = layersRef.current.map(l => {
+        if (!l.visible) return l;
+        return {
+          ...l,
+          strokes: l.strokes.filter(s => !rectIntersects(strokeBBox(s), rect)),
+          images: l.images.filter(im => !rectIntersects({ x: im.x, y: im.y, w: im.w, h: im.h }, rect)),
+        };
+      });
+      layersRef.current = next;
+      setLayers(next);
+      setSelectionRect(null);
+      pushHistory();
+    }
+  }, [pushHistory]);
+
+  const duplicateSelection = useCallback(() => {
+    const sel = selectedObjRef.current;
+    if (!sel) return;
+    const layer = layersRef.current.find(l => l.id === sel.layerId);
+    if (!layer) return;
+    if (sel.kind === "stroke") {
+      const s = layer.strokes.find(x => x.id === sel.strokeId);
+      if (!s) return;
+      const copy: Stroke = JSON.parse(JSON.stringify(s));
+      copy.id = ++strokeIdCounter;
+      copy.points = copy.points.map(p => ({ ...p, x: p.x + 20, y: p.y + 20 }));
+      copy.born = performance.now();
+      layer.strokes.push(copy);
+      setSelectedObj({ kind: "stroke", layerId: layer.id, strokeId: copy.id });
+    } else {
+      const im = layer.images.find(x => x.id === sel.imageId);
+      if (!im) return;
+      const copy: ImageItem = { ...im, id: ++imageIdCounter, x: im.x + 20, y: im.y + 20 };
+      layer.images.push(copy);
+      setSelectedObj({ kind: "image", layerId: layer.id, imageId: copy.id });
+    }
+    setLayers([...layersRef.current]);
+    pushHistory();
+  }, [pushHistory]);
+
   useEffect(() => {
     const dn = (e: KeyboardEvent) => {
       if (e.code === "Space" && !spaceRef.current) {
         spaceRef.current = true;
         setSpaceDown(true);
       }
+      const target = e.target as HTMLElement | null;
+      const inField = target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
       const meta = e.ctrlKey || e.metaKey;
       if (meta && e.key.toLowerCase() === "z") { e.preventDefault(); if (e.shiftKey) redo(); else undo(); }
       else if (meta && e.key.toLowerCase() === "y") { e.preventDefault(); redo(); }
+      else if (meta && e.key.toLowerCase() === "d") { e.preventDefault(); duplicateSelection(); }
+      else if ((e.key === "Delete" || e.key === "Backspace") && !inField) {
+        deleteSelection();
+      } else if (e.key === "Escape") {
+        setSelectedObj(null); setSelectionRect(null);
+      } else if (!inField && !meta) {
+        const k = e.key.toLowerCase();
+        if (k === "b") setTool("brush");
+        else if (k === "v") setTool("select-rect");
+        else if (k === "o") setTool("select-object");
+        else if (k === "t") setTool("transform");
+      }
     };
     const up = (e: KeyboardEvent) => {
       if (e.code === "Space") { spaceRef.current = false; setSpaceDown(false); }
@@ -785,12 +1481,12 @@ function Index() {
     window.addEventListener("keydown", dn);
     window.addEventListener("keyup", up);
     return () => { window.removeEventListener("keydown", dn); window.removeEventListener("keyup", up); };
-  }, [undo, redo]);
+  }, [undo, redo, deleteSelection, duplicateSelection]);
 
-  // === Layer ops ===
+  /* ---------- Layer ops ---------- */
   const addLayer = () => {
     const id = ++layerIdCounter;
-    const next = [...layersRef.current, { id, name: `Слой ${layersRef.current.length + 1}`, visible: true, strokes: [], images: [] }];
+    const next: Layer[] = [...layersRef.current, { id, name: `Слой ${layersRef.current.length + 1}`, visible: true, blendMode: "source-over", opacity: 1, strokes: [], images: [] }];
     layersRef.current = next;
     setLayers(next);
     setActiveLayerId(id);
@@ -806,6 +1502,18 @@ function Index() {
   };
   const toggleLayer = (id: number) => {
     const next = layersRef.current.map(l => l.id === id ? { ...l, visible: !l.visible } : l);
+    layersRef.current = next;
+    setLayers(next);
+    markDirty();
+  };
+  const setLayerBlendMode = (id: number, bm: BlendMode) => {
+    const next = layersRef.current.map(l => l.id === id ? { ...l, blendMode: bm } : l);
+    layersRef.current = next;
+    setLayers(next);
+    pushHistory();
+  };
+  const setLayerOpacity = (id: number, op: number) => {
+    const next = layersRef.current.map(l => l.id === id ? { ...l, opacity: op } : l);
     layersRef.current = next;
     setLayers(next);
     markDirty();
@@ -840,7 +1548,6 @@ function Index() {
     pushHistory();
   };
 
-  // Canvas ops
   const applyCanvasSize = () => {
     const w = Math.max(64, Math.min(8192, parseInt(pendingW) || canvasSize.w));
     const h = Math.max(64, Math.min(8192, parseInt(pendingH) || canvasSize.h));
@@ -850,7 +1557,7 @@ function Index() {
     const w = Math.max(64, Math.min(8192, parseInt(pendingW) || 1200));
     const h = Math.max(64, Math.min(8192, parseInt(pendingH) || 800));
     layerIdCounter += 1;
-    const fresh = [{ id: layerIdCounter, name: "Слой 1", visible: true, strokes: [], images: [] } as Layer];
+    const fresh: Layer[] = [{ id: layerIdCounter, name: "Слой 1", visible: true, blendMode: "source-over", opacity: 1, strokes: [], images: [] }];
     layersRef.current = fresh;
     setLayers(fresh);
     setActiveLayerId(layerIdCounter);
@@ -858,10 +1565,10 @@ function Index() {
     historyRef.current = [serializeLayers(fresh)];
     historyIdxRef.current = 0;
     setHistoryVer(v => v + 1);
+    setSelectedObj(null); setSelectionRect(null);
     markDirty();
   };
 
-  // === Import images ===
   const importFiles = (files: FileList | File[]) => {
     const arr = Array.from(files).filter(f => f.type.startsWith("image/"));
     for (const file of arr) {
@@ -874,10 +1581,10 @@ function Index() {
           const maxDim = Math.min(cs.w, cs.h) * 0.8;
           const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
           const w = img.width * scale, h = img.height * scale;
-          const image: ImageItem = { id: ++imageIdCounter, src, x: (cs.w - w) / 2, y: (cs.h - h) / 2, w, h };
+          const image: ImageItem = { id: ++imageIdCounter, src, x: (cs.w - w) / 2, y: (cs.h - h) / 2, w, h, rotation: 0 };
           imgCache.current.set(src, img);
           const id = ++layerIdCounter;
-          const layer: Layer = { id, name: file.name.slice(0, 24), visible: true, strokes: [], images: [image] };
+          const layer: Layer = { id, name: file.name.slice(0, 24), visible: true, blendMode: "source-over", opacity: 1, strokes: [], images: [image] };
           const next = [...layersRef.current, layer];
           layersRef.current = next;
           setLayers(next);
@@ -893,8 +1600,7 @@ function Index() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragOver, setDragOver] = useState(false);
 
-  // === Export ===
-  // PNG: render at 2x resolution of the fixed canvas
+  /* ---------- Export ---------- */
   const savePng = () => {
     const cs = canvasSizeRef.current;
     const scale = 2;
@@ -903,7 +1609,8 @@ function Index() {
     tmp.height = cs.h * scale;
     const tctx = tmp.getContext("2d")!;
     const now = performance.now();
-    renderFrameToCanvas(tctx, tmp.width, tmp.height, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, 16, now);
+    const buf = document.createElement("canvas");
+    renderFrameToCanvas(tctx, tmp.width, tmp.height, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, 16, now, buf);
     tmp.toBlob((blob) => {
       if (!blob) return;
       const url = URL.createObjectURL(blob);
@@ -925,6 +1632,7 @@ function Index() {
       const tmp = document.createElement("canvas");
       tmp.width = gifW; tmp.height = gifH;
       const tctx = tmp.getContext("2d", { willReadFrequently: true })!;
+      const buf = document.createElement("canvas");
       const gif = GIFEncoder();
       const delay = Math.round(1000 / gifFps);
       const dtRaw = 1000 / gifFps;
@@ -932,7 +1640,7 @@ function Index() {
 
       for (let i = 0; i < total; i++) {
         const now = startNow + i * dtRaw;
-        renderFrameToCanvas(tctx, gifW, gifH, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, dtRaw, now);
+        renderFrameToCanvas(tctx, gifW, gifH, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, dtRaw, now, buf);
         const data = tctx.getImageData(0, 0, gifW, gifH).data;
         const palette = quantize(data, 256);
         const index = applyPalette(data, palette);
@@ -942,8 +1650,8 @@ function Index() {
       }
       gif.finish();
       const bytes = gif.bytesView();
-      const buf = new Uint8Array(bytes.byteLength); buf.set(bytes);
-      const blob = new Blob([buf], { type: "image/gif" });
+      const bytesBuf = new Uint8Array(bytes.byteLength); bytesBuf.set(bytes);
+      const blob = new Blob([bytesBuf], { type: "image/gif" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url; a.download = `living-pixels-${Date.now()}.gif`;
@@ -954,7 +1662,6 @@ function Index() {
     }
   };
 
-  // MP4: offscreen canvas driven frame-by-frame; captureStream + requestFrame
   const exportMp4 = async () => {
     if (recording) return;
     const cs = canvasSizeRef.current;
@@ -964,8 +1671,8 @@ function Index() {
     const tmp = document.createElement("canvas");
     tmp.width = outW; tmp.height = outH;
     const tctx = tmp.getContext("2d")!;
-    // initial paint
-    renderFrameToCanvas(tctx, outW, outH, cs.w, cs.h, layersRef.current, imgCache.current, 0, 1000 / mp4Fps, performance.now());
+    const buf = document.createElement("canvas");
+    renderFrameToCanvas(tctx, outW, outH, cs.w, cs.h, layersRef.current, imgCache.current, 0, 1000 / mp4Fps, performance.now(), buf);
 
     interface CaptureCanvas extends HTMLCanvasElement { captureStream(fps?: number): MediaStream }
     const stream = (tmp as CaptureCanvas).captureStream(0);
@@ -984,10 +1691,9 @@ function Index() {
     const startNow = performance.now();
     for (let i = 0; i < total; i++) {
       const now = startNow + i * dtRaw;
-      renderFrameToCanvas(tctx, outW, outH, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, dtRaw, now);
+      renderFrameToCanvas(tctx, outW, outH, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, dtRaw, now, buf);
       if (track.requestFrame) track.requestFrame();
       setRecordProgress((i + 1) / total);
-      // yield to allow encoder to consume
       await new Promise(r => setTimeout(r, Math.max(1, Math.floor(1000 / mp4Fps))));
     }
     rec.stop();
@@ -1015,7 +1721,59 @@ function Index() {
   const draggingLayer = useRef<number | null>(null);
   const [dragOverLayer, setDragOverLayer] = useState<number | null>(null);
 
-  const cursor = spaceDown || panState.current ? "grab" : brush === "eraser" ? "cell" : "crosshair";
+  /* ---------- Color picker canvas ---------- */
+  const slRef = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const c = slRef.current;
+    if (!c) return;
+    const ctx = c.getContext("2d")!;
+    const w = c.width, h = c.height;
+    // Base: full color at top-right (S=100, L=50); build via layered gradients
+    // Draw hue-tinted white->color horizontally, then black overlay vertically
+    for (let x = 0; x < w; x++) {
+      const s = x / (w - 1) * 100;
+      for (let y = 0; y < h; y++) {
+        const l = (1 - y / (h - 1)) * 100;
+        const [r, g, b] = hslToRgb(color.h, s, l);
+        ctx.fillStyle = `rgb(${r},${g},${b})`;
+        ctx.fillRect(x, y, 1, 1);
+      }
+    }
+  }, [color.h]);
+
+  const onSLDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const c = e.currentTarget;
+    (c as Element).setPointerCapture(e.pointerId);
+    const upd = (evt: React.PointerEvent<HTMLCanvasElement>) => {
+      const r = c.getBoundingClientRect();
+      const x = Math.max(0, Math.min(r.width, evt.clientX - r.left));
+      const y = Math.max(0, Math.min(r.height, evt.clientY - r.top));
+      const s = Math.round(x / r.width * 100);
+      const l = Math.round((1 - y / r.height) * 100);
+      setColor(prev => ({ ...prev, s, l }));
+    };
+    upd(e);
+    const mv = (ev: PointerEvent) => upd(ev as unknown as React.PointerEvent<HTMLCanvasElement>);
+    const up = () => {
+      window.removeEventListener("pointermove", mv);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", mv);
+    window.addEventListener("pointerup", up);
+  };
+
+  const saveSwatch = () => {
+    const hex = toHex(color.h, color.s, color.l);
+    setSavedSwatches(prev => prev.includes(hex) ? prev : [...prev, hex].slice(-24));
+  };
+
+  const cursor = spaceDown || panState.current ? "grab"
+    : eyedropper ? "crosshair"
+    : tool === "select-rect" || tool === "select-object" ? "crosshair"
+    : tool === "transform" ? "move"
+    : brush === "eraser" ? "cell" : "crosshair";
+
+  const currentColorHex = toHex(color.h, color.s, color.l);
 
   return (
     <main className="relative h-screen w-screen overflow-hidden bg-[#0a0b12] text-white flex">
@@ -1029,6 +1787,33 @@ function Index() {
           <button onClick={undo} disabled={!canUndo || !!recording} className="flex-1 rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/10 disabled:opacity-30">↶ Отменить</button>
           <button onClick={redo} disabled={!canRedo || !!recording} className="flex-1 rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/10 disabled:opacity-30">Вернуть ↷</button>
         </div>
+
+        {/* Tools */}
+        <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
+          <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Инструменты</div>
+          <div className="grid grid-cols-4 gap-1">
+            {([
+              { id: "brush", label: "✎", title: "Кисть (B)" },
+              { id: "select-rect", label: "▭", title: "Выделение (V)" },
+              { id: "select-object", label: "◎", title: "Выд. объекта (O)" },
+              { id: "transform", label: "⤢", title: "Трансформация (T)" },
+            ] as { id: Tool; label: string; title: string }[]).map(t => (
+              <button
+                key={t.id}
+                title={t.title}
+                onClick={() => setTool(t.id)}
+                className={`rounded border px-1 py-1.5 text-[13px] transition ${tool === t.id ? "border-white/60 bg-white/15" : "border-white/10 bg-white/[0.02] text-white/60 hover:bg-white/[0.06]"}`}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+          {(selectedObj || (selectionRect && selectionRect.w > 2)) && (
+            <div className="mt-2 flex gap-1">
+              <button onClick={deleteSelection} className="flex-1 rounded border border-red-400/30 bg-red-500/10 px-2 py-1 text-[10px] tracking-widest text-red-300 hover:bg-red-500/20">Удалить</button>
+              <button onClick={duplicateSelection} disabled={!selectedObj} className="flex-1 rounded border border-white/10 bg-white/5 px-2 py-1 text-[10px] tracking-widest hover:bg-white/10 disabled:opacity-30">Дублировать</button>
+            </div>
+          )}
+        </section>
 
         {/* Canvas size */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-1.5">
@@ -1080,18 +1865,32 @@ function Index() {
                   if (dragId !== null) reorderLayers(dragId, l.id);
                   setDragOverLayer(null);
                 }}
-                className={`flex items-center gap-1.5 rounded-md border px-1.5 py-1 ${activeLayerId === l.id ? "border-white/40 bg-white/10" : "border-white/5 bg-transparent hover:bg-white/[0.04]"} ${dragOverLayer === l.id ? "ring-1 ring-cyan-400/60" : ""}`}
+                className={`flex flex-col gap-1 rounded-md border px-1.5 py-1 ${activeLayerId === l.id ? "border-white/40 bg-white/10" : "border-white/5 bg-transparent hover:bg-white/[0.04]"} ${dragOverLayer === l.id ? "ring-1 ring-cyan-400/60" : ""}`}
               >
-                <span className="cursor-grab text-white/30 select-none" title="Перетащить">⋮⋮</span>
-                <button onClick={() => toggleLayer(l.id)} className="text-[12px] leading-none text-white/70 hover:text-white" title="Видимость">{l.visible ? "👁" : "—"}</button>
-                <input
-                  value={l.name}
-                  onChange={(e) => renameLayer(l.id, e.target.value)}
-                  onFocus={() => setActiveLayerId(l.id)}
-                  className={`flex-1 min-w-0 bg-transparent text-[11px] outline-none ${activeLayerId === l.id ? "text-white" : "text-white/70"}`}
-                />
-                <span className="text-[9px] text-white/30">{l.strokes.length + l.images.length}</span>
-                <button onClick={() => removeLayer(l.id)} disabled={layers.length === 1} className="text-[11px] text-white/40 hover:text-red-400 disabled:opacity-20" title="Удалить">✕</button>
+                <div className="flex items-center gap-1.5">
+                  <span className="cursor-grab text-white/30 select-none" title="Перетащить">⋮⋮</span>
+                  <button onClick={() => toggleLayer(l.id)} className="text-[12px] leading-none text-white/70 hover:text-white" title="Видимость">{l.visible ? "👁" : "—"}</button>
+                  <input
+                    value={l.name}
+                    onChange={(e) => renameLayer(l.id, e.target.value)}
+                    onFocus={() => setActiveLayerId(l.id)}
+                    className={`flex-1 min-w-0 bg-transparent text-[11px] outline-none ${activeLayerId === l.id ? "text-white" : "text-white/70"}`}
+                  />
+                  <span className="text-[9px] text-white/30">{l.strokes.length + l.images.length}</span>
+                  <button onClick={() => removeLayer(l.id)} disabled={layers.length === 1} className="text-[11px] text-white/40 hover:text-red-400 disabled:opacity-20" title="Удалить">✕</button>
+                </div>
+                <div className="flex items-center gap-1">
+                  <select
+                    value={l.blendMode || "source-over"}
+                    onChange={(e) => setLayerBlendMode(l.id, e.target.value as BlendMode)}
+                    className="flex-1 min-w-0 rounded border border-white/10 bg-black/40 px-1 py-0.5 text-[9px] outline-none">
+                    {BLEND_MODES.map(bm => <option key={bm.id} value={bm.id}>{bm.label}</option>)}
+                  </select>
+                  <input type="range" min={0} max={1} step={0.01} value={l.opacity ?? 1}
+                    onChange={(e) => setLayerOpacity(l.id, +e.target.value)}
+                    onMouseUp={pushHistory} onTouchEnd={pushHistory}
+                    className="w-16 accent-white" title="Непрозрачность" />
+                </div>
               </li>
             ))}
           </ul>
@@ -1101,14 +1900,134 @@ function Index() {
           </div>
         </section>
 
+        {/* Color picker */}
+        <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
+          <div className="flex items-center justify-between">
+            <div className="text-[9px] uppercase tracking-widest text-white/40">Цвет</div>
+            <button
+              onClick={() => setEyedropper(v => !v)}
+              className={`rounded border px-1.5 py-0.5 text-[10px] ${eyedropper ? "border-cyan-400/60 bg-cyan-400/10 text-cyan-200" : "border-white/10 bg-white/5 hover:bg-white/10"}`}
+              title="Пипетка">
+              ◉
+            </button>
+          </div>
+          <div className="relative">
+            <canvas
+              ref={slRef}
+              width={220}
+              height={120}
+              onPointerDown={onSLDown}
+              className="w-full rounded border border-white/10"
+              style={{ height: 120, touchAction: "none" }}
+            />
+            <div className="pointer-events-none absolute h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow"
+              style={{
+                left: `${color.s}%`,
+                top: `${100 - color.l}%`,
+                mixBlendMode: "difference",
+              }} />
+          </div>
+          <input type="range" min={0} max={360} value={color.h}
+            onChange={(e) => setColor(c => ({ ...c, h: +e.target.value }))}
+            className="w-full"
+            style={{ background: "linear-gradient(to right, hsl(0,90%,60%), hsl(60,90%,60%), hsl(120,90%,60%), hsl(180,90%,60%), hsl(240,90%,60%), hsl(300,90%,60%), hsl(360,90%,60%))", appearance: "none", height: 8, borderRadius: 999 }}
+          />
+          <div className="flex items-center gap-1.5">
+            <div className="h-8 w-8 rounded border border-white/20" style={{ backgroundColor: `rgba(${hslToRgb(color.h, color.s, color.l).join(",")},${color.a})` }} />
+            <input
+              value={currentColorHex}
+              onChange={(e) => {
+                const parsed = fromHex(e.target.value);
+                if (parsed) setColor(c => ({ ...c, h: parsed[0], s: parsed[1], l: parsed[2] }));
+              }}
+              className="w-20 rounded border border-white/10 bg-white/5 px-1.5 py-1 text-[10px] tabular-nums"
+            />
+            <label className="flex flex-1 flex-col text-[9px] text-white/50">
+              <span className="flex justify-between"><span>A</span><span>{Math.round(color.a * 100)}</span></span>
+              <input type="range" min={0} max={1} step={0.01} value={color.a}
+                onChange={(e) => setColor(c => ({ ...c, a: +e.target.value }))}
+                className="w-full accent-white" />
+            </label>
+          </div>
+          <div>
+            <div className="mb-1 flex items-center justify-between text-[9px] uppercase tracking-widest text-white/40">
+              <span>Палитра</span>
+              <button onClick={saveSwatch} className="rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[9px] hover:bg-white/10">+ Сохранить</button>
+            </div>
+            <div className="grid grid-cols-12 gap-1">
+              {PRESET_SWATCHES.map(hex => (
+                <button key={hex} onClick={() => {
+                  const p = fromHex(hex);
+                  if (p) setColor(c => ({ ...c, h: p[0], s: p[1], l: p[2] }));
+                }}
+                  className="h-4 w-4 rounded border border-white/10 hover:scale-110"
+                  style={{ backgroundColor: hex }} title={hex} />
+              ))}
+            </div>
+            {savedSwatches.length > 0 && (
+              <div className="mt-1 grid grid-cols-12 gap-1">
+                {savedSwatches.map((hex, i) => (
+                  <button key={hex + i}
+                    onClick={() => {
+                      const p = fromHex(hex);
+                      if (p) setColor(c => ({ ...c, h: p[0], s: p[1], l: p[2] }));
+                    }}
+                    onContextMenu={(e) => { e.preventDefault(); setSavedSwatches(prev => prev.filter((_, j) => j !== i)); }}
+                    className="h-4 w-4 rounded border border-white/10 hover:scale-110"
+                    style={{ backgroundColor: hex }} title={`${hex} (ПКМ — удалить)`} />
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* Brush */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Кисть</div>
           <div className="grid grid-cols-2 gap-1">
             {BRUSHES.map(b => (
-              <button key={b.id} onClick={() => setBrush(b.id)} className={`rounded border px-2 py-1 text-[10px] tracking-wider transition ${brush === b.id ? "border-white/60 bg-white/15" : "border-white/10 bg-white/[0.02] text-white/60 hover:bg-white/[0.06]"}`}>{b.label}</button>
+              <button key={b.id} onClick={() => { setBrush(b.id); setTool("brush"); }} className={`rounded border px-2 py-1 text-[10px] tracking-wider transition ${brush === b.id && tool === "brush" ? "border-white/60 bg-white/15" : "border-white/10 bg-white/[0.02] text-white/60 hover:bg-white/[0.06]"}`}>{b.label}</button>
             ))}
           </div>
         </section>
+
+        {/* Gradient brush config */}
+        {brush === "gradient" && (
+          <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
+            <div className="text-[9px] uppercase tracking-widest text-white/40">Градиент</div>
+            <div className="space-y-1">
+              {gradientCfg.stops.map((stp, i) => (
+                <div key={i} className="flex items-center gap-1">
+                  <input type="color" value={toHex(stp.h, stp.s, stp.l)}
+                    onChange={(e) => {
+                      const p = fromHex(e.target.value);
+                      if (!p) return;
+                      setGradientCfg(g => ({ ...g, stops: g.stops.map((s, j) => j === i ? { ...s, h: p[0], s: p[1], l: p[2] } : s) }));
+                    }}
+                    className="h-5 w-5 rounded border border-white/10 bg-transparent" />
+                  <input type="range" min={0} max={1} step={0.01} value={stp.offset}
+                    onChange={(e) => setGradientCfg(g => ({ ...g, stops: g.stops.map((s, j) => j === i ? { ...s, offset: +e.target.value } : s) }))}
+                    className="flex-1 accent-white" />
+                  <input type="range" min={0} max={1} step={0.01} value={stp.a}
+                    onChange={(e) => setGradientCfg(g => ({ ...g, stops: g.stops.map((s, j) => j === i ? { ...s, a: +e.target.value } : s) }))}
+                    className="w-10 accent-white" title="Alpha" />
+                  <button onClick={() => setGradientCfg(g => ({ ...g, stops: g.stops.filter((_, j) => j !== i) }))} disabled={gradientCfg.stops.length <= 2} className="text-[11px] text-white/40 hover:text-red-400 disabled:opacity-20">✕</button>
+                </div>
+              ))}
+              <button onClick={() => setGradientCfg(g => ({ ...g, stops: [...g.stops, { offset: 1, h: color.h, s: color.s, l: color.l, a: color.a }] }))} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1 text-[10px] hover:bg-white/10">+ Стоп</button>
+            </div>
+            <label className="flex items-center gap-2 text-[10px] text-white/60">
+              <input type="checkbox" checked={gradientCfg.animate} onChange={(e) => setGradientCfg(g => ({ ...g, animate: e.target.checked }))} />
+              Анимация
+            </label>
+            <label className="block text-[10px] text-white/50">
+              <span className="flex justify-between"><span>Скорость потока</span><span className="text-white/80">{gradientCfg.speed.toFixed(2)}</span></span>
+              <input type="range" min={0} max={2} step={0.05} value={gradientCfg.speed}
+                onChange={(e) => setGradientCfg(g => ({ ...g, speed: +e.target.value }))}
+                className="w-full accent-white" />
+            </label>
+          </section>
+        )}
 
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Режим</div>
@@ -1123,13 +2042,6 @@ function Index() {
           <label className="block text-[10px] uppercase tracking-widest text-white/50">
             <span className="mb-1 flex justify-between"><span>Размер</span><span className="text-white/80">{size}</span></span>
             <input type="range" min={4} max={120} value={size} onChange={(e) => setSize(+e.target.value)} className="w-full accent-white" />
-          </label>
-          <label className="block text-[10px] uppercase tracking-widest text-white/50">
-            <span className="mb-1 flex items-center justify-between">
-              <span>Цвет</span>
-              <span className="h-4 w-4 rounded-full border border-white/30" style={{ backgroundColor: `hsl(${hue}, 90%, 60%)` }} />
-            </span>
-            <input type="range" min={0} max={360} value={hue} onChange={(e) => setHue(+e.target.value)} className="w-full" style={{ background: "linear-gradient(to right, hsl(0,90%,60%), hsl(60,90%,60%), hsl(120,90%,60%), hsl(180,90%,60%), hsl(240,90%,60%), hsl(300,90%,60%), hsl(360,90%,60%))", appearance: "none", height: 6, borderRadius: 999 }} />
           </label>
         </section>
 
@@ -1149,7 +2061,6 @@ function Index() {
             PNG · {canvasSize.w * 2}×{canvasSize.h * 2}
           </button>
 
-          {/* GIF */}
           <div className="space-y-1 border-t border-white/10 pt-2">
             <div className="text-[9px] uppercase tracking-widest text-white/40">GIF</div>
             <div className="flex gap-1">
@@ -1171,7 +2082,6 @@ function Index() {
             </button>
           </div>
 
-          {/* MP4 */}
           <div className="space-y-1 border-t border-white/10 pt-2">
             <div className="text-[9px] uppercase tracking-widest text-white/40">MP4 / WebM</div>
             <div className="flex gap-1">
@@ -1199,9 +2109,9 @@ function Index() {
         </section>
 
         <div className="text-center text-[9px] leading-relaxed text-white/30">
-          Ctrl+Z / Shift+Ctrl+Z<br/>
-          Space + drag · Middle-click = pan<br/>
-          Wheel = zoom · Pinch on touch
+          B кисть · V выделение · O объект · T трансформ<br/>
+          Del удалить · Ctrl+D дублировать · Esc сброс<br/>
+          Ctrl+Z / Shift+Ctrl+Z · Space+drag = pan · Wheel = zoom
         </div>
       </aside>
 
@@ -1232,6 +2142,10 @@ function Index() {
             ⬇ Отпустите изображения на холст
           </div>
         )}
+        <div className="pointer-events-none absolute top-3 left-1/2 -translate-x-1/2 rounded-md border border-white/10 bg-black/60 px-3 py-1 text-[10px] tracking-widest text-white/70 backdrop-blur">
+          {tool === "brush" ? "КИСТЬ" : tool === "select-rect" ? "ВЫДЕЛЕНИЕ" : tool === "select-object" ? "ВЫД. ОБЪЕКТА" : "ТРАНСФОРМАЦИЯ"}
+          {eyedropper && " · ПИПЕТКА"}
+        </div>
         <div className="pointer-events-none absolute bottom-3 right-3 flex items-center gap-1 rounded-md border border-white/10 bg-black/60 p-1 text-[11px] backdrop-blur">
           <button
             onClick={() => {
