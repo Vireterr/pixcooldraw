@@ -19,12 +19,11 @@ type BrushKind =
   | "pixelRain"
   | "pixelDither"
   | "pixelGlitch"
-  | "gradient"
   | "eraser";
 
 type ModeKind = "normal" | "rainbow" | "pulse" | "spray" | "mirror";
 
-type Tool = "brush" | "select-rect" | "select-object" | "transform";
+type Tool = "brush" | "select-rect" | "select-brush" | "select-object" | "transform";
 
 type BlendMode =
   | "source-over"
@@ -103,7 +102,6 @@ const BRUSHES: { id: BrushKind; label: string }[] = [
   { id: "pixelRain", label: "Пикс. дождь" },
   { id: "pixelDither", label: "Дизеринг" },
   { id: "pixelGlitch", label: "Глитч" },
-  { id: "gradient", label: "Градиент" },
   { id: "eraser", label: "Ластик" },
 ];
 
@@ -422,13 +420,12 @@ function renderStroke(ctx: CanvasRenderingContext2D, s: Stroke, t: number, dtRaw
       }
     }
   }
-  else if (s.kind === "gradient") {
-    // Animated gradient stroke along the path
-    if (pts.length < 2) return;
-    const g = s.gradient || { stops: [
-      { offset: 0, h: s.hue, s: SAT, l: 55, a: 1 },
-      { offset: 1, h: (s.hue + 120) % 360, s: SAT, l: 60, a: 1 },
-    ], angle: 0, animate: true, speed: 0.4 };
+
+  // Gradient effect — applied in addition to base kind when s.gradient is present
+  if (s.gradient && s.kind !== "eraser") {
+    const pts2 = s.points;
+    if (pts2.length < 2) return;
+    const g = s.gradient;
     const flow = g.animate ? (tt * g.speed) : 0;
     ctx.save();
     ctx.lineCap = "round";
@@ -521,6 +518,7 @@ function renderFrameToCanvas(
   imgCache: Map<string, HTMLImageElement>,
   t: number, dtRaw: number, now: number,
   layerBuffer?: HTMLCanvasElement,
+  selectionMask?: HTMLCanvasElement | null,
 ) {
   const sx = targetW / canvasW, sy = targetH / canvasH;
   tctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -534,12 +532,18 @@ function renderFrameToCanvas(
     if (!layer.visible) continue;
     const bm: BlendMode = layer.blendMode || "source-over";
     const op = layer.opacity ?? 1;
-    if (bm !== "source-over" && layerBuffer) {
+    const useBuffer = bm !== "source-over" || !!selectionMask;
+    if (useBuffer && layerBuffer) {
       layerBuffer.width = canvasW; layerBuffer.height = canvasH;
       const lctx = layerBuffer.getContext("2d")!;
       lctx.setTransform(1, 0, 0, 1, 0, 0);
       lctx.clearRect(0, 0, canvasW, canvasH);
       renderLayerContent(lctx, layer, imgCache, t, dtRaw, now);
+      if (selectionMask) {
+        lctx.globalCompositeOperation = "destination-in";
+        lctx.drawImage(selectionMask, 0, 0);
+        lctx.globalCompositeOperation = "source-over";
+      }
       const prev = tctx.globalCompositeOperation;
       const prevA = tctx.globalAlpha;
       tctx.globalCompositeOperation = bm;
@@ -590,9 +594,14 @@ function Index() {
 
   const imgCache = useRef<Map<string, HTMLImageElement>>(new Map());
   const layerBufferRef = useRef<HTMLCanvasElement | null>(null);
+  const overlayBufferRef = useRef<HTMLCanvasElement | null>(null);
   const getLayerBuffer = () => {
     if (!layerBufferRef.current) layerBufferRef.current = document.createElement("canvas");
     return layerBufferRef.current;
+  };
+  const getOverlayBuffer = () => {
+    if (!overlayBufferRef.current) overlayBufferRef.current = document.createElement("canvas");
+    return overlayBufferRef.current;
   };
   const ensureImg = (src: string): HTMLImageElement | null => {
     const c = imgCache.current;
@@ -685,6 +694,74 @@ function Index() {
   });
   const gradientRef = useRef(gradientCfg);
   useEffect(() => { gradientRef.current = gradientCfg; }, [gradientCfg]);
+
+  // Gradient as an independent effect (works with any brush)
+  const [gradientEnabled, setGradientEnabled] = useState(false);
+  const gradientEnabledRef = useRef(false);
+  useEffect(() => { gradientEnabledRef.current = gradientEnabled; }, [gradientEnabled]);
+
+  // Selection mask (world-space alpha mask). White = inside selection.
+  const selectionMaskRef = useRef<HTMLCanvasElement | null>(null);
+  const [hasSelection, setHasSelection] = useState(false);
+  const hasSelectionRef = useRef(false);
+  const selectionOpModeRef = useRef<"add" | "sub" | "replace">("replace");
+  useEffect(() => { hasSelectionRef.current = hasSelection; markDirty(); }, [hasSelection]);
+  const [selectionBrushSize, setSelectionBrushSize] = useState(48);
+  const selectionBrushSizeRef = useRef(selectionBrushSize);
+  useEffect(() => { selectionBrushSizeRef.current = selectionBrushSize; }, [selectionBrushSize]);
+
+  const ensureSelectionMask = useCallback((): HTMLCanvasElement => {
+    const cs = canvasSizeRef.current;
+    let m = selectionMaskRef.current;
+    if (!m) { m = document.createElement("canvas"); selectionMaskRef.current = m; }
+    if (m.width !== cs.w || m.height !== cs.h) { m.width = cs.w; m.height = cs.h; }
+    return m;
+  }, []);
+  const clearSelectionMask = useCallback(() => {
+    const m = selectionMaskRef.current;
+    if (m) { const c = m.getContext("2d")!; c.setTransform(1,0,0,1,0,0); c.clearRect(0,0,m.width,m.height); }
+    setHasSelection(false);
+    markDirty();
+  }, []);
+  const paintSelectionCircle = useCallback((wx: number, wy: number, r: number, mode: "add" | "sub") => {
+    const m = ensureSelectionMask();
+    const c = m.getContext("2d")!;
+    c.setTransform(1,0,0,1,0,0);
+    c.globalCompositeOperation = mode === "sub" ? "destination-out" : "source-over";
+    c.fillStyle = "#fff";
+    c.beginPath(); c.arc(wx, wy, r, 0, Math.PI * 2); c.fill();
+    c.globalCompositeOperation = "source-over";
+    setHasSelection(true);
+    markDirty();
+  }, [ensureSelectionMask]);
+  const paintSelectionRect = useCallback((rect: SelectionRect, mode: "add" | "sub" | "replace") => {
+    const m = ensureSelectionMask();
+    const c = m.getContext("2d")!;
+    c.setTransform(1,0,0,1,0,0);
+    if (mode === "replace") c.clearRect(0,0,m.width,m.height);
+    c.globalCompositeOperation = mode === "sub" ? "destination-out" : "source-over";
+    c.fillStyle = "#fff";
+    c.fillRect(rect.x, rect.y, rect.w, rect.h);
+    c.globalCompositeOperation = "source-over";
+    setHasSelection(true);
+    markDirty();
+  }, [ensureSelectionMask]);
+  const selectAllMask = useCallback(() => {
+    const cs = canvasSizeRef.current;
+    paintSelectionRect({ x: 0, y: 0, w: cs.w, h: cs.h }, "replace");
+  }, [paintSelectionRect]);
+  const invertMask = useCallback(() => {
+    const m = ensureSelectionMask();
+    const c = m.getContext("2d")!;
+    c.setTransform(1,0,0,1,0,0);
+    c.globalCompositeOperation = "xor";
+    c.fillStyle = "#fff";
+    c.fillRect(0, 0, m.width, m.height);
+    c.globalCompositeOperation = "source-over";
+    setHasSelection(true);
+    markDirty();
+  }, [ensureSelectionMask]);
+
 
   const [recording, setRecording] = useState<null | "gif" | "mp4">(null);
   const [recordProgress, setRecordProgress] = useState(0);
@@ -871,19 +948,26 @@ function Index() {
       ctx.clip();
 
       const t = now / 1000;
+      const activeMask = hasSelectionRef.current ? selectionMaskRef.current : null;
       for (const layer of layersRef.current) {
         if (!layer.visible) continue;
         // Preload images
         for (const im of layer.images) ensureImg(im.src);
         const bm: BlendMode = layer.blendMode || "source-over";
         const op = layer.opacity ?? 1;
-        if (bm !== "source-over") {
+        const useBuffer = bm !== "source-over" || !!activeMask;
+        if (useBuffer) {
           const buf = getLayerBuffer();
           if (buf.width !== cs.w || buf.height !== cs.h) { buf.width = cs.w; buf.height = cs.h; }
           const lctx = buf.getContext("2d")!;
           lctx.setTransform(1, 0, 0, 1, 0, 0);
           lctx.clearRect(0, 0, cs.w, cs.h);
           renderLayerContent(lctx, layer, imgCache.current, t, dtRaw, now);
+          if (activeMask) {
+            lctx.globalCompositeOperation = "destination-in";
+            lctx.drawImage(activeMask, 0, 0);
+            lctx.globalCompositeOperation = "source-over";
+          }
           const prev = ctx.globalCompositeOperation;
           const prevA = ctx.globalAlpha;
           ctx.globalCompositeOperation = bm;
@@ -897,6 +981,20 @@ function Index() {
           renderLayerContent(ctx, layer, imgCache.current, t, dtRaw, now);
           ctx.globalAlpha = prevA;
         }
+      }
+      // Selection mask overlay in world-space (dim area outside selection)
+      if (activeMask) {
+        const ov = getOverlayBuffer();
+        if (ov.width !== cs.w || ov.height !== cs.h) { ov.width = cs.w; ov.height = cs.h; }
+        const octx = ov.getContext("2d")!;
+        octx.setTransform(1, 0, 0, 1, 0, 0);
+        octx.clearRect(0, 0, cs.w, cs.h);
+        octx.fillStyle = "rgba(0,0,0,0.35)";
+        octx.fillRect(0, 0, cs.w, cs.h);
+        octx.globalCompositeOperation = "destination-out";
+        octx.drawImage(activeMask, 0, 0);
+        octx.globalCompositeOperation = "source-over";
+        ctx.drawImage(ov, 0, 0);
       }
       ctx.restore();
 
@@ -982,7 +1080,7 @@ function Index() {
       points: [],
       born: performance.now(),
       originY: wy,
-      gradient: refs.brush.current === "gradient" ? JSON.parse(JSON.stringify(gradientRef.current)) : undefined,
+      gradient: gradientEnabledRef.current ? JSON.parse(JSON.stringify(gradientRef.current)) : undefined,
     };
     currentStrokeRef.current = stroke;
     layer.strokes.push(stroke);
@@ -1266,12 +1364,26 @@ function Index() {
 
     if (tl === "select-rect") {
       setSelectedObj(null);
+      selectionOpModeRef.current = e.shiftKey ? "add" : e.altKey ? "sub" : "replace";
       rectDragRef.current = { startX: wpt.x, startY: wpt.y };
       setSelectionRect({ x: wpt.x, y: wpt.y, w: 0, h: 0 });
       drawingPointerId.current = e.pointerId;
       lastDrawScreen.current = local;
       return;
     }
+
+    if (tl === "select-brush") {
+      setSelectedObj(null);
+      selectionOpModeRef.current = e.shiftKey ? "add" : e.altKey ? "sub" : "add";
+      if (selectionOpModeRef.current === "add" && !e.shiftKey && !hasSelectionRef.current) {
+        // fresh selection start
+      }
+      paintSelectionCircle(wpt.x, wpt.y, selectionBrushSizeRef.current / 2, selectionOpModeRef.current === "sub" ? "sub" : "add");
+      drawingPointerId.current = e.pointerId;
+      lastDrawScreen.current = local;
+      return;
+    }
+
 
     // brush / eraser
     if (refs.brush.current === "eraser") {
@@ -1334,6 +1446,21 @@ function Index() {
       });
       return;
     }
+    if (tl === "select-brush") {
+      const px = lastDrawScreen.current.x, py = lastDrawScreen.current.y;
+      const dx = local.x - px, dy = local.y - py;
+      const dist = Math.hypot(dx, dy);
+      const r = selectionBrushSizeRef.current / 2;
+      const step = Math.max(3, r * 0.4);
+      const steps = Math.max(1, Math.floor(dist / step));
+      for (let i = 1; i <= steps; i++) {
+        const sx2 = px + dx * (i / steps), sy2 = py + dy * (i / steps);
+        const w = screenToWorld(sx2, sy2);
+        paintSelectionCircle(w.x, w.y, r, selectionOpModeRef.current === "sub" ? "sub" : "add");
+      }
+      lastDrawScreen.current = local;
+      return;
+    }
     if (tl === "select-object") return;
 
     if (refs.brush.current === "eraser") {
@@ -1341,6 +1468,7 @@ function Index() {
       lastDrawScreen.current = local;
       return;
     }
+
     const px = lastDrawScreen.current.x, py = lastDrawScreen.current.y;
     const dx = local.x - px, dy = local.y - py;
     const dist = Math.hypot(dx, dy);
@@ -1363,8 +1491,13 @@ function Index() {
         activeTransform.current = null;
         pushHistory();
       } else if (rectDragRef.current) {
+        // commit selection rect into mask
+        const r = selectionRectRef.current;
+        if (r && r.w > 2 && r.h > 2) {
+          paintSelectionRect(r, selectionOpModeRef.current);
+        }
         rectDragRef.current = null;
-        // keep selection rect
+        setSelectionRect(null);
       } else if (currentStrokeRef.current) {
         currentStrokeRef.current = null;
         pushHistory();
@@ -1466,11 +1599,16 @@ function Index() {
       else if ((e.key === "Delete" || e.key === "Backspace") && !inField) {
         deleteSelection();
       } else if (e.key === "Escape") {
-        setSelectedObj(null); setSelectionRect(null);
+        setSelectedObj(null); setSelectionRect(null); clearSelectionMask();
+      } else if (meta && e.key.toLowerCase() === "a" && !inField) {
+        e.preventDefault(); selectAllMask();
+      } else if (meta && e.shiftKey && e.key.toLowerCase() === "i" && !inField) {
+        e.preventDefault(); invertMask();
       } else if (!inField && !meta) {
         const k = e.key.toLowerCase();
         if (k === "b") setTool("brush");
         else if (k === "v") setTool("select-rect");
+        else if (k === "l") setTool("select-brush");
         else if (k === "o") setTool("select-object");
         else if (k === "t") setTool("transform");
       }
@@ -1481,7 +1619,7 @@ function Index() {
     window.addEventListener("keydown", dn);
     window.addEventListener("keyup", up);
     return () => { window.removeEventListener("keydown", dn); window.removeEventListener("keyup", up); };
-  }, [undo, redo, deleteSelection, duplicateSelection]);
+  }, [undo, redo, deleteSelection, duplicateSelection, clearSelectionMask, selectAllMask, invertMask]);
 
   /* ---------- Layer ops ---------- */
   const addLayer = () => {
@@ -1610,7 +1748,7 @@ function Index() {
     const tctx = tmp.getContext("2d")!;
     const now = performance.now();
     const buf = document.createElement("canvas");
-    renderFrameToCanvas(tctx, tmp.width, tmp.height, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, 16, now, buf);
+    renderFrameToCanvas(tctx, tmp.width, tmp.height, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, 16, now, buf, hasSelectionRef.current ? selectionMaskRef.current : null);
     tmp.toBlob((blob) => {
       if (!blob) return;
       const url = URL.createObjectURL(blob);
@@ -1640,7 +1778,7 @@ function Index() {
 
       for (let i = 0; i < total; i++) {
         const now = startNow + i * dtRaw;
-        renderFrameToCanvas(tctx, gifW, gifH, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, dtRaw, now, buf);
+        renderFrameToCanvas(tctx, gifW, gifH, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, dtRaw, now, buf, hasSelectionRef.current ? selectionMaskRef.current : null);
         const data = tctx.getImageData(0, 0, gifW, gifH).data;
         const palette = quantize(data, 256);
         const index = applyPalette(data, palette);
@@ -1672,7 +1810,7 @@ function Index() {
     tmp.width = outW; tmp.height = outH;
     const tctx = tmp.getContext("2d")!;
     const buf = document.createElement("canvas");
-    renderFrameToCanvas(tctx, outW, outH, cs.w, cs.h, layersRef.current, imgCache.current, 0, 1000 / mp4Fps, performance.now(), buf);
+    renderFrameToCanvas(tctx, outW, outH, cs.w, cs.h, layersRef.current, imgCache.current, 0, 1000 / mp4Fps, performance.now(), buf, hasSelectionRef.current ? selectionMaskRef.current : null);
 
     interface CaptureCanvas extends HTMLCanvasElement { captureStream(fps?: number): MediaStream }
     const stream = (tmp as CaptureCanvas).captureStream(0);
@@ -1691,7 +1829,7 @@ function Index() {
     const startNow = performance.now();
     for (let i = 0; i < total; i++) {
       const now = startNow + i * dtRaw;
-      renderFrameToCanvas(tctx, outW, outH, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, dtRaw, now, buf);
+      renderFrameToCanvas(tctx, outW, outH, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, dtRaw, now, buf, hasSelectionRef.current ? selectionMaskRef.current : null);
       if (track.requestFrame) track.requestFrame();
       setRecordProgress((i + 1) / total);
       await new Promise(r => setTimeout(r, Math.max(1, Math.floor(1000 / mp4Fps))));
@@ -1769,7 +1907,7 @@ function Index() {
 
   const cursor = spaceDown || panState.current ? "grab"
     : eyedropper ? "crosshair"
-    : tool === "select-rect" || tool === "select-object" ? "crosshair"
+    : tool === "select-rect" || tool === "select-object" || tool === "select-brush" ? "crosshair"
     : tool === "transform" ? "move"
     : brush === "eraser" ? "cell" : "crosshair";
 
@@ -1791,10 +1929,11 @@ function Index() {
         {/* Tools */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Инструменты</div>
-          <div className="grid grid-cols-4 gap-1">
+          <div className="grid grid-cols-5 gap-1">
             {([
               { id: "brush", label: "✎", title: "Кисть (B)" },
-              { id: "select-rect", label: "▭", title: "Выделение (V)" },
+              { id: "select-rect", label: "▭", title: "Прямоуг. выделение (V)" },
+              { id: "select-brush", label: "⌇", title: "Кисть выделения (L) — Shift доб., Alt выч." },
               { id: "select-object", label: "◎", title: "Выд. объекта (O)" },
               { id: "transform", label: "⤢", title: "Трансформация (T)" },
             ] as { id: Tool; label: string; title: string }[]).map(t => (
@@ -1813,7 +1952,27 @@ function Index() {
               <button onClick={duplicateSelection} disabled={!selectedObj} className="flex-1 rounded border border-white/10 bg-white/5 px-2 py-1 text-[10px] tracking-widest hover:bg-white/10 disabled:opacity-30">Дублировать</button>
             </div>
           )}
+          {(tool === "select-rect" || tool === "select-brush" || hasSelection) && (
+            <div className="mt-2 space-y-1.5 border-t border-white/10 pt-2">
+              {tool === "select-brush" && (
+                <label className="block text-[10px] text-white/60">
+                  <span className="flex justify-between"><span>Размер кисти выд.</span><span className="text-white/80">{selectionBrushSize}</span></span>
+                  <input type="range" min={4} max={200} value={selectionBrushSize} onChange={(e) => setSelectionBrushSize(+e.target.value)} className="w-full accent-white" />
+                </label>
+              )}
+              <div className="flex gap-1">
+                <button onClick={selectAllMask} className="flex-1 rounded border border-white/10 bg-white/5 px-1.5 py-1 text-[10px] hover:bg-white/10">Всё</button>
+                <button onClick={invertMask} disabled={!hasSelection} className="flex-1 rounded border border-white/10 bg-white/5 px-1.5 py-1 text-[10px] hover:bg-white/10 disabled:opacity-30">Инверт.</button>
+                <button onClick={clearSelectionMask} disabled={!hasSelection} className="flex-1 rounded border border-white/10 bg-white/5 px-1.5 py-1 text-[10px] hover:bg-white/10 disabled:opacity-30">Снять</button>
+              </div>
+              <div className="text-[9px] text-white/40 leading-relaxed">
+                Все кисти рисуют только внутри выделения.<br/>
+                Shift = добавить · Alt = вычесть
+              </div>
+            </div>
+          )}
         </section>
+
 
         {/* Canvas size */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-1.5">
@@ -1991,43 +2150,52 @@ function Index() {
           </div>
         </section>
 
-        {/* Gradient brush config */}
-        {brush === "gradient" && (
-          <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
-            <div className="text-[9px] uppercase tracking-widest text-white/40">Градиент</div>
-            <div className="space-y-1">
-              {gradientCfg.stops.map((stp, i) => (
-                <div key={i} className="flex items-center gap-1">
-                  <input type="color" value={toHex(stp.h, stp.s, stp.l)}
-                    onChange={(e) => {
-                      const p = fromHex(e.target.value);
-                      if (!p) return;
-                      setGradientCfg(g => ({ ...g, stops: g.stops.map((s, j) => j === i ? { ...s, h: p[0], s: p[1], l: p[2] } : s) }));
-                    }}
-                    className="h-5 w-5 rounded border border-white/10 bg-transparent" />
-                  <input type="range" min={0} max={1} step={0.01} value={stp.offset}
-                    onChange={(e) => setGradientCfg(g => ({ ...g, stops: g.stops.map((s, j) => j === i ? { ...s, offset: +e.target.value } : s) }))}
-                    className="flex-1 accent-white" />
-                  <input type="range" min={0} max={1} step={0.01} value={stp.a}
-                    onChange={(e) => setGradientCfg(g => ({ ...g, stops: g.stops.map((s, j) => j === i ? { ...s, a: +e.target.value } : s) }))}
-                    className="w-10 accent-white" title="Alpha" />
-                  <button onClick={() => setGradientCfg(g => ({ ...g, stops: g.stops.filter((_, j) => j !== i) }))} disabled={gradientCfg.stops.length <= 2} className="text-[11px] text-white/40 hover:text-red-400 disabled:opacity-20">✕</button>
-                </div>
-              ))}
-              <button onClick={() => setGradientCfg(g => ({ ...g, stops: [...g.stops, { offset: 1, h: color.h, s: color.s, l: color.l, a: color.a }] }))} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1 text-[10px] hover:bg-white/10">+ Стоп</button>
+        {/* Effects — combinable with any brush */}
+        <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
+          <div className="flex items-center justify-between">
+            <div className="text-[9px] uppercase tracking-widest text-white/40">Эффекты</div>
+          </div>
+          <label className="flex items-center gap-2 text-[11px] text-white/80">
+            <input type="checkbox" checked={gradientEnabled} onChange={(e) => setGradientEnabled(e.target.checked)} />
+            <span>Градиент</span>
+          </label>
+          {gradientEnabled && (
+            <div className="space-y-2 rounded border border-white/10 bg-black/20 p-2">
+              <div className="space-y-1">
+                {gradientCfg.stops.map((stp, i) => (
+                  <div key={i} className="flex items-center gap-1">
+                    <input type="color" value={toHex(stp.h, stp.s, stp.l)}
+                      onChange={(e) => {
+                        const p = fromHex(e.target.value);
+                        if (!p) return;
+                        setGradientCfg(g => ({ ...g, stops: g.stops.map((s, j) => j === i ? { ...s, h: p[0], s: p[1], l: p[2] } : s) }));
+                      }}
+                      className="h-5 w-5 rounded border border-white/10 bg-transparent" />
+                    <input type="range" min={0} max={1} step={0.01} value={stp.offset}
+                      onChange={(e) => setGradientCfg(g => ({ ...g, stops: g.stops.map((s, j) => j === i ? { ...s, offset: +e.target.value } : s) }))}
+                      className="flex-1 accent-white" />
+                    <input type="range" min={0} max={1} step={0.01} value={stp.a}
+                      onChange={(e) => setGradientCfg(g => ({ ...g, stops: g.stops.map((s, j) => j === i ? { ...s, a: +e.target.value } : s) }))}
+                      className="w-10 accent-white" title="Alpha" />
+                    <button onClick={() => setGradientCfg(g => ({ ...g, stops: g.stops.filter((_, j) => j !== i) }))} disabled={gradientCfg.stops.length <= 2} className="text-[11px] text-white/40 hover:text-red-400 disabled:opacity-20">✕</button>
+                  </div>
+                ))}
+                <button onClick={() => setGradientCfg(g => ({ ...g, stops: [...g.stops, { offset: 1, h: color.h, s: color.s, l: color.l, a: color.a }] }))} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1 text-[10px] hover:bg-white/10">+ Стоп</button>
+              </div>
+              <label className="flex items-center gap-2 text-[10px] text-white/60">
+                <input type="checkbox" checked={gradientCfg.animate} onChange={(e) => setGradientCfg(g => ({ ...g, animate: e.target.checked }))} />
+                Анимация
+              </label>
+              <label className="block text-[10px] text-white/50">
+                <span className="flex justify-between"><span>Скорость потока</span><span className="text-white/80">{gradientCfg.speed.toFixed(2)}</span></span>
+                <input type="range" min={0} max={2} step={0.05} value={gradientCfg.speed}
+                  onChange={(e) => setGradientCfg(g => ({ ...g, speed: +e.target.value }))}
+                  className="w-full accent-white" />
+              </label>
             </div>
-            <label className="flex items-center gap-2 text-[10px] text-white/60">
-              <input type="checkbox" checked={gradientCfg.animate} onChange={(e) => setGradientCfg(g => ({ ...g, animate: e.target.checked }))} />
-              Анимация
-            </label>
-            <label className="block text-[10px] text-white/50">
-              <span className="flex justify-between"><span>Скорость потока</span><span className="text-white/80">{gradientCfg.speed.toFixed(2)}</span></span>
-              <input type="range" min={0} max={2} step={0.05} value={gradientCfg.speed}
-                onChange={(e) => setGradientCfg(g => ({ ...g, speed: +e.target.value }))}
-                className="w-full accent-white" />
-            </label>
-          </section>
-        )}
+          )}
+        </section>
+
 
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Режим</div>
@@ -2109,7 +2277,7 @@ function Index() {
         </section>
 
         <div className="text-center text-[9px] leading-relaxed text-white/30">
-          B кисть · V выделение · O объект · T трансформ<br/>
+          B кисть · V выд.▭ · L выд.кисть · O объект · T трансформ<br/>
           Del удалить · Ctrl+D дублировать · Esc сброс<br/>
           Ctrl+Z / Shift+Ctrl+Z · Space+drag = pan · Wheel = zoom
         </div>
@@ -2143,7 +2311,7 @@ function Index() {
           </div>
         )}
         <div className="pointer-events-none absolute top-3 left-1/2 -translate-x-1/2 rounded-md border border-white/10 bg-black/60 px-3 py-1 text-[10px] tracking-widest text-white/70 backdrop-blur">
-          {tool === "brush" ? "КИСТЬ" : tool === "select-rect" ? "ВЫДЕЛЕНИЕ" : tool === "select-object" ? "ВЫД. ОБЪЕКТА" : "ТРАНСФОРМАЦИЯ"}
+          {tool === "brush" ? "КИСТЬ" : tool === "select-rect" ? "ВЫДЕЛЕНИЕ ▭" : tool === "select-brush" ? "КИСТЬ ВЫДЕЛЕНИЯ" : tool === "select-object" ? "ВЫД. ОБЪЕКТА" : "ТРАНСФОРМАЦИЯ"}
           {eyedropper && " · ПИПЕТКА"}
         </div>
         <div className="pointer-events-none absolute bottom-3 right-3 flex items-center gap-1 rounded-md border border-white/10 bg-black/60 p-1 text-[11px] backdrop-blur">

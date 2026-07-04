@@ -1,87 +1,65 @@
-## Scope
+## Правки инструментов выделения и градиента
 
-Extend the existing drawing studio in `src/routes/index.tsx` without breaking current brushes, layers, history, export or pan/zoom. All additions are additive.
+Всё в `src/routes/index.tsx` (+ мелкие хелперы в `src/lib/canvas-tools.ts`, если он уже есть — иначе inline). Существующие «Выделение объекта» и «Свободная трансформация» не трогаем.
 
-## 1. Tool system
+### 1. Выделение как маска рисования (а не как выбор объектов)
 
-Add a top-level `Tool` mode alongside brushes:
+Меняем семантику `select-rect` и добавляем `select-brush`:
 
-```
-type Tool = "brush" | "select-rect" | "select-object" | "transform"
-```
+- Прямоугольное выделение (`select-rect`): drag рисует rect в world-space. По отпусканию — коммит в единый `selectionMask`.
+- Кисть выделения (`select-brush`): не рисует штрих по холсту. Движение курсора/пальца добавляет круги радиуса `selectionBrushSize` в `selectionMask` (freeform lasso по мазку). Поддержка Shift = добавить, Alt = вычесть.
 
-Sidebar toolbar (above brush list): Кисть, Ластик, Выделение, Выделение объекта, Свободная трансформация.
+`selectionMask`:
+- Offscreen `HTMLCanvasElement` размером с холст (world-space, 1:1 пикселям документа).
+- Чёрно-белая альфа-маска (белое = «внутри выделения»).
+- Хранится в ref, не в React state; инвалидирует `dirtyRef` при изменении.
+- Кнопки в панели выделения: «Снять выделение» (Esc), «Инвертировать», «Выделить всё».
+- Оверлей на экране: marching-ants по контуру маски (через `ctx.setLineDash` + анимация `lineDashOffset`) плюс полупрозрачная синяя заливка вне маски.
 
-### Rectangular selection (`select-rect`)
-- Drag creates world-space rect `{ x,y,w,h, layerId }`.
-- Animated marching-ants overlay (dashed stroke, `lineDashOffset` in the existing RAF loop).
-- Actions: Delete / Duplicate / Clear on selected region. Strokes hit by cached `bbox`; images by rectangle intersection.
+### 2. Ограничение всех кистей/эффектов областью выделения
 
-### Object selection (`select-object`)
-- Click picks top-most object under cursor in active layer:
-  - Image: rect hit-test.
-  - Stroke: expanded bbox → per-segment distance ≤ size/2.
-- Selected object drawn with outline; supports Delete / Ctrl+D.
+В `renderFrameToCanvas` (и в live-рендере, и в экспорте) для каждого слоя:
 
-### Free transform (`transform`)
-- Auto-enabled when an object/region is selected, or picked from toolbar.
-- 8 scale handles + rotate handle above bbox. Drag inside = move; corner = uniform (Shift constrain); rotate handle = rotate around center.
-- Applies affine transform to underlying data:
-  - Image gains `rotation` (default 0); renderer uses `translate/rotate`.
-  - Stroke points transformed by matrix; `size` scaled by average scale.
-- Commit on pointer-up → single `pushHistory()` snapshot. Esc cancels.
+1. Рисуем содержимое слоя в `layerBuffer` как сейчас.
+2. Если `selectionMask` активна, применяем к `layerBuffer` маску:
+   `ctx.globalCompositeOperation = "destination-in"` → `drawImage(selectionMask)`.
+3. Композитим `layerBuffer` на основной ctx с текущим `blendMode`/`opacity`.
 
-## 2. Layer blend modes
+Это автоматически ограничивает ВСЕ кисти (обычные, анимированные — чернила/молнии/лента, будущий градиент-режим и эффекты) без правок в самих алгоритмах кистей.
 
-Add `blendMode: GlobalCompositeOperation` to `Layer` (default `"source-over"`).
+Во время активного мазка живой предпросмотр использует ту же маску, поэтому пользователь видит границу сразу.
 
-- `renderScene` and export renderer set `ctx.globalCompositeOperation = layer.blendMode` before drawing each layer's composite; reset after.
-- Layers panel row gets a compact `<select>`:
-  `normal, multiply, screen, overlay, darken, lighten, color-dodge, color-burn, hard-light, soft-light, difference, exclusion, hue, saturation, color, luminosity`.
-- Included in `serializeLayers` for undo/redo.
+### 3. Градиент — режим, а не кисть
 
-## 3. Extended color palette
+Удаляем `BrushKind: "gradient"`. Возвращаем прежний набор кистей.
 
-Replace lone hue slider with a full color picker; keep backward compatibility.
+Добавляем независимые модификаторы к любой кисти (state `brushEffects`):
 
-- State: `color: { h, s, l, a }`. Derive existing `hue` from `color.h`; extend brush code to read optional `hsl` on `Stroke` (falls back to current constants).
-- New collapsible "Цвет" panel:
-  - Canvas-based 2D saturation/lightness square + hue slider.
-  - Alpha slider.
-  - Hex + HSL numeric inputs.
-  - Preset swatches (12) + user palette (up to 24, "Сохранить" adds current; right-click removes).
-  - Eyedropper button: next canvas click samples pixel from composed scene.
+- `gradient: { enabled, stops[], angle, animate, speed }`
+- (существующие анимационные эффекты — «чернила», «молнии», «лента» — становятся такими же независимыми флажками и свободно комбинируются)
 
-## 4. Gradient brush
+UI: под выбором кисти — секция «Эффекты» с чекбоксами. Каждый чекбокс раскрывает свои параметры. Можно включить сразу несколько (например, градиент + молнии + анимация).
 
-New `BrushKind: "gradient"`. Renders each stroke as a gradient-filled band along the path, animated over time.
+Рендер штриха:
+- База — обычный путь текущей кисти.
+- Если `gradient.enabled`: `strokeStyle` = `CanvasGradient` по стопам и углу; при `animate` — сдвиг offset по времени через существующий RAF.
+- Анимационные эффекты применяются как пост-модификаторы к тому же пути (последовательно), а не как альтернативные ветви.
 
-- Stroke gains optional `gradient: { stops: [{ offset:0..1, h,s,l,a }, ...], angle: number, animate: boolean }`. Defaults: two stops derived from current color + complement, `angle=0`, `animate=true`.
-- Renderer:
-  - Builds a `CanvasGradient` per segment along the direction of travel (or across the stroke width for cross-stroke gradients — toggle via `angle`).
-  - When `animate=true`, offsets are shifted by `(t * speed) % 1` each frame → flowing gradient. Uses the existing time-driven RAF; drives the dirty flag.
-  - Uses `ctx.lineWidth = size`, `lineCap: "round"`, `strokeStyle = gradient` per short segment (segment length ≈ 24px so stops remain visible on curves).
-- New UI in brush parameters when Gradient is active:
-  - Stop editor (add/remove/reorder stops, each with color chip from the color picker).
-  - Angle (0–360°) and animation speed sliders.
-  - "Взять из палитры" quick-fill from preset palette.
-- Included in serialization; snapshots without `gradient` fall back to defaults.
+Сериализация: на штрихе `effects?: { gradient?, ink?, lightning?, ribbon? }`. Старые штрихи без поля рендерятся как раньше.
 
-## Technical notes
+### 4. Клавиатура и панель
 
-- Files:
-  - `src/routes/index.tsx` — wire new state and UI.
-  - `src/lib/canvas-tools.ts` — `strokeBBox`, `hitTestStroke`, `transformPoint`, matrix builder, dash helper.
-  - `src/lib/color.ts` — hsl↔hex↔rgb converters.
-  - `src/components/color-picker.tsx` — canvas SL square + hue/alpha + swatches + eyedropper trigger.
-  - `src/components/gradient-editor.tsx` — stops editor with color picker popover.
-  - `src/components/tool-bar.tsx` — 5-button top-level tool selector.
-- Renderer overlays for selection/transform are on-screen only; skipped in export renderer (kept clean for GIF/MP4/PNG).
-- `serializeLayers` gains `blendMode`, stroke `hsl`, stroke `gradient`, image `rotation`. Missing fields default gracefully.
-- History unchanged in shape (string snapshots); every new mutation goes through existing `pushHistory()`.
-- Keyboard: `B` brush, `V` select-rect, `O` select-object, `T` transform; `Del` delete, `Ctrl+D` duplicate, `Esc` cancel.
-- Non-breaking defaults: tool = `brush`, blend mode = `normal`, color = current hue 200 / s90 / l55 / a1, no `gradient` on old strokes → identical rendering for existing content.
+- `V` — прямоугольное выделение, `L` — кисть выделения, `B` — кисть, `O` — объект, `T` — трансформация.
+- `Esc` — снять выделение (было: отмена трансформации; сохраняем оба поведения по контексту).
+- Ctrl+A — выделить всё, Ctrl+Shift+I — инвертировать.
 
-## Deliverables
+### Технические детали
 
-Updated `src/routes/index.tsx` plus the five new small modules above. No routing, export pipeline signature, or existing brush algorithm changes beyond the optional `hsl`/`gradient` reads.
+Файлы:
+- `src/routes/index.tsx` — новые ref'ы (`selectionMaskRef`, `selectionBrushSize`), обработчики pointer для `select-rect`/`select-brush`, применение маски в `renderFrameToCanvas`, UI панелей выделения и эффектов, удаление ветки `BrushKind === "gradient"`.
+- `src/lib/canvas-tools.ts` — `createSelectionMask(w,h)`, `paintSelectionCircle(mask, x, y, r, mode)`, `paintSelectionRect(mask, rect, mode)`, `invertMask`, `clearMask`, `maskIsEmpty`.
+
+Совместимость:
+- Пустая/отсутствующая маска = рисование по всему холсту (текущее поведение).
+- Старые сохранения без `effects` и без `selectionMask` открываются без изменений.
+- Экспорт PNG/GIF/MP4 применяет маску так же, как экран (если маска активна на момент экспорта); можно опционально снимать её перед экспортом кнопкой.
