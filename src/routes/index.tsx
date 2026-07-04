@@ -942,7 +942,7 @@ function Index() {
       ctx.clip();
 
       const t = now / 1000;
-      const activeMask = hasSelection ? selectionMaskRef.current : null;
+      const activeMask = hasSelectionRef.current ? selectionMaskRef.current : null;
       for (const layer of layersRef.current) {
         if (!layer.visible) continue;
         // Preload images
