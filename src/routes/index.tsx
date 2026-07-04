@@ -940,19 +940,26 @@ function Index() {
       ctx.clip();
 
       const t = now / 1000;
+      const activeMask = hasSelection ? selectionMaskRef.current : null;
       for (const layer of layersRef.current) {
         if (!layer.visible) continue;
         // Preload images
         for (const im of layer.images) ensureImg(im.src);
         const bm: BlendMode = layer.blendMode || "source-over";
         const op = layer.opacity ?? 1;
-        if (bm !== "source-over") {
+        const useBuffer = bm !== "source-over" || !!activeMask;
+        if (useBuffer) {
           const buf = getLayerBuffer();
           if (buf.width !== cs.w || buf.height !== cs.h) { buf.width = cs.w; buf.height = cs.h; }
           const lctx = buf.getContext("2d")!;
           lctx.setTransform(1, 0, 0, 1, 0, 0);
           lctx.clearRect(0, 0, cs.w, cs.h);
           renderLayerContent(lctx, layer, imgCache.current, t, dtRaw, now);
+          if (activeMask) {
+            lctx.globalCompositeOperation = "destination-in";
+            lctx.drawImage(activeMask, 0, 0);
+            lctx.globalCompositeOperation = "source-over";
+          }
           const prev = ctx.globalCompositeOperation;
           const prevA = ctx.globalAlpha;
           ctx.globalCompositeOperation = bm;
@@ -967,6 +974,20 @@ function Index() {
           ctx.globalAlpha = prevA;
         }
       }
+      // Selection mask overlay in world-space (before we restore transform)
+      if (activeMask) {
+        ctx.save();
+        ctx.globalCompositeOperation = "source-over";
+        // dim outside selection
+        ctx.globalAlpha = 0.35;
+        ctx.fillStyle = "#000";
+        ctx.fillRect(0, 0, cs.w, cs.h);
+        ctx.globalCompositeOperation = "destination-out";
+        ctx.globalAlpha = 1;
+        ctx.drawImage(activeMask, 0, 0);
+        ctx.restore();
+      }
+
       ctx.restore();
 
       /* Selection / transform overlays (screen space) */
