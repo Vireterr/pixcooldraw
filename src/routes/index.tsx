@@ -982,20 +982,20 @@ function Index() {
           ctx.globalAlpha = prevA;
         }
       }
-      // Selection mask overlay in world-space (before we restore transform)
+      // Selection mask overlay in world-space (dim area outside selection)
       if (activeMask) {
-        ctx.save();
-        ctx.globalCompositeOperation = "source-over";
-        // dim outside selection
-        ctx.globalAlpha = 0.35;
-        ctx.fillStyle = "#000";
-        ctx.fillRect(0, 0, cs.w, cs.h);
-        ctx.globalCompositeOperation = "destination-out";
-        ctx.globalAlpha = 1;
-        ctx.drawImage(activeMask, 0, 0);
-        ctx.restore();
+        const ov = getOverlayBuffer();
+        if (ov.width !== cs.w || ov.height !== cs.h) { ov.width = cs.w; ov.height = cs.h; }
+        const octx = ov.getContext("2d")!;
+        octx.setTransform(1, 0, 0, 1, 0, 0);
+        octx.clearRect(0, 0, cs.w, cs.h);
+        octx.fillStyle = "rgba(0,0,0,0.35)";
+        octx.fillRect(0, 0, cs.w, cs.h);
+        octx.globalCompositeOperation = "destination-out";
+        octx.drawImage(activeMask, 0, 0);
+        octx.globalCompositeOperation = "source-over";
+        ctx.drawImage(ov, 0, 0);
       }
-
       ctx.restore();
 
       /* Selection / transform overlays (screen space) */
