@@ -1594,11 +1594,16 @@ function Index() {
       else if ((e.key === "Delete" || e.key === "Backspace") && !inField) {
         deleteSelection();
       } else if (e.key === "Escape") {
-        setSelectedObj(null); setSelectionRect(null);
+        setSelectedObj(null); setSelectionRect(null); clearSelectionMask();
+      } else if (meta && e.key.toLowerCase() === "a" && !inField) {
+        e.preventDefault(); selectAllMask();
+      } else if (meta && e.shiftKey && e.key.toLowerCase() === "i" && !inField) {
+        e.preventDefault(); invertMask();
       } else if (!inField && !meta) {
         const k = e.key.toLowerCase();
         if (k === "b") setTool("brush");
         else if (k === "v") setTool("select-rect");
+        else if (k === "l") setTool("select-brush");
         else if (k === "o") setTool("select-object");
         else if (k === "t") setTool("transform");
       }
