@@ -1614,7 +1614,7 @@ function Index() {
     window.addEventListener("keydown", dn);
     window.addEventListener("keyup", up);
     return () => { window.removeEventListener("keydown", dn); window.removeEventListener("keyup", up); };
-  }, [undo, redo, deleteSelection, duplicateSelection]);
+  }, [undo, redo, deleteSelection, duplicateSelection, clearSelectionMask, selectAllMask, invertMask]);
 
   /* ---------- Layer ops ---------- */
   const addLayer = () => {
