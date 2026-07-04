@@ -102,7 +102,6 @@ const BRUSHES: { id: BrushKind; label: string }[] = [
   { id: "pixelRain", label: "Пикс. дождь" },
   { id: "pixelDither", label: "Дизеринг" },
   { id: "pixelGlitch", label: "Глитч" },
-  { id: "gradient", label: "Градиент" },
   { id: "eraser", label: "Ластик" },
 ];
 
