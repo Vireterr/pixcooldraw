@@ -518,6 +518,7 @@ function renderFrameToCanvas(
   imgCache: Map<string, HTMLImageElement>,
   t: number, dtRaw: number, now: number,
   layerBuffer?: HTMLCanvasElement,
+  selectionMask?: HTMLCanvasElement | null,
 ) {
   const sx = targetW / canvasW, sy = targetH / canvasH;
   tctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -531,12 +532,18 @@ function renderFrameToCanvas(
     if (!layer.visible) continue;
     const bm: BlendMode = layer.blendMode || "source-over";
     const op = layer.opacity ?? 1;
-    if (bm !== "source-over" && layerBuffer) {
+    const useBuffer = bm !== "source-over" || !!selectionMask;
+    if (useBuffer && layerBuffer) {
       layerBuffer.width = canvasW; layerBuffer.height = canvasH;
       const lctx = layerBuffer.getContext("2d")!;
       lctx.setTransform(1, 0, 0, 1, 0, 0);
       lctx.clearRect(0, 0, canvasW, canvasH);
       renderLayerContent(lctx, layer, imgCache, t, dtRaw, now);
+      if (selectionMask) {
+        lctx.globalCompositeOperation = "destination-in";
+        lctx.drawImage(selectionMask, 0, 0);
+        lctx.globalCompositeOperation = "source-over";
+      }
       const prev = tctx.globalCompositeOperation;
       const prevA = tctx.globalAlpha;
       tctx.globalCompositeOperation = bm;
