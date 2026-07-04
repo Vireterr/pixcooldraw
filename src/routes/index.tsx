@@ -2272,7 +2272,7 @@ function Index() {
         </section>
 
         <div className="text-center text-[9px] leading-relaxed text-white/30">
-          B кисть · V выделение · O объект · T трансформ<br/>
+          B кисть · V выд.▭ · L выд.кисть · O объект · T трансформ<br/>
           Del удалить · Ctrl+D дублировать · Esc сброс<br/>
           Ctrl+Z / Shift+Ctrl+Z · Space+drag = pan · Wheel = zoom
         </div>
