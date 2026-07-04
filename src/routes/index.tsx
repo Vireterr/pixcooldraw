@@ -2306,7 +2306,7 @@ function Index() {
           </div>
         )}
         <div className="pointer-events-none absolute top-3 left-1/2 -translate-x-1/2 rounded-md border border-white/10 bg-black/60 px-3 py-1 text-[10px] tracking-widest text-white/70 backdrop-blur">
-          {tool === "brush" ? "КИСТЬ" : tool === "select-rect" ? "ВЫДЕЛЕНИЕ" : tool === "select-object" ? "ВЫД. ОБЪЕКТА" : "ТРАНСФОРМАЦИЯ"}
+          {tool === "brush" ? "КИСТЬ" : tool === "select-rect" ? "ВЫДЕЛЕНИЕ ▭" : tool === "select-brush" ? "КИСТЬ ВЫДЕЛЕНИЯ" : tool === "select-object" ? "ВЫД. ОБЪЕКТА" : "ТРАНСФОРМАЦИЯ"}
           {eyedropper && " · ПИПЕТКА"}
         </div>
         <div className="pointer-events-none absolute bottom-3 right-3 flex items-center gap-1 rounded-md border border-white/10 bg-black/60 p-1 text-[11px] backdrop-blur">
