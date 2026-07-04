@@ -698,6 +698,8 @@ function Index() {
   // Selection mask (world-space alpha mask). White = inside selection.
   const selectionMaskRef = useRef<HTMLCanvasElement | null>(null);
   const [hasSelection, setHasSelection] = useState(false);
+  const hasSelectionRef = useRef(false);
+  useEffect(() => { hasSelectionRef.current = hasSelection; markDirty(); }, [hasSelection]);
   const [selectionBrushSize, setSelectionBrushSize] = useState(48);
   const selectionBrushSizeRef = useRef(selectionBrushSize);
   useEffect(() => { selectionBrushSizeRef.current = selectionBrushSize; }, [selectionBrushSize]);
