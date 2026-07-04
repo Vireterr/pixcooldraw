@@ -1947,7 +1947,27 @@ function Index() {
               <button onClick={duplicateSelection} disabled={!selectedObj} className="flex-1 rounded border border-white/10 bg-white/5 px-2 py-1 text-[10px] tracking-widest hover:bg-white/10 disabled:opacity-30">Дублировать</button>
             </div>
           )}
+          {(tool === "select-rect" || tool === "select-brush" || hasSelection) && (
+            <div className="mt-2 space-y-1.5 border-t border-white/10 pt-2">
+              {tool === "select-brush" && (
+                <label className="block text-[10px] text-white/60">
+                  <span className="flex justify-between"><span>Размер кисти выд.</span><span className="text-white/80">{selectionBrushSize}</span></span>
+                  <input type="range" min={4} max={200} value={selectionBrushSize} onChange={(e) => setSelectionBrushSize(+e.target.value)} className="w-full accent-white" />
+                </label>
+              )}
+              <div className="flex gap-1">
+                <button onClick={selectAllMask} className="flex-1 rounded border border-white/10 bg-white/5 px-1.5 py-1 text-[10px] hover:bg-white/10">Всё</button>
+                <button onClick={invertMask} disabled={!hasSelection} className="flex-1 rounded border border-white/10 bg-white/5 px-1.5 py-1 text-[10px] hover:bg-white/10 disabled:opacity-30">Инверт.</button>
+                <button onClick={clearSelectionMask} disabled={!hasSelection} className="flex-1 rounded border border-white/10 bg-white/5 px-1.5 py-1 text-[10px] hover:bg-white/10 disabled:opacity-30">Снять</button>
+              </div>
+              <div className="text-[9px] text-white/40 leading-relaxed">
+                Все кисти рисуют только внутри выделения.<br/>
+                Shift = добавить · Alt = вычесть
+              </div>
+            </div>
+          )}
         </section>
+
 
         {/* Canvas size */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-1.5">
