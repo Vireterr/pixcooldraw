@@ -1743,7 +1743,7 @@ function Index() {
     const tctx = tmp.getContext("2d")!;
     const now = performance.now();
     const buf = document.createElement("canvas");
-    renderFrameToCanvas(tctx, tmp.width, tmp.height, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, 16, now, buf);
+    renderFrameToCanvas(tctx, tmp.width, tmp.height, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, 16, now, buf, hasSelectionRef.current ? selectionMaskRef.current : null);
     tmp.toBlob((blob) => {
       if (!blob) return;
       const url = URL.createObjectURL(blob);
@@ -1773,7 +1773,7 @@ function Index() {
 
       for (let i = 0; i < total; i++) {
         const now = startNow + i * dtRaw;
-        renderFrameToCanvas(tctx, gifW, gifH, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, dtRaw, now, buf);
+        renderFrameToCanvas(tctx, gifW, gifH, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, dtRaw, now, buf, hasSelectionRef.current ? selectionMaskRef.current : null);
         const data = tctx.getImageData(0, 0, gifW, gifH).data;
         const palette = quantize(data, 256);
         const index = applyPalette(data, palette);
@@ -1805,7 +1805,7 @@ function Index() {
     tmp.width = outW; tmp.height = outH;
     const tctx = tmp.getContext("2d")!;
     const buf = document.createElement("canvas");
-    renderFrameToCanvas(tctx, outW, outH, cs.w, cs.h, layersRef.current, imgCache.current, 0, 1000 / mp4Fps, performance.now(), buf);
+    renderFrameToCanvas(tctx, outW, outH, cs.w, cs.h, layersRef.current, imgCache.current, 0, 1000 / mp4Fps, performance.now(), buf, hasSelectionRef.current ? selectionMaskRef.current : null);
 
     interface CaptureCanvas extends HTMLCanvasElement { captureStream(fps?: number): MediaStream }
     const stream = (tmp as CaptureCanvas).captureStream(0);
@@ -1824,7 +1824,7 @@ function Index() {
     const startNow = performance.now();
     for (let i = 0; i < total; i++) {
       const now = startNow + i * dtRaw;
-      renderFrameToCanvas(tctx, outW, outH, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, dtRaw, now, buf);
+      renderFrameToCanvas(tctx, outW, outH, cs.w, cs.h, layersRef.current, imgCache.current, now / 1000, dtRaw, now, buf, hasSelectionRef.current ? selectionMaskRef.current : null);
       if (track.requestFrame) track.requestFrame();
       setRecordProgress((i + 1) / total);
       await new Promise(r => setTimeout(r, Math.max(1, Math.floor(1000 / mp4Fps))));
