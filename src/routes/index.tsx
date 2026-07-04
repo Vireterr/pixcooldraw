@@ -1358,12 +1358,26 @@ function Index() {
 
     if (tl === "select-rect") {
       setSelectedObj(null);
+      selectionOpModeRef.current = e.shiftKey ? "add" : e.altKey ? "sub" : "replace";
       rectDragRef.current = { startX: wpt.x, startY: wpt.y };
       setSelectionRect({ x: wpt.x, y: wpt.y, w: 0, h: 0 });
       drawingPointerId.current = e.pointerId;
       lastDrawScreen.current = local;
       return;
     }
+
+    if (tl === "select-brush") {
+      setSelectedObj(null);
+      selectionOpModeRef.current = e.shiftKey ? "add" : e.altKey ? "sub" : "add";
+      if (selectionOpModeRef.current === "add" && !e.shiftKey && !hasSelectionRef.current) {
+        // fresh selection start
+      }
+      paintSelectionCircle(wpt.x, wpt.y, selectionBrushSizeRef.current / 2, selectionOpModeRef.current === "sub" ? "sub" : "add");
+      drawingPointerId.current = e.pointerId;
+      lastDrawScreen.current = local;
+      return;
+    }
+
 
     // brush / eraser
     if (refs.brush.current === "eraser") {
