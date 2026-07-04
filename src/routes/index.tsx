@@ -2053,43 +2053,52 @@ function Index() {
           </div>
         </section>
 
-        {/* Gradient brush config */}
-        {brush === "gradient" && (
-          <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
-            <div className="text-[9px] uppercase tracking-widest text-white/40">Градиент</div>
-            <div className="space-y-1">
-              {gradientCfg.stops.map((stp, i) => (
-                <div key={i} className="flex items-center gap-1">
-                  <input type="color" value={toHex(stp.h, stp.s, stp.l)}
-                    onChange={(e) => {
-                      const p = fromHex(e.target.value);
-                      if (!p) return;
-                      setGradientCfg(g => ({ ...g, stops: g.stops.map((s, j) => j === i ? { ...s, h: p[0], s: p[1], l: p[2] } : s) }));
-                    }}
-                    className="h-5 w-5 rounded border border-white/10 bg-transparent" />
-                  <input type="range" min={0} max={1} step={0.01} value={stp.offset}
-                    onChange={(e) => setGradientCfg(g => ({ ...g, stops: g.stops.map((s, j) => j === i ? { ...s, offset: +e.target.value } : s) }))}
-                    className="flex-1 accent-white" />
-                  <input type="range" min={0} max={1} step={0.01} value={stp.a}
-                    onChange={(e) => setGradientCfg(g => ({ ...g, stops: g.stops.map((s, j) => j === i ? { ...s, a: +e.target.value } : s) }))}
-                    className="w-10 accent-white" title="Alpha" />
-                  <button onClick={() => setGradientCfg(g => ({ ...g, stops: g.stops.filter((_, j) => j !== i) }))} disabled={gradientCfg.stops.length <= 2} className="text-[11px] text-white/40 hover:text-red-400 disabled:opacity-20">✕</button>
-                </div>
-              ))}
-              <button onClick={() => setGradientCfg(g => ({ ...g, stops: [...g.stops, { offset: 1, h: color.h, s: color.s, l: color.l, a: color.a }] }))} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1 text-[10px] hover:bg-white/10">+ Стоп</button>
+        {/* Effects — combinable with any brush */}
+        <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
+          <div className="flex items-center justify-between">
+            <div className="text-[9px] uppercase tracking-widest text-white/40">Эффекты</div>
+          </div>
+          <label className="flex items-center gap-2 text-[11px] text-white/80">
+            <input type="checkbox" checked={gradientEnabled} onChange={(e) => setGradientEnabled(e.target.checked)} />
+            <span>Градиент</span>
+          </label>
+          {gradientEnabled && (
+            <div className="space-y-2 rounded border border-white/10 bg-black/20 p-2">
+              <div className="space-y-1">
+                {gradientCfg.stops.map((stp, i) => (
+                  <div key={i} className="flex items-center gap-1">
+                    <input type="color" value={toHex(stp.h, stp.s, stp.l)}
+                      onChange={(e) => {
+                        const p = fromHex(e.target.value);
+                        if (!p) return;
+                        setGradientCfg(g => ({ ...g, stops: g.stops.map((s, j) => j === i ? { ...s, h: p[0], s: p[1], l: p[2] } : s) }));
+                      }}
+                      className="h-5 w-5 rounded border border-white/10 bg-transparent" />
+                    <input type="range" min={0} max={1} step={0.01} value={stp.offset}
+                      onChange={(e) => setGradientCfg(g => ({ ...g, stops: g.stops.map((s, j) => j === i ? { ...s, offset: +e.target.value } : s) }))}
+                      className="flex-1 accent-white" />
+                    <input type="range" min={0} max={1} step={0.01} value={stp.a}
+                      onChange={(e) => setGradientCfg(g => ({ ...g, stops: g.stops.map((s, j) => j === i ? { ...s, a: +e.target.value } : s) }))}
+                      className="w-10 accent-white" title="Alpha" />
+                    <button onClick={() => setGradientCfg(g => ({ ...g, stops: g.stops.filter((_, j) => j !== i) }))} disabled={gradientCfg.stops.length <= 2} className="text-[11px] text-white/40 hover:text-red-400 disabled:opacity-20">✕</button>
+                  </div>
+                ))}
+                <button onClick={() => setGradientCfg(g => ({ ...g, stops: [...g.stops, { offset: 1, h: color.h, s: color.s, l: color.l, a: color.a }] }))} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1 text-[10px] hover:bg-white/10">+ Стоп</button>
+              </div>
+              <label className="flex items-center gap-2 text-[10px] text-white/60">
+                <input type="checkbox" checked={gradientCfg.animate} onChange={(e) => setGradientCfg(g => ({ ...g, animate: e.target.checked }))} />
+                Анимация
+              </label>
+              <label className="block text-[10px] text-white/50">
+                <span className="flex justify-between"><span>Скорость потока</span><span className="text-white/80">{gradientCfg.speed.toFixed(2)}</span></span>
+                <input type="range" min={0} max={2} step={0.05} value={gradientCfg.speed}
+                  onChange={(e) => setGradientCfg(g => ({ ...g, speed: +e.target.value }))}
+                  className="w-full accent-white" />
+              </label>
             </div>
-            <label className="flex items-center gap-2 text-[10px] text-white/60">
-              <input type="checkbox" checked={gradientCfg.animate} onChange={(e) => setGradientCfg(g => ({ ...g, animate: e.target.checked }))} />
-              Анимация
-            </label>
-            <label className="block text-[10px] text-white/50">
-              <span className="flex justify-between"><span>Скорость потока</span><span className="text-white/80">{gradientCfg.speed.toFixed(2)}</span></span>
-              <input type="range" min={0} max={2} step={0.05} value={gradientCfg.speed}
-                onChange={(e) => setGradientCfg(g => ({ ...g, speed: +e.target.value }))}
-                className="w-full accent-white" />
-            </label>
-          </section>
-        )}
+          )}
+        </section>
+
 
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Режим</div>
