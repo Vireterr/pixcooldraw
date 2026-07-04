@@ -979,7 +979,7 @@ function Index() {
       points: [],
       born: performance.now(),
       originY: wy,
-      gradient: refs.brush.current === "gradient" ? JSON.parse(JSON.stringify(gradientRef.current)) : undefined,
+      gradient: gradientEnabledRef.current ? JSON.parse(JSON.stringify(gradientRef.current)) : undefined,
     };
     currentStrokeRef.current = stroke;
     layer.strokes.push(stroke);
