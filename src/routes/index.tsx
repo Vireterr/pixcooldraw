@@ -1486,8 +1486,13 @@ function Index() {
         activeTransform.current = null;
         pushHistory();
       } else if (rectDragRef.current) {
+        // commit selection rect into mask
+        const r = selectionRectRef.current;
+        if (r && r.w > 2 && r.h > 2) {
+          paintSelectionRect(r, selectionOpModeRef.current);
+        }
         rectDragRef.current = null;
-        // keep selection rect
+        setSelectionRect(null);
       } else if (currentStrokeRef.current) {
         currentStrokeRef.current = null;
         pushHistory();
