@@ -699,6 +699,7 @@ function Index() {
   const selectionMaskRef = useRef<HTMLCanvasElement | null>(null);
   const [hasSelection, setHasSelection] = useState(false);
   const hasSelectionRef = useRef(false);
+  const selectionOpModeRef = useRef<"add" | "sub" | "replace">("replace");
   useEffect(() => { hasSelectionRef.current = hasSelection; markDirty(); }, [hasSelection]);
   const [selectionBrushSize, setSelectionBrushSize] = useState(48);
   const selectionBrushSizeRef = useRef(selectionBrushSize);
