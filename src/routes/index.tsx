@@ -594,9 +594,14 @@ function Index() {
 
   const imgCache = useRef<Map<string, HTMLImageElement>>(new Map());
   const layerBufferRef = useRef<HTMLCanvasElement | null>(null);
+  const overlayBufferRef = useRef<HTMLCanvasElement | null>(null);
   const getLayerBuffer = () => {
     if (!layerBufferRef.current) layerBufferRef.current = document.createElement("canvas");
     return layerBufferRef.current;
+  };
+  const getOverlayBuffer = () => {
+    if (!overlayBufferRef.current) overlayBufferRef.current = document.createElement("canvas");
+    return overlayBufferRef.current;
   };
   const ensureImg = (src: string): HTMLImageElement | null => {
     const c = imgCache.current;
