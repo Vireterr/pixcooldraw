@@ -1902,7 +1902,7 @@ function Index() {
 
   const cursor = spaceDown || panState.current ? "grab"
     : eyedropper ? "crosshair"
-    : tool === "select-rect" || tool === "select-object" ? "crosshair"
+    : tool === "select-rect" || tool === "select-object" || tool === "select-brush" ? "crosshair"
     : tool === "transform" ? "move"
     : brush === "eraser" ? "cell" : "crosshair";
 
