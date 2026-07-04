@@ -19,12 +19,11 @@ type BrushKind =
   | "pixelRain"
   | "pixelDither"
   | "pixelGlitch"
-  | "gradient"
   | "eraser";
 
 type ModeKind = "normal" | "rainbow" | "pulse" | "spray" | "mirror";
 
-type Tool = "brush" | "select-rect" | "select-object" | "transform";
+type Tool = "brush" | "select-rect" | "select-brush" | "select-object" | "transform";
 
 type BlendMode =
   | "source-over"
