@@ -420,13 +420,12 @@ function renderStroke(ctx: CanvasRenderingContext2D, s: Stroke, t: number, dtRaw
       }
     }
   }
-  else if (s.kind === "gradient") {
-    // Animated gradient stroke along the path
-    if (pts.length < 2) return;
-    const g = s.gradient || { stops: [
-      { offset: 0, h: s.hue, s: SAT, l: 55, a: 1 },
-      { offset: 1, h: (s.hue + 120) % 360, s: SAT, l: 60, a: 1 },
-    ], angle: 0, animate: true, speed: 0.4 };
+
+  // Gradient effect — applied in addition to base kind when s.gradient is present
+  if (s.gradient && s.kind !== "eraser") {
+    const pts2 = s.points;
+    if (pts2.length < 2) return;
+    const g = s.gradient;
     const flow = g.animate ? (tt * g.speed) : 0;
     ctx.save();
     ctx.lineCap = "round";
