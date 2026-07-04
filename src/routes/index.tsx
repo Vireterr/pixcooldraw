@@ -683,6 +683,71 @@ function Index() {
   const gradientRef = useRef(gradientCfg);
   useEffect(() => { gradientRef.current = gradientCfg; }, [gradientCfg]);
 
+  // Gradient as an independent effect (works with any brush)
+  const [gradientEnabled, setGradientEnabled] = useState(false);
+  const gradientEnabledRef = useRef(false);
+  useEffect(() => { gradientEnabledRef.current = gradientEnabled; }, [gradientEnabled]);
+
+  // Selection mask (world-space alpha mask). White = inside selection.
+  const selectionMaskRef = useRef<HTMLCanvasElement | null>(null);
+  const [hasSelection, setHasSelection] = useState(false);
+  const [selectionBrushSize, setSelectionBrushSize] = useState(48);
+  const selectionBrushSizeRef = useRef(selectionBrushSize);
+  useEffect(() => { selectionBrushSizeRef.current = selectionBrushSize; }, [selectionBrushSize]);
+
+  const ensureSelectionMask = useCallback((): HTMLCanvasElement => {
+    const cs = canvasSizeRef.current;
+    let m = selectionMaskRef.current;
+    if (!m) { m = document.createElement("canvas"); selectionMaskRef.current = m; }
+    if (m.width !== cs.w || m.height !== cs.h) { m.width = cs.w; m.height = cs.h; }
+    return m;
+  }, []);
+  const clearSelectionMask = useCallback(() => {
+    const m = selectionMaskRef.current;
+    if (m) { const c = m.getContext("2d")!; c.setTransform(1,0,0,1,0,0); c.clearRect(0,0,m.width,m.height); }
+    setHasSelection(false);
+    markDirty();
+  }, []);
+  const paintSelectionCircle = useCallback((wx: number, wy: number, r: number, mode: "add" | "sub") => {
+    const m = ensureSelectionMask();
+    const c = m.getContext("2d")!;
+    c.setTransform(1,0,0,1,0,0);
+    c.globalCompositeOperation = mode === "sub" ? "destination-out" : "source-over";
+    c.fillStyle = "#fff";
+    c.beginPath(); c.arc(wx, wy, r, 0, Math.PI * 2); c.fill();
+    c.globalCompositeOperation = "source-over";
+    setHasSelection(true);
+    markDirty();
+  }, [ensureSelectionMask]);
+  const paintSelectionRect = useCallback((rect: SelectionRect, mode: "add" | "sub" | "replace") => {
+    const m = ensureSelectionMask();
+    const c = m.getContext("2d")!;
+    c.setTransform(1,0,0,1,0,0);
+    if (mode === "replace") c.clearRect(0,0,m.width,m.height);
+    c.globalCompositeOperation = mode === "sub" ? "destination-out" : "source-over";
+    c.fillStyle = "#fff";
+    c.fillRect(rect.x, rect.y, rect.w, rect.h);
+    c.globalCompositeOperation = "source-over";
+    setHasSelection(true);
+    markDirty();
+  }, [ensureSelectionMask]);
+  const selectAllMask = useCallback(() => {
+    const cs = canvasSizeRef.current;
+    paintSelectionRect({ x: 0, y: 0, w: cs.w, h: cs.h }, "replace");
+  }, [paintSelectionRect]);
+  const invertMask = useCallback(() => {
+    const m = ensureSelectionMask();
+    const c = m.getContext("2d")!;
+    c.setTransform(1,0,0,1,0,0);
+    c.globalCompositeOperation = "xor";
+    c.fillStyle = "#fff";
+    c.fillRect(0, 0, m.width, m.height);
+    c.globalCompositeOperation = "source-over";
+    setHasSelection(true);
+    markDirty();
+  }, [ensureSelectionMask]);
+
+
   const [recording, setRecording] = useState<null | "gif" | "mp4">(null);
   const [recordProgress, setRecordProgress] = useState(0);
 
