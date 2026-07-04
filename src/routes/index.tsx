@@ -1924,10 +1924,11 @@ function Index() {
         {/* Tools */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Инструменты</div>
-          <div className="grid grid-cols-4 gap-1">
+          <div className="grid grid-cols-5 gap-1">
             {([
               { id: "brush", label: "✎", title: "Кисть (B)" },
-              { id: "select-rect", label: "▭", title: "Выделение (V)" },
+              { id: "select-rect", label: "▭", title: "Прямоуг. выделение (V)" },
+              { id: "select-brush", label: "⌇", title: "Кисть выделения (L) — Shift доб., Alt выч." },
               { id: "select-object", label: "◎", title: "Выд. объекта (O)" },
               { id: "transform", label: "⤢", title: "Трансформация (T)" },
             ] as { id: Tool; label: string; title: string }[]).map(t => (
