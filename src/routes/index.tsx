@@ -1441,6 +1441,21 @@ function Index() {
       });
       return;
     }
+    if (tl === "select-brush") {
+      const px = lastDrawScreen.current.x, py = lastDrawScreen.current.y;
+      const dx = local.x - px, dy = local.y - py;
+      const dist = Math.hypot(dx, dy);
+      const r = selectionBrushSizeRef.current / 2;
+      const step = Math.max(3, r * 0.4);
+      const steps = Math.max(1, Math.floor(dist / step));
+      for (let i = 1; i <= steps; i++) {
+        const sx2 = px + dx * (i / steps), sy2 = py + dy * (i / steps);
+        const w = screenToWorld(sx2, sy2);
+        paintSelectionCircle(w.x, w.y, r, selectionOpModeRef.current === "sub" ? "sub" : "add");
+      }
+      lastDrawScreen.current = local;
+      return;
+    }
     if (tl === "select-object") return;
 
     if (refs.brush.current === "eraser") {
@@ -1448,6 +1463,7 @@ function Index() {
       lastDrawScreen.current = local;
       return;
     }
+
     const px = lastDrawScreen.current.x, py = lastDrawScreen.current.y;
     const dx = local.x - px, dy = local.y - py;
     const dist = Math.hypot(dx, dy);
