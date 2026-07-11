@@ -851,7 +851,32 @@ function Index() {
         {/* Export */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
           <div className="text-[9px] uppercase tracking-widest text-white/40">Экспорт</div>
-          <button onClick={savePng} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">PNG</button>
+
+          {/* Scale + Duration selectors (shared) */}
+          <div className="space-y-1">
+            <div className="flex items-center justify-between text-[9px] uppercase tracking-widest text-white/40">
+              <span>Масштаб</span>
+              <span className="text-white/70 normal-case tracking-normal">{Math.round(canvasSize.w * exportScale)}×{Math.round(canvasSize.h * exportScale)}</span>
+            </div>
+            <div className="flex gap-1">
+              {SCALES.map(s => (
+                <button key={s} onClick={() => setExportScale(s)} className={`flex-1 rounded border px-1 py-1 text-[10px] tracking-wider transition ${exportScale === s ? "border-white/60 bg-white/10" : "border-white/5 text-white/40 hover:text-white/80"}`}>{s}x</button>
+              ))}
+            </div>
+          </div>
+          <div className="space-y-1">
+            <div className="flex items-center justify-between text-[9px] uppercase tracking-widest text-white/40">
+              <span>Длительность</span>
+              <span className="text-white/70 normal-case tracking-normal">{exportSec}s</span>
+            </div>
+            <div className="flex flex-wrap gap-1">
+              {DURATIONS.map(sec => (
+                <button key={sec} onClick={() => setExportSec(sec)} className={`flex-1 rounded border px-1 py-1 text-[10px] tracking-wider transition ${exportSec === sec ? "border-white/60 bg-white/10" : "border-white/5 text-white/40 hover:text-white/80"}`}>{sec}s</button>
+              ))}
+            </div>
+          </div>
+
+          <button onClick={savePng} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">PNG · {exportScale}x</button>
 
           <div className="space-y-1">
             <div className="flex gap-1">
@@ -860,7 +885,7 @@ function Index() {
               ))}
             </div>
             <button onClick={exportGif} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">
-              {recording === "gif" ? `GIF ${Math.round(recordProgress * 100)}%` : `GIF · ${GIF_PRESETS[gifQ].w}px ${GIF_PRESETS[gifQ].fps}fps ${GIF_PRESETS[gifQ].sec}s`}
+              {recording === "gif" ? `GIF ${Math.round(recordProgress * 100)}%` : `GIF · ${GIF_PRESETS[gifQ].fps}fps ${exportSec}s`}
             </button>
           </div>
 
@@ -871,7 +896,7 @@ function Index() {
               ))}
             </div>
             <button onClick={exportMp4} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">
-              {recording === "mp4" ? `MP4 ${Math.round(recordProgress * 100)}%` : `MP4 · ${MP4_PRESETS[mp4Q].sec}s ${(MP4_PRESETS[mp4Q].bps/1_000_000).toFixed(1)}M`}
+              {recording === "mp4" ? `MP4 ${Math.round(recordProgress * 100)}%` : `MP4 · ${exportSec}s ${(MP4_PRESETS[mp4Q].bps/1_000_000).toFixed(1)}M`}
             </button>
           </div>
         </section>
