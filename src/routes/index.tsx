@@ -674,7 +674,7 @@ function Index() {
       for (let i = 0; i < total; i++) {
         renderScene(tctx, canvasSize.w, canvasSize.h, startNow + i * dtRaw, dtRaw);
         const data = tctx.getImageData(0, 0, gifW, gifH).data;
-        const palette = quantize(data, 256);
+        const palette = quantize(data, preset.colors);
         const index = applyPalette(data, palette);
         gif.writeFrame(index, gifW, gifH, { palette, delay });
         setRecordProgress((i + 1) / total);
