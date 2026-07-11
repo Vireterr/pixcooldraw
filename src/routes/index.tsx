@@ -310,7 +310,7 @@ function Index() {
             const gy = Math.round((cy + ny * (t2 + wob)) / grid) * grid;
             const edge = 1 - Math.abs(t2) / (half + 1);
             const l = 55 + edge * 25;
-            ctx.fillStyle = `hsla(${hueI}, 85%, ${l}%, ${alphaMul * edge})`;
+            ctx.fillStyle = `hsla(${hueAt(i, f)}, 85%, ${l}%, ${alphaMul * edge})`;
             ctx.fillRect(gx, gy, grid, grid);
           }
         }
