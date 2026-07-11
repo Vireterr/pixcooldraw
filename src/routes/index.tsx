@@ -346,14 +346,14 @@ function Index() {
     else if (s.kind === "lightning") {
       const grid = Math.max(2, Math.round(s.size / 6));
       const arcs = Math.max(1, Math.floor(1 + s.density * 5));
-      const hueL = (s.hue + modeHueShift) % 360;
-      const coreCol = `hsla(${hueL}, 100%, 82%, ${alphaMul})`;
-      const glowCol = `hsla(${hueL}, 100%, 60%, ${alphaMul * 0.45})`;
       for (let a = 0; a < arcs; a++) {
         if (Math.random() > 0.3 + s.intensity * 0.6) continue;
         const i0 = Math.floor(Math.random() * pts.length);
         const i1 = Math.min(pts.length - 1, i0 + 1 + Math.floor(Math.random() * (5 + s.dynamics * 30)));
         const p0 = pts[i0], p1 = pts[i1];
+        const hueL = hueAt(i0);
+        const coreCol = `hsla(${hueL}, 100%, 82%, ${alphaMul})`;
+        const glowCol = `hsla(${hueL}, 100%, 60%, ${alphaMul * 0.45})`;
         const segs = 6 + Math.floor(s.dynamics * 10);
         let ppx = p0.x, ppy = p0.y;
         for (let i = 1; i <= segs; i++) {
