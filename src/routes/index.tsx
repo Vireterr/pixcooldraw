@@ -19,9 +19,10 @@ type BrushKind =
   | "pixelRain"
   | "pixelDither"
   | "pixelGlitch"
+  | "fill"
   | "eraser";
 
-type ModeKind = "normal" | "rainbow" | "pulse" | "spray" | "mirror";
+type ModeKind = "normal" | "rainbow" | "gradient" | "pulse" | "spray" | "mirror";
 
 interface StrokePoint { x: number; y: number; t: number }
 
@@ -57,21 +58,23 @@ const BRUSHES: { id: BrushKind; label: string }[] = [
   { id: "pixelRain", label: "Пикс. дождь" },
   { id: "pixelDither", label: "Дизеринг" },
   { id: "pixelGlitch", label: "Глитч" },
+  { id: "fill", label: "Заливка" },
   { id: "eraser", label: "Ластик" },
 ];
 
 const MODES: { id: ModeKind; label: string }[] = [
   { id: "normal", label: "Обычный" },
   { id: "rainbow", label: "Радуга" },
+  { id: "gradient", label: "Градиент" },
   { id: "pulse", label: "Пульс" },
   { id: "spray", label: "Распыление" },
   { id: "mirror", label: "Зеркало" },
 ];
 
 const GIF_PRESETS = {
-  low:    { fps: 10, label: "Низкое" },
-  medium: { fps: 15, label: "Среднее" },
-  high:   { fps: 24, label: "Высокое" },
+  low:    { colors: 64,  label: "Низкое" },
+  medium: { colors: 128, label: "Среднее" },
+  high:   { colors: 256, label: "Высокое" },
 } as const;
 type GifQ = keyof typeof GIF_PRESETS;
 
@@ -84,6 +87,7 @@ type Mp4Q = keyof typeof MP4_PRESETS;
 
 const SCALES = [1, 2, 3] as const;
 const DURATIONS = [2, 3, 4, 6, 8, 10] as const;
+const FPS_OPTIONS = [10, 15, 24, 30, 60] as const;
 
 const HISTORY_LIMIT = 60;
 const MAX_POINTS_PER_STROKE = 600;
@@ -184,6 +188,7 @@ function Index() {
   const [mp4Q, setMp4Q] = useState<Mp4Q>("medium");
   const [exportScale, setExportScale] = useState<number>(2);
   const [exportSec, setExportSec] = useState<number>(4);
+  const [exportFps, setExportFps] = useState<number>(24);
   const [zoom, setZoom] = useState(1);
 
   const refs = {
@@ -268,13 +273,25 @@ function Index() {
     const modeSpray = s.mode === "spray" ? 2.2 : 1;
     const alphaMul = (0.25 + s.intensity * 0.9) * modePulse;
     const pts = s.points;
+    const gradAmt = s.mode === "gradient" ? 360 : 0;
+    const nSeg = Math.max(1, pts.length - 1);
+    const hueAt = (i: number, f = 0) => (s.hue + modeHueShift + gradAmt * (i + f) / nSeg) % 360;
+
+    if (s.kind === "fill") {
+      const p = pts[0] || { x: w / 2, y: h / 2, t: 0 };
+      const hueF = hueAt(0, 0);
+      ctx.fillStyle = `hsla(${hueF}, 85%, 55%, ${Math.min(1, 0.3 + s.intensity * 0.8) * modePulse})`;
+      ctx.fillRect(0, 0, w, h);
+      void p;
+      return;
+    }
 
     if (s.kind === "ink") {
       // Pixelated animated line — pixel dots along smooth path with breathing thickness
       if (!s.ink) s.ink = { phase: Math.random() * 100 };
       s.ink.phase += dt * 0.002;
       const grid = Math.max(2, Math.round(s.size / 8));
-      const hueI = (s.hue + modeHueShift) % 360;
+      // per-point hue via hueAt(i, f)
       const thickness = Math.max(grid, s.size * (0.45 + s.intensity * 0.55) * modePulse * modeSpray);
       const half = thickness / 2;
       const phaseI = s.ink.phase;
@@ -294,7 +311,7 @@ function Index() {
             const gy = Math.round((cy + ny * (t2 + wob)) / grid) * grid;
             const edge = 1 - Math.abs(t2) / (half + 1);
             const l = 55 + edge * 25;
-            ctx.fillStyle = `hsla(${hueI}, 85%, ${l}%, ${alphaMul * edge})`;
+            ctx.fillStyle = `hsla(${hueAt(i, f)}, 85%, ${l}%, ${alphaMul * edge})`;
             ctx.fillRect(gx, gy, grid, grid);
           }
         }
@@ -307,8 +324,7 @@ function Index() {
       for (let pass = 0; pass < passes; pass++) {
         const phase = tt * 2 + pass * 0.7;
         const amp = s.size * 0.6 * (0.3 + s.dynamics) + Math.sin(tt + pass) * s.size * 0.2;
-        const hueR = (s.hue + pass * 20 + modeHueShift) % 360;
-        ctx.fillStyle = `hsla(${hueR}, 100%, 65%, ${alphaMul * 0.75})`;
+        // hue computed per point below with gradient support
         for (let i = 0; i < pts.length - 1; i++) {
           const p = pts[i], nxt = pts[i + 1];
           const dx = nxt.x - p.x, dy = nxt.y - p.y;
@@ -321,6 +337,7 @@ function Index() {
                        + hash(i + f + tt) * s.noise * s.size * 0.5;
             const gx = Math.round((p.x + dx * f + nx * wave) / grid) * grid;
             const gy = Math.round((p.y + dy * f + ny * wave) / grid) * grid;
+            ctx.fillStyle = `hsla(${(hueAt(i, f) + pass * 20) % 360}, 100%, 65%, ${alphaMul * 0.75})`;
             ctx.fillRect(gx, gy, grid, grid);
           }
         }
@@ -330,14 +347,14 @@ function Index() {
     else if (s.kind === "lightning") {
       const grid = Math.max(2, Math.round(s.size / 6));
       const arcs = Math.max(1, Math.floor(1 + s.density * 5));
-      const hueL = (s.hue + modeHueShift) % 360;
-      const coreCol = `hsla(${hueL}, 100%, 82%, ${alphaMul})`;
-      const glowCol = `hsla(${hueL}, 100%, 60%, ${alphaMul * 0.45})`;
       for (let a = 0; a < arcs; a++) {
         if (Math.random() > 0.3 + s.intensity * 0.6) continue;
         const i0 = Math.floor(Math.random() * pts.length);
         const i1 = Math.min(pts.length - 1, i0 + 1 + Math.floor(Math.random() * (5 + s.dynamics * 30)));
         const p0 = pts[i0], p1 = pts[i1];
+        const hueL = hueAt(i0);
+        const coreCol = `hsla(${hueL}, 100%, 82%, ${alphaMul})`;
+        const glowCol = `hsla(${hueL}, 100%, 60%, ${alphaMul * 0.45})`;
         const segs = 6 + Math.floor(s.dynamics * 10);
         let ppx = p0.x, ppy = p0.y;
         for (let i = 1; i <= segs; i++) {
@@ -369,12 +386,13 @@ function Index() {
       const target = Math.min(200, Math.floor(10 + s.density * 80));
       if (!s.rain) s.rain = [];
       while (s.rain.length < target) {
-        const p = pts[Math.floor(Math.random() * pts.length)];
+        const idx = Math.floor(Math.random() * pts.length);
+        const p = pts[idx];
         s.rain.push({
           x: Math.round(p.x / grid) * grid + (Math.random() - 0.5) * s.size,
           y: p.y,
           vy: 0.5 + Math.random() * 2 * (0.3 + s.dynamics * 2),
-          hue: s.hue + (Math.random() - 0.5) * 40,
+          hue: s.hue + (Math.random() - 0.5) * 40 + gradAmt * idx / nSeg,
           len: 3 + Math.floor(Math.random() * 8 * (0.3 + s.dynamics)),
           seed: Math.random() * 1000,
         });
@@ -395,12 +413,12 @@ function Index() {
 
     else if (s.kind === "pixelDither") {
       const grid = Math.max(4, Math.round(s.size / 4));
-      const hueD = (s.hue + modeHueShift) % 360;
       const sweep = (tt * (0.5 + s.speed * 2)) % 1;
       // Sample every Nth point for performance
       const step = Math.max(1, Math.floor(pts.length / 40));
       for (let pi = 0; pi < pts.length; pi += step) {
         const p = pts[pi];
+        const hueD = hueAt(pi);
         const radius = s.size * (1 + s.dynamics * 1.5);
         const cx = Math.round(p.x / grid) * grid;
         const cy = Math.round(p.y / grid) * grid;
@@ -423,10 +441,10 @@ function Index() {
 
     else if (s.kind === "pixelGlitch") {
       const grid = Math.max(2, Math.round(s.size / 6));
-      const hueG = (s.hue + modeHueShift) % 360;
       const step = Math.max(1, Math.floor(pts.length / 30));
       for (let pi = 0; pi < pts.length; pi += step) {
         const p = pts[pi];
+        const hueG = hueAt(pi);
         const radius = s.size * (0.8 + s.dynamics * 1.5);
         const slices = 3 + Math.floor(s.density * 8);
         for (let i = 0; i < slices; i++) {
@@ -641,7 +659,7 @@ function Index() {
     const preset = GIF_PRESETS[gifQ];
     setRecording("gif"); setRecordProgress(0);
     try {
-      const fps = preset.fps, seconds = exportSec, total = Math.max(1, Math.round(fps * seconds));
+      const fps = exportFps, seconds = exportSec, total = Math.max(1, Math.round(fps * seconds));
       const scale = Math.max(1, Math.min(4, exportScale));
       const gifW = Math.round(canvasSize.w * scale);
       const gifH = Math.round(canvasSize.h * scale);
@@ -656,7 +674,7 @@ function Index() {
       for (let i = 0; i < total; i++) {
         renderScene(tctx, canvasSize.w, canvasSize.h, startNow + i * dtRaw, dtRaw);
         const data = tctx.getImageData(0, 0, gifW, gifH).data;
-        const palette = quantize(data, 256);
+        const palette = quantize(data, preset.colors);
         const index = applyPalette(data, palette);
         gif.writeFrame(index, gifW, gifH, { palette, delay });
         setRecordProgress((i + 1) / total);
@@ -682,7 +700,7 @@ function Index() {
     const preset = MP4_PRESETS[mp4Q];
     const scale = Math.max(1, Math.min(4, exportScale));
     const seconds = exportSec;
-    const fps = 30;
+    const fps = exportFps;
     const total = Math.max(1, Math.round(fps * seconds));
     const w = Math.round(canvasSize.w * scale);
     const h = Math.round(canvasSize.h * scale);
@@ -875,6 +893,17 @@ function Index() {
               ))}
             </div>
           </div>
+          <div className="space-y-1">
+            <div className="flex items-center justify-between text-[9px] uppercase tracking-widest text-white/40">
+              <span>FPS</span>
+              <span className="text-white/70 normal-case tracking-normal">{exportFps} fps</span>
+            </div>
+            <div className="flex gap-1">
+              {FPS_OPTIONS.map(f => (
+                <button key={f} onClick={() => setExportFps(f)} className={`flex-1 rounded border px-1 py-1 text-[10px] tracking-wider transition ${exportFps === f ? "border-white/60 bg-white/10" : "border-white/5 text-white/40 hover:text-white/80"}`}>{f}</button>
+              ))}
+            </div>
+          </div>
 
           <button onClick={savePng} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">PNG · {exportScale}x</button>
 
@@ -885,7 +914,7 @@ function Index() {
               ))}
             </div>
             <button onClick={exportGif} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">
-              {recording === "gif" ? `GIF ${Math.round(recordProgress * 100)}%` : `GIF · ${GIF_PRESETS[gifQ].fps}fps ${exportSec}s`}
+              {recording === "gif" ? `GIF ${Math.round(recordProgress * 100)}%` : `GIF · ${exportFps}fps ${exportSec}s`}
             </button>
           </div>
 
@@ -896,7 +925,7 @@ function Index() {
               ))}
             </div>
             <button onClick={exportMp4} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">
-              {recording === "mp4" ? `MP4 ${Math.round(recordProgress * 100)}%` : `MP4 · ${exportSec}s ${(MP4_PRESETS[mp4Q].bps/1_000_000).toFixed(1)}M`}
+              {recording === "mp4" ? `MP4 ${Math.round(recordProgress * 100)}%` : `MP4 · ${exportFps}fps ${exportSec}s ${(MP4_PRESETS[mp4Q].bps/1_000_000).toFixed(1)}M`}
             </button>
           </div>
         </section>
