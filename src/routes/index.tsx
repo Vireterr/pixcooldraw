@@ -440,10 +440,10 @@ function Index() {
 
     else if (s.kind === "pixelGlitch") {
       const grid = Math.max(2, Math.round(s.size / 6));
-      const hueG = (s.hue + modeHueShift) % 360;
       const step = Math.max(1, Math.floor(pts.length / 30));
       for (let pi = 0; pi < pts.length; pi += step) {
         const p = pts[pi];
+        const hueG = hueAt(pi);
         const radius = s.size * (0.8 + s.dynamics * 1.5);
         const slices = 3 + Math.floor(s.density * 8);
         for (let i = 0; i < slices; i++) {
