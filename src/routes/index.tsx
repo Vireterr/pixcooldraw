@@ -385,12 +385,13 @@ function Index() {
       const target = Math.min(200, Math.floor(10 + s.density * 80));
       if (!s.rain) s.rain = [];
       while (s.rain.length < target) {
-        const p = pts[Math.floor(Math.random() * pts.length)];
+        const idx = Math.floor(Math.random() * pts.length);
+        const p = pts[idx];
         s.rain.push({
           x: Math.round(p.x / grid) * grid + (Math.random() - 0.5) * s.size,
           y: p.y,
           vy: 0.5 + Math.random() * 2 * (0.3 + s.dynamics * 2),
-          hue: s.hue + (Math.random() - 0.5) * 40,
+          hue: s.hue + (Math.random() - 0.5) * 40 + gradAmt * idx / nSeg,
           len: 3 + Math.floor(Math.random() * 8 * (0.3 + s.dynamics)),
           seed: Math.random() * 1000,
         });
