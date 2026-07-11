@@ -69,18 +69,21 @@ const MODES: { id: ModeKind; label: string }[] = [
 ];
 
 const GIF_PRESETS = {
-  low:    { w: 320, fps: 10, sec: 2, label: "Низкое" },
-  medium: { w: 480, fps: 15, sec: 3, label: "Среднее" },
-  high:   { w: 640, fps: 20, sec: 4, label: "Высокое" },
+  low:    { fps: 10, label: "Низкое" },
+  medium: { fps: 15, label: "Среднее" },
+  high:   { fps: 24, label: "Высокое" },
 } as const;
 type GifQ = keyof typeof GIF_PRESETS;
 
 const MP4_PRESETS = {
-  low:    { bps: 2_500_000, sec: 3, label: "Низкое" },
-  medium: { bps: 6_000_000, sec: 5, label: "Среднее" },
-  high:   { bps: 12_000_000, sec: 8, label: "Высокое" },
+  low:    { bps: 2_500_000, label: "Низкое" },
+  medium: { bps: 6_000_000, label: "Среднее" },
+  high:   { bps: 12_000_000, label: "Высокое" },
 } as const;
 type Mp4Q = keyof typeof MP4_PRESETS;
+
+const SCALES = [1, 2, 3] as const;
+const DURATIONS = [2, 3, 4, 6, 8, 10] as const;
 
 const HISTORY_LIMIT = 60;
 const MAX_POINTS_PER_STROKE = 600;
