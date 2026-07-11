@@ -72,9 +72,9 @@ const MODES: { id: ModeKind; label: string }[] = [
 ];
 
 const GIF_PRESETS = {
-  low:    { fps: 10, label: "Низкое" },
-  medium: { fps: 15, label: "Среднее" },
-  high:   { fps: 24, label: "Высокое" },
+  low:    { colors: 64,  label: "Низкое" },
+  medium: { colors: 128, label: "Среднее" },
+  high:   { colors: 256, label: "Высокое" },
 } as const;
 type GifQ = keyof typeof GIF_PRESETS;
 
