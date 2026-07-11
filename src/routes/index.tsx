@@ -272,6 +272,18 @@ function Index() {
     const modeSpray = s.mode === "spray" ? 2.2 : 1;
     const alphaMul = (0.25 + s.intensity * 0.9) * modePulse;
     const pts = s.points;
+    const gradAmt = s.mode === "gradient" ? 360 : 0;
+    const nSeg = Math.max(1, pts.length - 1);
+    const hueAt = (i: number, f = 0) => (s.hue + modeHueShift + gradAmt * (i + f) / nSeg) % 360;
+
+    if (s.kind === "fill") {
+      const p = pts[0] || { x: w / 2, y: h / 2, t: 0 };
+      const hueF = hueAt(0, 0);
+      ctx.fillStyle = `hsla(${hueF}, 85%, 55%, ${Math.min(1, 0.3 + s.intensity * 0.8) * modePulse})`;
+      ctx.fillRect(0, 0, w, h);
+      void p;
+      return;
+    }
 
     if (s.kind === "ink") {
       // Pixelated animated line — pixel dots along smooth path with breathing thickness
