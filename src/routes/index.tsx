@@ -893,6 +893,17 @@ function Index() {
               ))}
             </div>
           </div>
+          <div className="space-y-1">
+            <div className="flex items-center justify-between text-[9px] uppercase tracking-widest text-white/40">
+              <span>FPS</span>
+              <span className="text-white/70 normal-case tracking-normal">{exportFps} fps</span>
+            </div>
+            <div className="flex gap-1">
+              {FPS_OPTIONS.map(f => (
+                <button key={f} onClick={() => setExportFps(f)} className={`flex-1 rounded border px-1 py-1 text-[10px] tracking-wider transition ${exportFps === f ? "border-white/60 bg-white/10" : "border-white/5 text-white/40 hover:text-white/80"}`}>{f}</button>
+              ))}
+            </div>
+          </div>
 
           <button onClick={savePng} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">PNG · {exportScale}x</button>
 
@@ -903,7 +914,7 @@ function Index() {
               ))}
             </div>
             <button onClick={exportGif} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">
-              {recording === "gif" ? `GIF ${Math.round(recordProgress * 100)}%` : `GIF · ${GIF_PRESETS[gifQ].fps}fps ${exportSec}s`}
+              {recording === "gif" ? `GIF ${Math.round(recordProgress * 100)}%` : `GIF · ${exportFps}fps ${exportSec}s`}
             </button>
           </div>
 
