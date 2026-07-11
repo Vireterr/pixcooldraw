@@ -58,12 +58,14 @@ const BRUSHES: { id: BrushKind; label: string }[] = [
   { id: "pixelRain", label: "Пикс. дождь" },
   { id: "pixelDither", label: "Дизеринг" },
   { id: "pixelGlitch", label: "Глитч" },
+  { id: "fill", label: "Заливка" },
   { id: "eraser", label: "Ластик" },
 ];
 
 const MODES: { id: ModeKind; label: string }[] = [
   { id: "normal", label: "Обычный" },
   { id: "rainbow", label: "Радуга" },
+  { id: "gradient", label: "Градиент" },
   { id: "pulse", label: "Пульс" },
   { id: "spray", label: "Распыление" },
   { id: "mirror", label: "Зеркало" },
@@ -85,6 +87,7 @@ type Mp4Q = keyof typeof MP4_PRESETS;
 
 const SCALES = [1, 2, 3] as const;
 const DURATIONS = [2, 3, 4, 6, 8, 10] as const;
+const FPS_OPTIONS = [10, 15, 24, 30, 60] as const;
 
 const HISTORY_LIMIT = 60;
 const MAX_POINTS_PER_STROKE = 600;
