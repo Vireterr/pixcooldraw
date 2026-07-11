@@ -290,7 +290,7 @@ function Index() {
       if (!s.ink) s.ink = { phase: Math.random() * 100 };
       s.ink.phase += dt * 0.002;
       const grid = Math.max(2, Math.round(s.size / 8));
-      const hueI = (s.hue + modeHueShift) % 360;
+      // per-point hue via hueAt(i, f)
       const thickness = Math.max(grid, s.size * (0.45 + s.intensity * 0.55) * modePulse * modeSpray);
       const half = thickness / 2;
       const phaseI = s.ink.phase;
