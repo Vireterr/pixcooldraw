@@ -19,9 +19,10 @@ type BrushKind =
   | "pixelRain"
   | "pixelDither"
   | "pixelGlitch"
+  | "fill"
   | "eraser";
 
-type ModeKind = "normal" | "rainbow" | "pulse" | "spray" | "mirror";
+type ModeKind = "normal" | "rainbow" | "gradient" | "pulse" | "spray" | "mirror";
 
 interface StrokePoint { x: number; y: number; t: number }
 
