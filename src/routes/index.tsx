@@ -188,6 +188,7 @@ function Index() {
   const [mp4Q, setMp4Q] = useState<Mp4Q>("medium");
   const [exportScale, setExportScale] = useState<number>(2);
   const [exportSec, setExportSec] = useState<number>(4);
+  const [exportFps, setExportFps] = useState<number>(24);
   const [zoom, setZoom] = useState(1);
 
   const refs = {
