@@ -659,7 +659,7 @@ function Index() {
     const preset = GIF_PRESETS[gifQ];
     setRecording("gif"); setRecordProgress(0);
     try {
-      const fps = preset.fps, seconds = exportSec, total = Math.max(1, Math.round(fps * seconds));
+      const fps = exportFps, seconds = exportSec, total = Math.max(1, Math.round(fps * seconds));
       const scale = Math.max(1, Math.min(4, exportScale));
       const gifW = Math.round(canvasSize.w * scale);
       const gifH = Math.round(canvasSize.h * scale);
