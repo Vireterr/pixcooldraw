@@ -323,8 +323,7 @@ function Index() {
       for (let pass = 0; pass < passes; pass++) {
         const phase = tt * 2 + pass * 0.7;
         const amp = s.size * 0.6 * (0.3 + s.dynamics) + Math.sin(tt + pass) * s.size * 0.2;
-        const hueR = (s.hue + pass * 20 + modeHueShift) % 360;
-        ctx.fillStyle = `hsla(${hueR}, 100%, 65%, ${alphaMul * 0.75})`;
+        // hue computed per point below with gradient support
         for (let i = 0; i < pts.length - 1; i++) {
           const p = pts[i], nxt = pts[i + 1];
           const dx = nxt.x - p.x, dy = nxt.y - p.y;
