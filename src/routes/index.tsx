@@ -336,6 +336,7 @@ function Index() {
                        + hash(i + f + tt) * s.noise * s.size * 0.5;
             const gx = Math.round((p.x + dx * f + nx * wave) / grid) * grid;
             const gy = Math.round((p.y + dy * f + ny * wave) / grid) * grid;
+            ctx.fillStyle = `hsla(${(hueAt(i, f) + pass * 20) % 360}, 100%, 65%, ${alphaMul * 0.75})`;
             ctx.fillRect(gx, gy, grid, grid);
           }
         }
