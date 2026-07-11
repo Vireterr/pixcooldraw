@@ -700,7 +700,7 @@ function Index() {
     const preset = MP4_PRESETS[mp4Q];
     const scale = Math.max(1, Math.min(4, exportScale));
     const seconds = exportSec;
-    const fps = 30;
+    const fps = exportFps;
     const total = Math.max(1, Math.round(fps * seconds));
     const w = Math.round(canvasSize.w * scale);
     const h = Math.round(canvasSize.h * scale);
