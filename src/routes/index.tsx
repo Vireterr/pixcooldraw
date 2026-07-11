@@ -412,12 +412,12 @@ function Index() {
 
     else if (s.kind === "pixelDither") {
       const grid = Math.max(4, Math.round(s.size / 4));
-      const hueD = (s.hue + modeHueShift) % 360;
       const sweep = (tt * (0.5 + s.speed * 2)) % 1;
       // Sample every Nth point for performance
       const step = Math.max(1, Math.floor(pts.length / 40));
       for (let pi = 0; pi < pts.length; pi += step) {
         const p = pts[pi];
+        const hueD = hueAt(pi);
         const radius = s.size * (1 + s.dynamics * 1.5);
         const cx = Math.round(p.x / grid) * grid;
         const cy = Math.round(p.y / grid) * grid;
