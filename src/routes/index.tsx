@@ -69,18 +69,21 @@ const MODES: { id: ModeKind; label: string }[] = [
 ];
 
 const GIF_PRESETS = {
-  low:    { w: 320, fps: 10, sec: 2, label: "Низкое" },
-  medium: { w: 480, fps: 15, sec: 3, label: "Среднее" },
-  high:   { w: 640, fps: 20, sec: 4, label: "Высокое" },
+  low:    { fps: 10, label: "Низкое" },
+  medium: { fps: 15, label: "Среднее" },
+  high:   { fps: 24, label: "Высокое" },
 } as const;
 type GifQ = keyof typeof GIF_PRESETS;
 
 const MP4_PRESETS = {
-  low:    { bps: 2_500_000, sec: 3, label: "Низкое" },
-  medium: { bps: 6_000_000, sec: 5, label: "Среднее" },
-  high:   { bps: 12_000_000, sec: 8, label: "Высокое" },
+  low:    { bps: 2_500_000, label: "Низкое" },
+  medium: { bps: 6_000_000, label: "Среднее" },
+  high:   { bps: 12_000_000, label: "Высокое" },
 } as const;
 type Mp4Q = keyof typeof MP4_PRESETS;
+
+const SCALES = [1, 2, 3] as const;
+const DURATIONS = [2, 3, 4, 6, 8, 10] as const;
 
 const HISTORY_LIMIT = 60;
 const MAX_POINTS_PER_STROKE = 600;
@@ -179,6 +182,8 @@ function Index() {
   const [recordProgress, setRecordProgress] = useState(0);
   const [gifQ, setGifQ] = useState<GifQ>("medium");
   const [mp4Q, setMp4Q] = useState<Mp4Q>("medium");
+  const [exportScale, setExportScale] = useState<number>(2);
+  const [exportSec, setExportSec] = useState<number>(4);
   const [zoom, setZoom] = useState(1);
 
   const refs = {
@@ -598,44 +603,7 @@ function Index() {
   };
 
   // === Export ===
-  const savePng = () => {
-    const c = canvasRef.current;
-    if (!c) return;
-    const link = document.createElement("a");
-    link.download = `living-pixels-${Date.now()}.png`;
-    link.href = c.toDataURL("image/png");
-    link.click();
-  };
-
-  const exportMp4 = async () => {
-    const c = canvasRef.current;
-    if (!c || recording) return;
-    const preset = MP4_PRESETS[mp4Q];
-    const stream = c.captureStream(30);
-    const mimes = ["video/mp4;codecs=avc1", "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
-    const mime = mimes.find(m => (window as any).MediaRecorder?.isTypeSupported?.(m)) || "video/webm";
-    const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: preset.bps });
-    const chunks: Blob[] = [];
-    rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
-    setRecording("mp4"); setRecordProgress(0);
-    rec.start();
-    const duration = preset.sec * 1000;
-    const startedAt = performance.now();
-    const timer = setInterval(() => setRecordProgress(Math.min(1, (performance.now() - startedAt) / duration)), 100);
-    await new Promise(r => setTimeout(r, duration));
-    rec.stop();
-    await new Promise<void>(r => { rec.onstop = () => r(); });
-    clearInterval(timer);
-    const blob = new Blob(chunks, { type: mime });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = `living-pixels-${Date.now()}.${mime.includes("mp4") ? "mp4" : "webm"}`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    setRecording(null); setRecordProgress(0);
-  };
-
-  // Render the full scene into an arbitrary context (used by export at full quality)
+  // Render the full scene into an arbitrary context (used by exports at full quality)
   const renderScene = useCallback((tctx: CanvasRenderingContext2D, w: number, h: number, now: number, dtRaw: number) => {
     tctx.fillStyle = "#080a12";
     tctx.fillRect(0, 0, w, h);
@@ -649,18 +617,38 @@ function Index() {
     }
   }, []);
 
+  const savePng = () => {
+    const scale = Math.max(1, Math.min(4, exportScale));
+    const w = Math.round(canvasSize.w * scale);
+    const h = Math.round(canvasSize.h * scale);
+    const tmp = document.createElement("canvas");
+    tmp.width = w; tmp.height = h;
+    const tctx = tmp.getContext("2d")!;
+    tctx.setTransform(scale, 0, 0, scale, 0, 0);
+    renderScene(tctx, canvasSize.w, canvasSize.h, performance.now(), 16.67);
+    tmp.toBlob((blob) => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `living-pixels-${Date.now()}@${scale}x.png`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }, "image/png");
+  };
+
   const exportGif = async () => {
     if (recording) return;
     const preset = GIF_PRESETS[gifQ];
     setRecording("gif"); setRecordProgress(0);
     try {
-      const fps = preset.fps, seconds = preset.sec, total = fps * seconds;
-      const gifW = Math.min(preset.w, canvasSize.w);
-      const gifH = Math.round(canvasSize.h * (gifW / canvasSize.w));
+      const fps = preset.fps, seconds = exportSec, total = Math.max(1, Math.round(fps * seconds));
+      const scale = Math.max(1, Math.min(4, exportScale));
+      const gifW = Math.round(canvasSize.w * scale);
+      const gifH = Math.round(canvasSize.h * scale);
       const tmp = document.createElement("canvas");
       tmp.width = gifW; tmp.height = gifH;
       const tctx = tmp.getContext("2d", { willReadFrequently: true })!;
-      tctx.setTransform(gifW / canvasSize.w, 0, 0, gifH / canvasSize.h, 0, 0);
+      tctx.setTransform(scale, 0, 0, scale, 0, 0);
       const gif = GIFEncoder();
       const delay = Math.round(1000 / fps);
       const dtRaw = 1000 / fps;
@@ -683,9 +671,60 @@ function Index() {
       a.href = url; a.download = `living-pixels-${Date.now()}.gif`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 1500);
-      // free encoder memory
       (gif as unknown as { bytes?: () => Uint8Array }).bytes?.();
     } finally {
+      setRecording(null); setRecordProgress(0);
+    }
+  };
+
+  const exportMp4 = async () => {
+    if (recording) return;
+    const preset = MP4_PRESETS[mp4Q];
+    const scale = Math.max(1, Math.min(4, exportScale));
+    const seconds = exportSec;
+    const fps = 30;
+    const total = Math.max(1, Math.round(fps * seconds));
+    const w = Math.round(canvasSize.w * scale);
+    const h = Math.round(canvasSize.h * scale);
+
+    const tmp = document.createElement("canvas");
+    tmp.width = w; tmp.height = h;
+    const tctx = tmp.getContext("2d")!;
+    tctx.setTransform(scale, 0, 0, scale, 0, 0);
+
+    // frame-by-frame stream: captureStream(0) + requestFrame per rendered frame
+    const stream = (tmp as HTMLCanvasElement).captureStream(0);
+    const track = stream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack;
+    const mimes = ["video/mp4;codecs=avc1", "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
+    const mime = mimes.find(m => (window as any).MediaRecorder?.isTypeSupported?.(m)) || "video/webm";
+    const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: preset.bps });
+    const chunks: Blob[] = [];
+    rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+
+    setRecording("mp4"); setRecordProgress(0);
+    rec.start();
+    try {
+      const dtRaw = 1000 / fps;
+      const startNow = performance.now();
+      // prime first frame before start
+      renderScene(tctx, canvasSize.w, canvasSize.h, startNow, dtRaw);
+      for (let i = 0; i < total; i++) {
+        renderScene(tctx, canvasSize.w, canvasSize.h, startNow + i * dtRaw, dtRaw);
+        track.requestFrame?.();
+        setRecordProgress((i + 1) / total);
+        // yield so the encoder can consume the frame
+        await new Promise(r => setTimeout(r, 1000 / fps));
+      }
+    } finally {
+      rec.stop();
+      await new Promise<void>(r => { rec.onstop = () => r(); });
+      track.stop();
+      const blob = new Blob(chunks, { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `living-pixels-${Date.now()}.${mime.includes("mp4") ? "mp4" : "webm"}`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
       setRecording(null); setRecordProgress(0);
     }
   };
@@ -812,7 +851,32 @@ function Index() {
         {/* Export */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
           <div className="text-[9px] uppercase tracking-widest text-white/40">Экспорт</div>
-          <button onClick={savePng} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">PNG</button>
+
+          {/* Scale + Duration selectors (shared) */}
+          <div className="space-y-1">
+            <div className="flex items-center justify-between text-[9px] uppercase tracking-widest text-white/40">
+              <span>Масштаб</span>
+              <span className="text-white/70 normal-case tracking-normal">{Math.round(canvasSize.w * exportScale)}×{Math.round(canvasSize.h * exportScale)}</span>
+            </div>
+            <div className="flex gap-1">
+              {SCALES.map(s => (
+                <button key={s} onClick={() => setExportScale(s)} className={`flex-1 rounded border px-1 py-1 text-[10px] tracking-wider transition ${exportScale === s ? "border-white/60 bg-white/10" : "border-white/5 text-white/40 hover:text-white/80"}`}>{s}x</button>
+              ))}
+            </div>
+          </div>
+          <div className="space-y-1">
+            <div className="flex items-center justify-between text-[9px] uppercase tracking-widest text-white/40">
+              <span>Длительность</span>
+              <span className="text-white/70 normal-case tracking-normal">{exportSec}s</span>
+            </div>
+            <div className="flex flex-wrap gap-1">
+              {DURATIONS.map(sec => (
+                <button key={sec} onClick={() => setExportSec(sec)} className={`flex-1 rounded border px-1 py-1 text-[10px] tracking-wider transition ${exportSec === sec ? "border-white/60 bg-white/10" : "border-white/5 text-white/40 hover:text-white/80"}`}>{sec}s</button>
+              ))}
+            </div>
+          </div>
+
+          <button onClick={savePng} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">PNG · {exportScale}x</button>
 
           <div className="space-y-1">
             <div className="flex gap-1">
@@ -821,7 +885,7 @@ function Index() {
               ))}
             </div>
             <button onClick={exportGif} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">
-              {recording === "gif" ? `GIF ${Math.round(recordProgress * 100)}%` : `GIF · ${GIF_PRESETS[gifQ].w}px ${GIF_PRESETS[gifQ].fps}fps ${GIF_PRESETS[gifQ].sec}s`}
+              {recording === "gif" ? `GIF ${Math.round(recordProgress * 100)}%` : `GIF · ${GIF_PRESETS[gifQ].fps}fps ${exportSec}s`}
             </button>
           </div>
 
@@ -832,7 +896,7 @@ function Index() {
               ))}
             </div>
             <button onClick={exportMp4} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">
-              {recording === "mp4" ? `MP4 ${Math.round(recordProgress * 100)}%` : `MP4 · ${MP4_PRESETS[mp4Q].sec}s ${(MP4_PRESETS[mp4Q].bps/1_000_000).toFixed(1)}M`}
+              {recording === "mp4" ? `MP4 ${Math.round(recordProgress * 100)}%` : `MP4 · ${exportSec}s ${(MP4_PRESETS[mp4Q].bps/1_000_000).toFixed(1)}M`}
             </button>
           </div>
         </section>
