@@ -37,6 +37,7 @@ interface Stroke {
   noise: number;
   intensity: number;
   dynamics: number;
+  rainbowFlow: boolean;
   points: StrokePoint[];
   born: number;
   // transient per-brush buckets (not serialized in history)
@@ -221,6 +222,7 @@ function Index() {
   const [noise, setNoise] = useState(0.4);
   const [intensity, setIntensity] = useState(0.7);
   const [dynamics, setDynamics] = useState(0.5);
+  const [rainbowFlow, setRainbowFlow] = useState(true);
   const [recording, setRecording] = useState<null | "gif" | "mp4">(null);
   const [recordProgress, setRecordProgress] = useState(0);
   const [gifQ, setGifQ] = useState<GifQ>("medium");
@@ -234,6 +236,7 @@ function Index() {
     brush: useRef(brush), mode: useRef(mode), hue: useRef(hue), size: useRef(size),
     speed: useRef(speed), density: useRef(density), noise: useRef(noise),
     intensity: useRef(intensity), dynamics: useRef(dynamics),
+    rainbowFlow: useRef(rainbowFlow),
   };
   useEffect(() => { refs.brush.current = brush; });
   useEffect(() => { refs.mode.current = mode; });
@@ -244,6 +247,7 @@ function Index() {
   useEffect(() => { refs.noise.current = noise; });
   useEffect(() => { refs.intensity.current = intensity; });
   useEffect(() => { refs.dynamics.current = dynamics; });
+  useEffect(() => { refs.rainbowFlow.current = rainbowFlow; });
 
   // resize canvas backing store to logical canvasSize
   useEffect(() => {
@@ -331,12 +335,12 @@ function Index() {
     const modeSpray = s.mode === "spray" ? 2.2 : 1;
     const alphaMul = (0.25 + s.intensity * 0.9) * modePulse;
     const pts = s.points;
-    const gradAmt = s.mode === "gradient" ? 360 : 0;
-// Gradient mode now "flows" along the stroke over time — reuses the same tt (time × speed)
-// used elsewhere, so the existing "Скорость" (speed) slider already controls flow speed.
-const modeGradientFlow = s.mode === "gradient" ? (tt * 40) % 360 : 0;
-const nSeg = Math.max(1, pts.length - 1);
-const hueAt = (i: number, f = 0) => (s.hue + modeHueShift + modeGradientFlow + gradAmt * (i + f) / nSeg) % 360;
+    const gradAmt = (s.mode === "gradient" || (s.mode === "rainbow" && s.rainbowFlow)) ? 360 : 0;
+    // Gradient mode now "flows" along the stroke over time — reuses the same tt (time × speed)
+    // used elsewhere, so the existing "Скорость" (speed) slider already controls flow speed.
+    const modeGradientFlow = s.mode === "gradient" ? (tt * 40) % 360 : 0;
+    const nSeg = Math.max(1, pts.length - 1);
+    const hueAt = (i: number, f = 0) => (s.hue + modeHueShift + modeGradientFlow + gradAmt * (i + f) / nSeg) % 360;
 
     if (s.kind === "fill") {
       const p = pts[0] || { x: w / 2, y: h / 2, t: 0 };
@@ -444,10 +448,13 @@ const hueAt = (i: number, f = 0) => (s.hue + modeHueShift + modeGradientFlow + g
 
     else if (s.kind === "pixelRain") {
       const grid = Math.max(3, Math.round(s.size / 4));
-const currentRainCount = s.rain?.length ?? 0;
-const wantRain = Math.floor(10 + s.density * 80);
-const target = Math.min(wantRain, currentRainCount + Math.max(0, opts.rainBudget.left));
-if (!s.rain) s.rain = [];
+      // PERF: target is now capped by the GLOBAL shared budget, not a flat 200-per-stroke pool.
+      // (Fixed: previous version's target collapsed to whatever count currently existed, which
+      // blocked new particles from ever spawning once old ones fell off-canvas.)
+      const currentRainCount = s.rain?.length ?? 0;
+      const wantRain = Math.floor(10 + s.density * 80);
+      const target = Math.min(wantRain, currentRainCount + Math.max(0, opts.rainBudget.left));
+      if (!s.rain) s.rain = [];
       while (s.rain.length < target && opts.rainBudget.left > 0) {
         const idx = Math.floor(Math.random() * pts.length);
         const p = pts[idx];
@@ -608,6 +615,7 @@ if (!s.rain) s.rain = [];
       noise: refs.noise.current,
       intensity: refs.intensity.current,
       dynamics: refs.dynamics.current,
+      rainbowFlow: refs.rainbowFlow.current,
       points: [],
       born: performance.now(),
     };
@@ -905,6 +913,14 @@ if (!s.rain) s.rain = [];
               <button key={m.id} onClick={() => setMode(m.id)} className={`rounded border px-1.5 py-1 text-[9px] uppercase tracking-widest transition ${mode === m.id ? "border-white/60 bg-white/10" : "border-white/5 text-white/40 hover:text-white/80"}`}>{m.label}</button>
             ))}
           </div>
+          {mode === "rainbow" && (
+            <button
+              onClick={() => setRainbowFlow(v => !v)}
+              className="mt-1.5 w-full rounded border border-white/10 bg-white/[0.02] px-1.5 py-1 text-[9px] uppercase tracking-widest text-white/60 transition hover:bg-white/5"
+            >
+              {rainbowFlow ? "Радуга: Поток вдоль мазка" : "Радуга: Мигание целиком"}
+            </button>
+          )}
         </section>
 
         {/* Size / Hue */}
