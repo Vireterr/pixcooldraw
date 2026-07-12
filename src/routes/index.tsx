@@ -5,7 +5,7 @@ import { GIFEncoder, quantize, applyPalette } from "gifenc";
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "Living Pixels вЂ” Animated Brush Studio" },
+      { title: "Living Pixels — Animated Brush Studio" },
       { name: "description", content: "Draw with living animated brushes, layers, undo/redo and quality export to GIF/MP4." },
     ],
   }),
@@ -52,36 +52,36 @@ interface Layer {
 }
 
 const BRUSHES: { id: BrushKind; label: string }[] = [
-  { id: "ink", label: "Р§РµСЂРЅРёР»Р°" },
-  { id: "ribbon", label: "Р›РµРЅС‚Р°" },
-  { id: "lightning", label: "РњРѕР»РЅРёСЏ" },
-  { id: "pixelRain", label: "РџРёРєСЃ. РґРѕР¶РґСЊ" },
-  { id: "pixelDither", label: "Р”РёР·РµСЂРёРЅРі" },
-  { id: "pixelGlitch", label: "Р“Р»РёС‚С‡" },
-  { id: "fill", label: "Р—Р°Р»РёРІРєР°" },
-  { id: "eraser", label: "Р›Р°СЃС‚РёРє" },
+  { id: "ink", label: "Чернила" },
+  { id: "ribbon", label: "Лента" },
+  { id: "lightning", label: "Молния" },
+  { id: "pixelRain", label: "Пикс. дождь" },
+  { id: "pixelDither", label: "Дизеринг" },
+  { id: "pixelGlitch", label: "Глитч" },
+  { id: "fill", label: "Заливка" },
+  { id: "eraser", label: "Ластик" },
 ];
 
 const MODES: { id: ModeKind; label: string }[] = [
-  { id: "normal", label: "РћР±С‹С‡РЅС‹Р№" },
-  { id: "rainbow", label: "Р Р°РґСѓРіР°" },
-  { id: "gradient", label: "Р“СЂР°РґРёРµРЅС‚" },
-  { id: "pulse", label: "РџСѓР»СЊСЃ" },
-  { id: "spray", label: "Р Р°СЃРїС‹Р»РµРЅРёРµ" },
-  { id: "mirror", label: "Р—РµСЂРєР°Р»Рѕ" },
+  { id: "normal", label: "Обычный" },
+  { id: "rainbow", label: "Радуга" },
+  { id: "gradient", label: "Градиент" },
+  { id: "pulse", label: "Пульс" },
+  { id: "spray", label: "Распыление" },
+  { id: "mirror", label: "Зеркало" },
 ];
 
 const GIF_PRESETS = {
-  low:    { colors: 64,  label: "РќРёР·РєРѕРµ" },
-  medium: { colors: 128, label: "РЎСЂРµРґРЅРµРµ" },
-  high:   { colors: 256, label: "Р’С‹СЃРѕРєРѕРµ" },
+  low:    { colors: 64,  label: "Низкое" },
+  medium: { colors: 128, label: "Среднее" },
+  high:   { colors: 256, label: "Высокое" },
 } as const;
 type GifQ = keyof typeof GIF_PRESETS;
 
 const MP4_PRESETS = {
-  low:    { bps: 2_500_000, label: "РќРёР·РєРѕРµ" },
-  medium: { bps: 6_000_000, label: "РЎСЂРµРґРЅРµРµ" },
-  high:   { bps: 12_000_000, label: "Р’С‹СЃРѕРєРѕРµ" },
+  low:    { bps: 2_500_000, label: "Низкое" },
+  medium: { bps: 6_000_000, label: "Среднее" },
+  high:   { bps: 12_000_000, label: "Высокое" },
 } as const;
 type Mp4Q = keyof typeof MP4_PRESETS;
 
@@ -126,7 +126,7 @@ function deserializeLayers(str: string): Layer[] {
 
 // ==== PERF: cached pixelDither offset patterns ====
 // Previously recomputed a nested dx/dy loop with Math.hypot for EVERY sampled point, EVERY frame.
-// The offset pattern only depends on (grid, radius), which are fixed per-stroke вЂ” so cache it once
+// The offset pattern only depends on (grid, radius), which are fixed per-stroke — so cache it once
 // per (grid, radius) pair and reuse across frames/strokes.
 const ditherOffsetCache = new Map<string, { dx: number; dy: number; dist: number }[]>();
 function getDitherOffsets(grid: number, radius: number) {
@@ -164,7 +164,7 @@ function Index() {
 
   // layers
   const [layers, setLayers] = useState<Layer[]>(() => [{
-    id: ++layerIdCounter, name: "РЎР»РѕР№ 1", visible: true, strokes: [],
+    id: ++layerIdCounter, name: "Слой 1", visible: true, strokes: [],
   }]);
   const [activeLayerId, setActiveLayerId] = useState<number>(() => layerIdCounter);
   const layersRef = useRef(layers);
@@ -345,7 +345,7 @@ function Index() {
     }
 
     if (s.kind === "ink") {
-      // Pixelated animated line вЂ” pixel dots along smooth path with breathing thickness
+      // Pixelated animated line — pixel dots along smooth path with breathing thickness
       if (!s.ink) s.ink = { phase: Math.random() * 100 };
       s.ink.phase += dt * 0.002;
       const grid = Math.max(2, Math.round(s.size / 8));
@@ -382,7 +382,7 @@ function Index() {
       for (let pass = 0; pass < passes; pass++) {
         const phase = tt * 2 + pass * 0.7;
         const amp = s.size * 0.6 * (0.3 + s.dynamics) + Math.sin(tt + pass) * s.size * 0.2;
-        // PERF: same decimation as ink вЂ” walk fewer segments as scene load grows.
+        // PERF: same decimation as ink — walk fewer segments as scene load grows.
         for (let i = 0; i < pts.length - 1; i += step) {
           const p = pts[i], nxt = pts[Math.min(i + 1, pts.length - 1)];
           const dx = nxt.x - p.x, dy = nxt.y - p.y;
@@ -633,7 +633,7 @@ function Index() {
   // === Layer ops ===
   const addLayer = () => {
     const id = ++layerIdCounter;
-    const next = [...layersRef.current, { id, name: `РЎР»РѕР№ ${layersRef.current.length + 1}`, visible: true, strokes: [] }];
+    const next = [...layersRef.current, { id, name: `Слой ${layersRef.current.length + 1}`, visible: true, strokes: [] }];
     layersRef.current = next;
     setLayers(next);
     setActiveLayerId(id);
@@ -670,7 +670,7 @@ function Index() {
   const [newH, setNewH] = useState(800);
   const newCanvas = () => {
     setCanvasSize({ w: newW, h: newH });
-    const layer: Layer = { id: ++layerIdCounter, name: "РЎР»РѕР№ 1", visible: true, strokes: [] };
+    const layer: Layer = { id: ++layerIdCounter, name: "Слой 1", visible: true, strokes: [] };
     const next = [layer];
     layersRef.current = next;
     setLayers(next);
@@ -682,7 +682,7 @@ function Index() {
 
   // === Export ===
   // Render the full scene into an arbitrary context (used by exports at full quality).
-  // PERF: exports always use FULL_QUALITY_OPTS (step=1, unlimited rain) вЂ” the live-preview
+  // PERF: exports always use FULL_QUALITY_OPTS (step=1, unlimited rain) — the live-preview
   // decimation above never touches exported PNG/GIF/MP4 quality.
   const renderScene = useCallback((tctx: CanvasRenderingContext2D, w: number, h: number, now: number, dtRaw: number) => {
     tctx.fillStyle = "#080a12";
@@ -845,47 +845,47 @@ function Index() {
 
         {/* Undo / Redo */}
         <div className="flex gap-1.5">
-          <button onClick={undo} disabled={!canUndo || !!recording} className="flex-1 rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/10 disabled:opacity-30">в†¶ РћС‚РјРµРЅРёС‚СЊ</button>
-          <button onClick={redo} disabled={!canRedo || !!recording} className="flex-1 rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/10 disabled:opacity-30">Р’РµСЂРЅСѓС‚СЊ в†·</button>
+          <button onClick={undo} disabled={!canUndo || !!recording} className="flex-1 rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/10 disabled:opacity-30">↶ Отменить</button>
+          <button onClick={redo} disabled={!canRedo || !!recording} className="flex-1 rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/10 disabled:opacity-30">Вернуть ↷</button>
         </div>
 
         {/* New canvas */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
-          <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">РҐРѕР»СЃС‚</div>
+          <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Холст</div>
           <div className="mb-2 flex items-center gap-1.5 text-[11px]">
             <input type="number" min={64} max={4096} value={newW} onChange={(e) => setNewW(+e.target.value || 0)} className="w-full rounded border border-white/10 bg-black/40 px-1.5 py-1 text-white" />
-            <span className="text-white/40">Г—</span>
+            <span className="text-white/40">×</span>
             <input type="number" min={64} max={4096} value={newH} onChange={(e) => setNewH(+e.target.value || 0)} className="w-full rounded border border-white/10 bg-black/40 px-1.5 py-1 text-white" />
           </div>
-          <button onClick={newCanvas} className="w-full rounded-md border border-white/15 bg-white/10 px-2 py-1.5 text-[11px] tracking-wider hover:bg-white/15">+ РќРѕРІС‹Р№ С…РѕР»СЃС‚</button>
-          <div className="mt-1.5 text-[9px] text-white/40">РўРµРєСѓС‰РёР№: {canvasSize.w}Г—{canvasSize.h}</div>
+          <button onClick={newCanvas} className="w-full rounded-md border border-white/15 bg-white/10 px-2 py-1.5 text-[11px] tracking-wider hover:bg-white/15">+ Новый холст</button>
+          <div className="mt-1.5 text-[9px] text-white/40">Текущий: {canvasSize.w}×{canvasSize.h}</div>
         </section>
 
         {/* Layers */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-2 flex items-center justify-between">
-            <div className="text-[9px] uppercase tracking-widest text-white/40">РЎР»РѕРё</div>
-            <button onClick={addLayer} className="rounded border border-white/15 bg-white/10 px-2 py-0.5 text-[10px] hover:bg-white/20">+ РЎР»РѕР№</button>
+            <div className="text-[9px] uppercase tracking-widest text-white/40">Слои</div>
+            <button onClick={addLayer} className="rounded border border-white/15 bg-white/10 px-2 py-0.5 text-[10px] hover:bg-white/20">+ Слой</button>
           </div>
           <ul className="flex flex-col gap-1">
             {[...layers].reverse().map((l) => (
               <li key={l.id} className={`flex items-center gap-1.5 rounded-md border px-1.5 py-1 ${activeLayerId === l.id ? "border-white/40 bg-white/10" : "border-white/5 bg-transparent hover:bg-white/[0.04]"}`}>
-                <button onClick={() => toggleLayer(l.id)} className="text-[12px] leading-none text-white/70 hover:text-white" title="Р’РёРґРёРјРѕСЃС‚СЊ">{l.visible ? "рџ‘Ѓ" : "вЂ”"}</button>
+                <button onClick={() => toggleLayer(l.id)} className="text-[12px] leading-none text-white/70 hover:text-white" title="Видимость">{l.visible ? "👁" : "—"}</button>
                 <button onClick={() => setActiveLayerId(l.id)} className="flex-1 truncate text-left text-[11px]">{l.name}</button>
                 <span className="text-[9px] text-white/30">{l.strokes.length}</span>
-                <button onClick={() => removeLayer(l.id)} disabled={layers.length === 1} className="text-[11px] text-white/40 hover:text-red-400 disabled:opacity-20" title="РЈРґР°Р»РёС‚СЊ">вњ•</button>
+                <button onClick={() => removeLayer(l.id)} disabled={layers.length === 1} className="text-[11px] text-white/40 hover:text-red-400 disabled:opacity-20" title="Удалить">✕</button>
               </li>
             ))}
           </ul>
           <div className="mt-2 flex gap-1.5">
-            <button onClick={clearActive} className="flex-1 rounded border border-white/10 px-1.5 py-1 text-[10px] uppercase tracking-widest text-white/60 hover:bg-white/5">РћС‡РёСЃС‚РёС‚СЊ СЃР»РѕР№</button>
-            <button onClick={clearAll} className="flex-1 rounded border border-white/10 px-1.5 py-1 text-[10px] uppercase tracking-widest text-white/60 hover:bg-white/5">Р’СЃС‘</button>
+            <button onClick={clearActive} className="flex-1 rounded border border-white/10 px-1.5 py-1 text-[10px] uppercase tracking-widest text-white/60 hover:bg-white/5">Очистить слой</button>
+            <button onClick={clearAll} className="flex-1 rounded border border-white/10 px-1.5 py-1 text-[10px] uppercase tracking-widest text-white/60 hover:bg-white/5">Всё</button>
           </div>
         </section>
 
         {/* Brushes */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
-          <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">РљРёСЃС‚СЊ</div>
+          <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Кисть</div>
           <div className="grid grid-cols-2 gap-1">
             {BRUSHES.map(b => (
               <button key={b.id} onClick={() => setBrush(b.id)} className={`rounded border px-2 py-1 text-[10px] tracking-wider transition ${brush === b.id ? "border-white/60 bg-white/15" : "border-white/10 bg-white/[0.02] text-white/60 hover:bg-white/[0.06]"}`}>{b.label}</button>
@@ -895,7 +895,7 @@ function Index() {
 
         {/* Modes */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
-          <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Р РµР¶РёРј</div>
+          <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Режим</div>
           <div className="grid grid-cols-3 gap-1">
             {MODES.map(m => (
               <button key={m.id} onClick={() => setMode(m.id)} className={`rounded border px-1.5 py-1 text-[9px] uppercase tracking-widest transition ${mode === m.id ? "border-white/60 bg-white/10" : "border-white/5 text-white/40 hover:text-white/80"}`}>{m.label}</button>
@@ -906,12 +906,12 @@ function Index() {
         {/* Size / Hue */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
           <label className="block text-[10px] uppercase tracking-widest text-white/50">
-            <span className="mb-1 flex justify-between"><span>Р Р°Р·РјРµСЂ</span><span className="text-white/80">{size}</span></span>
+            <span className="mb-1 flex justify-between"><span>Размер</span><span className="text-white/80">{size}</span></span>
             <input type="range" min={4} max={120} value={size} onChange={(e) => setSize(+e.target.value)} className="w-full accent-white" />
           </label>
           <label className="block text-[10px] uppercase tracking-widest text-white/50">
             <span className="mb-1 flex items-center justify-between">
-              <span>Р¦РІРµС‚</span>
+              <span>Цвет</span>
               <span className="h-4 w-4 rounded-full border border-white/30" style={{ backgroundColor: `hsl(${hue}, 90%, 60%)` }} />
             </span>
             <input type="range" min={0} max={360} value={hue} onChange={(e) => setHue(+e.target.value)} className="w-full" style={{ background: "linear-gradient(to right, hsl(0,90%,60%), hsl(60,90%,60%), hsl(120,90%,60%), hsl(180,90%,60%), hsl(240,90%,60%), hsl(300,90%,60%), hsl(360,90%,60%))", appearance: "none", height: 6, borderRadius: 999 }} />
@@ -920,23 +920,23 @@ function Index() {
 
         {/* Params */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
-          <div className="mb-1 text-[9px] uppercase tracking-widest text-white/40">РџР°СЂР°РјРµС‚СЂС‹</div>
-          <ParamSlider label="РЎРєРѕСЂРѕСЃС‚СЊ" value={speed} set={setSpeed} />
-          <ParamSlider label="РџР»РѕС‚РЅРѕСЃС‚СЊ" value={density} set={setDensity} />
-          <ParamSlider label="РЁСѓРј" value={noise} set={setNoise} />
-          <ParamSlider label="РРЅС‚РµРЅСЃРёРІ." value={intensity} set={setIntensity} />
-          <ParamSlider label="Р”РёРЅР°РјРёРєР°" value={dynamics} set={setDynamics} />
+          <div className="mb-1 text-[9px] uppercase tracking-widest text-white/40">Параметры</div>
+          <ParamSlider label="Скорость" value={speed} set={setSpeed} />
+          <ParamSlider label="Плотность" value={density} set={setDensity} />
+          <ParamSlider label="Шум" value={noise} set={setNoise} />
+          <ParamSlider label="Интенсив." value={intensity} set={setIntensity} />
+          <ParamSlider label="Динамика" value={dynamics} set={setDynamics} />
         </section>
 
         {/* Export */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
-          <div className="text-[9px] uppercase tracking-widest text-white/40">Р­РєСЃРїРѕСЂС‚</div>
+          <div className="text-[9px] uppercase tracking-widest text-white/40">Экспорт</div>
 
           {/* Scale + Duration selectors (shared) */}
           <div className="space-y-1">
             <div className="flex items-center justify-between text-[9px] uppercase tracking-widest text-white/40">
-              <span>РњР°СЃС€С‚Р°Р±</span>
-              <span className="text-white/70 normal-case tracking-normal">{Math.round(canvasSize.w * exportScale)}Г—{Math.round(canvasSize.h * exportScale)}</span>
+              <span>Масштаб</span>
+              <span className="text-white/70 normal-case tracking-normal">{Math.round(canvasSize.w * exportScale)}×{Math.round(canvasSize.h * exportScale)}</span>
             </div>
             <div className="flex gap-1">
               {SCALES.map(s => (
@@ -946,7 +946,7 @@ function Index() {
           </div>
           <div className="space-y-1">
             <div className="flex items-center justify-between text-[9px] uppercase tracking-widest text-white/40">
-              <span>Р”Р»РёС‚РµР»СЊРЅРѕСЃС‚СЊ</span>
+              <span>Длительность</span>
               <span className="text-white/70 normal-case tracking-normal">{exportSec}s</span>
             </div>
             <div className="flex flex-wrap gap-1">
@@ -967,7 +967,7 @@ function Index() {
             </div>
           </div>
 
-          <button onClick={savePng} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">PNG В· {exportScale}x</button>
+          <button onClick={savePng} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">PNG · {exportScale}x</button>
 
           <div className="space-y-1">
             <div className="flex gap-1">
@@ -976,7 +976,7 @@ function Index() {
               ))}
             </div>
             <button onClick={exportGif} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">
-              {recording === "gif" ? `GIF ${Math.round(recordProgress * 100)}%` : `GIF В· ${exportFps}fps ${exportSec}s`}
+              {recording === "gif" ? `GIF ${Math.round(recordProgress * 100)}%` : `GIF · ${exportFps}fps ${exportSec}s`}
             </button>
           </div>
 
@@ -987,7 +987,7 @@ function Index() {
               ))}
             </div>
             <button onClick={exportMp4} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">
-              {recording === "mp4" ? `MP4 ${Math.round(recordProgress * 100)}%` : `MP4 В· ${exportFps}fps ${exportSec}s ${(MP4_PRESETS[mp4Q].bps/1_000_000).toFixed(1)}M`}
+              {recording === "mp4" ? `MP4 ${Math.round(recordProgress * 100)}%` : `MP4 · ${exportFps}fps ${exportSec}s ${(MP4_PRESETS[mp4Q].bps/1_000_000).toFixed(1)}M`}
             </button>
           </div>
         </section>
@@ -1017,7 +1017,7 @@ function Index() {
           />
         </div>
         <div className="pointer-events-none absolute bottom-3 right-3 flex items-center gap-1 rounded-md border border-white/10 bg-black/60 p-1 text-[11px] backdrop-blur">
-          <button onClick={() => setZoom((z) => Math.max(0.1, z / 1.2))} className="pointer-events-auto rounded px-2 py-0.5 hover:bg-white/10">в€’</button>
+          <button onClick={() => setZoom((z) => Math.max(0.1, z / 1.2))} className="pointer-events-auto rounded px-2 py-0.5 hover:bg-white/10">−</button>
           <button onClick={() => setZoom(1)} className="pointer-events-auto rounded px-2 py-0.5 tabular-nums hover:bg-white/10">{Math.round(zoom * 100)}%</button>
           <button onClick={() => setZoom((z) => Math.min(6, z * 1.2))} className="pointer-events-auto rounded px-2 py-0.5 hover:bg-white/10">+</button>
         </div>
