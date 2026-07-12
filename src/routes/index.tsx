@@ -38,6 +38,8 @@ interface Stroke {
   intensity: number;
   dynamics: number;
   rainbowFlow: boolean;
+  gradientSpeed: number;
+  gradientSpread: number;
   points: StrokePoint[];
   born: number;
   // transient per-brush buckets (not serialized in history)
@@ -223,6 +225,8 @@ function Index() {
   const [intensity, setIntensity] = useState(0.7);
   const [dynamics, setDynamics] = useState(0.5);
   const [rainbowFlow, setRainbowFlow] = useState(true);
+  const [gradientSpeed, setGradientSpeed] = useState(0.3);
+  const [gradientSpread, setGradientSpread] = useState(0.5);
   const [recording, setRecording] = useState<null | "gif" | "mp4">(null);
   const [recordProgress, setRecordProgress] = useState(0);
   const [gifQ, setGifQ] = useState<GifQ>("medium");
@@ -237,6 +241,7 @@ function Index() {
     speed: useRef(speed), density: useRef(density), noise: useRef(noise),
     intensity: useRef(intensity), dynamics: useRef(dynamics),
     rainbowFlow: useRef(rainbowFlow),
+    gradientSpeed: useRef(gradientSpeed), gradientSpread: useRef(gradientSpread),
   };
   useEffect(() => { refs.brush.current = brush; });
   useEffect(() => { refs.mode.current = mode; });
@@ -248,6 +253,8 @@ function Index() {
   useEffect(() => { refs.intensity.current = intensity; });
   useEffect(() => { refs.dynamics.current = dynamics; });
   useEffect(() => { refs.rainbowFlow.current = rainbowFlow; });
+  useEffect(() => { refs.gradientSpeed.current = gradientSpeed; });
+  useEffect(() => { refs.gradientSpread.current = gradientSpread; });
 
   // resize canvas backing store to logical canvasSize
   useEffect(() => {
@@ -335,10 +342,12 @@ function Index() {
     const modeSpray = s.mode === "spray" ? 2.2 : 1;
     const alphaMul = (0.25 + s.intensity * 0.9) * modePulse;
     const pts = s.points;
-    const gradAmt = (s.mode === "gradient" || (s.mode === "rainbow" && s.rainbowFlow)) ? 360 : 0;
-    // Gradient mode now "flows" along the stroke over time — reuses the same tt (time × speed)
-    // used elsewhere, so the existing "Скорость" (speed) slider already controls flow speed.
-    const modeGradientFlow = s.mode === "gradient" ? (tt * 40) % 360 : 0;
+    // Gradient/rainbow-flow now driven by two per-stroke sliders instead of fixed constants:
+    // gradientSpread controls how many times the hue cycle repeats along the stroke's length,
+    // gradientSpeed controls how fast that hue pattern travels over time.
+    const hasFlowingGradient = s.mode === "gradient" || (s.mode === "rainbow" && s.rainbowFlow);
+    const gradAmt = hasFlowingGradient ? 360 * (0.2 + s.gradientSpread * 1.8) : 0;
+    const modeGradientFlow = hasFlowingGradient ? (tt * (10 + s.gradientSpeed * 150)) % 360 : 0;
     const nSeg = Math.max(1, pts.length - 1);
     const hueAt = (i: number, f = 0) => (s.hue + modeHueShift + modeGradientFlow + gradAmt * (i + f) / nSeg) % 360;
 
@@ -616,6 +625,8 @@ function Index() {
       intensity: refs.intensity.current,
       dynamics: refs.dynamics.current,
       rainbowFlow: refs.rainbowFlow.current,
+      gradientSpeed: refs.gradientSpeed.current,
+      gradientSpread: refs.gradientSpread.current,
       points: [],
       born: performance.now(),
     };
@@ -920,6 +931,12 @@ function Index() {
             >
               {rainbowFlow ? "Радуга: Поток вдоль мазка" : "Радуга: Мигание целиком"}
             </button>
+          )}
+          {(mode === "gradient" || (mode === "rainbow" && rainbowFlow)) && (
+            <div className="mt-2 space-y-2 border-t border-white/10 pt-2">
+              <ParamSlider label="Поток градиента" value={gradientSpeed} set={setGradientSpeed} />
+              <ParamSlider label="Растяжка" value={gradientSpread} set={setGradientSpread} />
+            </div>
           )}
         </section>
 
