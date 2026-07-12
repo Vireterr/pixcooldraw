@@ -100,10 +100,6 @@ const MAX_POINTS_PER_STROKE = 600;
 // ==== PERF: tunables ====
 // Global cap on live pixelRain particles across the ENTIRE scene (was 200 PER STROKE before).
 const GLOBAL_RAIN_CAP = 500;
-// Every this many total points across the visible scene, live rendering skips one extra point
-// per segment for ink/ribbon/lightning. Keeps per-frame cost roughly bounded instead of growing
-// linearly forever with stroke count/length.
-const LOAD_STEP_DIVISOR = 4000;
 
 function hash(n: number) {
   n = (n << 13) ^ n;
@@ -379,21 +375,20 @@ function Index() {
 
       const t = now / 1000;
 
-      // ==== PERF: compute per-frame load and a shared rain budget BEFORE drawing anything ====
-      // This lets per-frame cost stay roughly bounded instead of growing linearly forever with
-      // however many strokes/points have accumulated in the session.
-      let totalPoints = 0;
+      // Rain still shares one global budget across the scene (this doesn't touch visual quality of
+      // any individual particle — it just caps total particle COUNT once truly enormous, same as
+      // exports would need some cap too). Everything else always renders at full detail now — no
+      // point/segment skipping based on scene load, so drawing never visibly degrades as you add
+      // more strokes.
       let existingRain = 0;
       for (const layer of layersRef.current) {
         if (!layer.visible) continue;
         for (const s of layer.strokes) {
-          totalPoints += s.points.length;
           if (s.rain) existingRain += s.rain.length;
         }
       }
-      const liveStep = Math.max(1, Math.floor(totalPoints / LOAD_STEP_DIVISOR) + 1);
       const liveOpts: RenderOpts = {
-        step: liveStep,
+        step: 1,
         rainBudget: { left: Math.max(0, GLOBAL_RAIN_CAP - existingRain) },
       };
 
