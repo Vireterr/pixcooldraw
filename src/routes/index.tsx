@@ -39,7 +39,8 @@ interface Stroke {
   dynamics: number;
   rainbowFlow: boolean;
   gradientSpeed: number;
-  gradientSpread: number;
+  gradientColors: number[];
+  gradientAngle: number;
   points: StrokePoint[];
   born: number;
   // transient per-brush buckets (not serialized in history)
@@ -108,6 +109,64 @@ function hash(n: number) {
   return 1.0 - (((n * (n * n * 15731 + 789221) + 1376312589) & 0x7fffffff) / 1073741823.5);
 }
 
+// ==== Custom gradient tool: color <-> hue conversion + multi-stop interpolation ====
+function hexToHue(hex: string): number {
+  const r = parseInt(hex.slice(1, 3), 16) / 255;
+  const g = parseInt(hex.slice(3, 5), 16) / 255;
+  const b = parseInt(hex.slice(5, 7), 16) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  let h = 0;
+  if (max !== min) {
+    const d = max - min;
+    if (max === r) h = ((g - b) / d + (g < b ? 6 : 0));
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+  }
+  return Math.round(h);
+}
+function hueToHex(hue: number): string {
+  const s = 0.9, l = 0.6;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs((hue / 60) % 2 - 1));
+  const m = l - c / 2;
+  let r = 0, g = 0, b = 0;
+  if (hue < 60) { r = c; g = x; b = 0; }
+  else if (hue < 120) { r = x; g = c; b = 0; }
+  else if (hue < 180) { r = 0; g = c; b = x; }
+  else if (hue < 240) { r = 0; g = x; b = c; }
+  else if (hue < 300) { r = x; g = 0; b = c; }
+  else { r = c; g = 0; b = x; }
+  const toHex = (v: number) => Math.round((v + m) * 255).toString(16).padStart(2, "0");
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+// Cyclic interpolation across N user-picked hues. t travels continuously (not clamped to [0,1]),
+// so feeding it a growing time-based value makes the palette flow endlessly along the stroke.
+function sampleGradient(colors: number[], t: number): number {
+  const n = colors.length;
+  if (n === 0) return 0;
+  if (n === 1) return colors[0];
+  const norm = ((t % 1) + 1) % 1;
+  const scaled = norm * n;
+  const idx = Math.floor(scaled) % n;
+  const frac = scaled - Math.floor(scaled);
+  const c0 = colors[idx];
+  const c1 = colors[(idx + 1) % n];
+  const diff = ((c1 - c0 + 540) % 360) - 180; // shortest angular path between the two stops
+  return (c0 + diff * frac + 360) % 360;
+}
+// Direction the brush actually travelled, from the first point to the last, in degrees.
+// Falls back to 0 for a stroke with no real movement (e.g. a single-click "Заливка" — in that
+// case the gradientAngle slider becomes the sole, absolute angle control since there's no
+// natural stroke direction to derive from).
+function strokeAutoAngleDeg(pts: StrokePoint[]): number {
+  if (pts.length < 2) return 0;
+  const p0 = pts[0], p1 = pts[pts.length - 1];
+  const dx = p1.x - p0.x, dy = p1.y - p0.y;
+  if (Math.hypot(dx, dy) < 1) return 0;
+  return ((Math.atan2(dy, dx) * 180) / Math.PI + 360) % 360;
+}
+
 let strokeIdCounter = 0;
 let layerIdCounter = 0;
 
@@ -119,6 +178,8 @@ function serializeLayers(layers: Layer[]): string {
       id: s.id, kind: s.kind, mode: s.mode, size: s.size, hue: s.hue,
       speed: s.speed, density: s.density, noise: s.noise,
       intensity: s.intensity, dynamics: s.dynamics,
+      rainbowFlow: s.rainbowFlow, gradientSpeed: s.gradientSpeed,
+      gradientColors: s.gradientColors, gradientAngle: s.gradientAngle,
       points: s.points, born: s.born,
     })),
   })));
@@ -226,7 +287,8 @@ function Index() {
   const [dynamics, setDynamics] = useState(0.5);
   const [rainbowFlow, setRainbowFlow] = useState(true);
   const [gradientSpeed, setGradientSpeed] = useState(0.3);
-  const [gradientSpread, setGradientSpread] = useState(0.5);
+  const [gradientColors, setGradientColors] = useState<number[]>([200, 320, 60]);
+  const [gradientAngle, setGradientAngle] = useState(0);
   const [recording, setRecording] = useState<null | "gif" | "mp4">(null);
   const [recordProgress, setRecordProgress] = useState(0);
   const [gifQ, setGifQ] = useState<GifQ>("medium");
@@ -241,7 +303,8 @@ function Index() {
     speed: useRef(speed), density: useRef(density), noise: useRef(noise),
     intensity: useRef(intensity), dynamics: useRef(dynamics),
     rainbowFlow: useRef(rainbowFlow),
-    gradientSpeed: useRef(gradientSpeed), gradientSpread: useRef(gradientSpread),
+    gradientSpeed: useRef(gradientSpeed), gradientColors: useRef(gradientColors),
+    gradientAngle: useRef(gradientAngle),
   };
   useEffect(() => { refs.brush.current = brush; });
   useEffect(() => { refs.mode.current = mode; });
@@ -254,7 +317,8 @@ function Index() {
   useEffect(() => { refs.dynamics.current = dynamics; });
   useEffect(() => { refs.rainbowFlow.current = rainbowFlow; });
   useEffect(() => { refs.gradientSpeed.current = gradientSpeed; });
-  useEffect(() => { refs.gradientSpread.current = gradientSpread; });
+  useEffect(() => { refs.gradientColors.current = gradientColors; });
+  useEffect(() => { refs.gradientAngle.current = gradientAngle; });
 
   // resize canvas backing store to logical canvasSize
   useEffect(() => {
@@ -342,14 +406,38 @@ function Index() {
     const modeSpray = s.mode === "spray" ? 2.2 : 1;
     const alphaMul = (0.25 + s.intensity * 0.9) * modePulse;
     const pts = s.points;
-    // Gradient/rainbow-flow now driven by two per-stroke sliders instead of fixed constants:
-    // gradientSpread controls how many times the hue cycle repeats along the stroke's length,
-    // gradientSpeed controls how fast that hue pattern travels over time.
-    const hasFlowingGradient = s.mode === "gradient" || (s.mode === "rainbow" && s.rainbowFlow);
-    const gradAmt = hasFlowingGradient ? 360 * (0.2 + s.gradientSpread * 1.8) : 0;
-    const modeGradientFlow = hasFlowingGradient ? (tt * (10 + s.gradientSpeed * 150)) % 360 : 0;
+    // "Радуга: Поток" keeps its original simple full-spectrum sweep, unchanged.
+    // "Градиент" is now fully independent and spatial. Its base direction is auto-derived from
+    // the way the brush was actually moved (start point -> end point of the stroke) — draw
+    // left-to-right and the gradient flows left-to-right, draw diagonally and it follows that
+    // diagonal. gradientAngle (the slider) is an ADDITIONAL offset rotated on top of that auto
+    // direction — at 0 it does nothing. For strokes with no real movement (a single-click "Заливка")
+    // the auto direction is 0, so the slider becomes the sole, absolute angle control there.
+    const rainbowFlowActive = s.mode === "rainbow" && s.rainbowFlow;
+    const legacySpread = rainbowFlowActive ? 360 : 0;
+    const legacyFlow = rainbowFlowActive ? (tt * 40) % 360 : 0;
     const nSeg = Math.max(1, pts.length - 1);
-    const hueAt = (i: number, f = 0) => (s.hue + modeHueShift + modeGradientFlow + gradAmt * (i + f) / nSeg) % 360;
+    const gradAutoAngle = s.mode === "gradient" ? strokeAutoAngleDeg(pts) : 0;
+    const gradAngleRad = ((gradAutoAngle + s.gradientAngle) * Math.PI) / 180;
+    const gradCos = Math.cos(gradAngleRad), gradSin = Math.sin(gradAngleRad);
+    // Normalize the projection so the picked colors span roughly the visible canvas regardless of angle.
+    const gradExtent = Math.abs(w * gradCos) + Math.abs(h * gradSin) || 1;
+    const gradTravel = tt * (0.03 + s.gradientSpeed * 0.5);
+    const gradientHueAtXY = (x: number, y: number): number => {
+      const proj = (x * gradCos + y * gradSin) / gradExtent;
+      return sampleGradient(s.gradientColors, proj + gradTravel);
+    };
+    const hueAt = (i: number, f = 0): number => {
+      if (s.mode === "gradient") {
+        const p0 = pts[Math.min(i, pts.length - 1)];
+        const p1 = pts[Math.min(i + 1, pts.length - 1)];
+        const px = p0.x + (p1.x - p0.x) * f;
+        const py = p0.y + (p1.y - p0.y) * f;
+        return gradientHueAtXY(px, py);
+      }
+      const posT = (i + f) / nSeg;
+      return (s.hue + modeHueShift + legacyFlow + legacySpread * posT) % 360;
+    };
 
     if (s.kind === "fill") {
       const p = pts[0] || { x: w / 2, y: h / 2, t: 0 };
@@ -471,7 +559,7 @@ function Index() {
           x: Math.round(p.x / grid) * grid + (Math.random() - 0.5) * s.size,
           y: p.y,
           vy: 0.5 + Math.random() * 2 * (0.3 + s.dynamics * 2),
-          hue: s.hue + (Math.random() - 0.5) * 40 + gradAmt * idx / nSeg,
+          hue: s.mode === "gradient" ? gradientHueAtXY(p.x, p.y) : s.hue + (Math.random() - 0.5) * 40 + legacySpread * idx / nSeg,
           len: 3 + Math.floor(Math.random() * 8 * (0.3 + s.dynamics)),
           seed: Math.random() * 1000,
         });
@@ -626,7 +714,8 @@ function Index() {
       dynamics: refs.dynamics.current,
       rainbowFlow: refs.rainbowFlow.current,
       gradientSpeed: refs.gradientSpeed.current,
-      gradientSpread: refs.gradientSpread.current,
+      gradientColors: [...refs.gradientColors.current],
+      gradientAngle: refs.gradientAngle.current,
       points: [],
       born: performance.now(),
     };
@@ -932,13 +1021,69 @@ function Index() {
               {rainbowFlow ? "Радуга: Поток вдоль мазка" : "Радуга: Мигание целиком"}
             </button>
           )}
-          {(mode === "gradient" || (mode === "rainbow" && rainbowFlow)) && (
-            <div className="mt-2 space-y-2 border-t border-white/10 pt-2">
-              <ParamSlider label="Поток градиента" value={gradientSpeed} set={setGradientSpeed} />
-              <ParamSlider label="Растяжка" value={gradientSpread} set={setGradientSpread} />
-            </div>
-          )}
         </section>
+
+        {/* Dedicated Gradient tool menu — only visible while the Gradient mode is active */}
+        {mode === "gradient" && (
+          <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
+            <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Градиент — цвета</div>
+
+            <div className="flex flex-wrap gap-1.5">
+              {gradientColors.map((c, i) => (
+                <div key={i} className="relative">
+                  <input
+                    type="color"
+                    value={hueToHex(c)}
+                    onChange={(e) => {
+                      const hue = hexToHue(e.target.value);
+                      setGradientColors(cols => cols.map((cc, ci) => ci === i ? hue : cc));
+                    }}
+                    className="h-7 w-7 cursor-pointer rounded border border-white/20 bg-transparent p-0"
+                    title={`Цвет ${i + 1}`}
+                  />
+                  {gradientColors.length > 2 && (
+                    <button
+                      onClick={() => setGradientColors(cols => cols.filter((_, ci) => ci !== i))}
+                      className="absolute -right-1 -top-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-black/80 text-[8px] text-white/70 hover:text-red-400"
+                      title="Удалить цвет"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+              ))}
+              {gradientColors.length < 6 && (
+                <button
+                  onClick={() => setGradientColors(cols => [...cols, Math.round(Math.random() * 360)])}
+                  className="flex h-7 w-7 items-center justify-center rounded border border-dashed border-white/30 text-[13px] text-white/50 hover:border-white/60 hover:text-white"
+                  title="Добавить цвет"
+                >
+                  +
+                </button>
+              )}
+            </div>
+
+            <label className="block text-[10px] uppercase tracking-widest text-white/50">
+              <span className="mb-1 flex justify-between">
+                <span>Поворот направления</span>
+                <span className="text-white/80">{gradientAngle > 0 ? "+" : ""}{gradientAngle}°</span>
+              </span>
+              <input
+                type="range"
+                min={-180}
+                max={180}
+                value={gradientAngle}
+                onChange={(e) => setGradientAngle(+e.target.value)}
+                className="w-full accent-white"
+              />
+              <span className="mt-1 block text-[8px] normal-case tracking-normal text-white/30">
+                0° — вдоль мазка (для заливки — угол вручную)
+              </span>
+            </label>
+
+            <ParamSlider label="Скорость потока" value={gradientSpeed} set={setGradientSpeed} />
+          </section>
+        )}
 
         {/* Size / Hue */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
