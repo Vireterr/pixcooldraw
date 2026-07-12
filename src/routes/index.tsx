@@ -332,8 +332,11 @@ function Index() {
     const alphaMul = (0.25 + s.intensity * 0.9) * modePulse;
     const pts = s.points;
     const gradAmt = s.mode === "gradient" ? 360 : 0;
-    const nSeg = Math.max(1, pts.length - 1);
-    const hueAt = (i: number, f = 0) => (s.hue + modeHueShift + gradAmt * (i + f) / nSeg) % 360;
+// Gradient mode now "flows" along the stroke over time — reuses the same tt (time × speed)
+// used elsewhere, so the existing "Скорость" (speed) slider already controls flow speed.
+const modeGradientFlow = s.mode === "gradient" ? (tt * 40) % 360 : 0;
+const nSeg = Math.max(1, pts.length - 1);
+const hueAt = (i: number, f = 0) => (s.hue + modeHueShift + modeGradientFlow + gradAmt * (i + f) / nSeg) % 360;
 
     if (s.kind === "fill") {
       const p = pts[0] || { x: w / 2, y: h / 2, t: 0 };
