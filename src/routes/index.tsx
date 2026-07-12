@@ -441,9 +441,10 @@ function Index() {
 
     else if (s.kind === "pixelRain") {
       const grid = Math.max(3, Math.round(s.size / 4));
-      // PERF: target is now capped by the GLOBAL shared budget, not a flat 200-per-stroke pool.
-      const target = Math.min(opts.rainBudget.left > 0 ? Math.floor(10 + s.density * 80) : 0, s.rain?.length ?? 0 + opts.rainBudget.left);
-      if (!s.rain) s.rain = [];
+const currentRainCount = s.rain?.length ?? 0;
+const wantRain = Math.floor(10 + s.density * 80);
+const target = Math.min(wantRain, currentRainCount + Math.max(0, opts.rainBudget.left));
+if (!s.rain) s.rain = [];
       while (s.rain.length < target && opts.rainBudget.left > 0) {
         const idx = Math.floor(Math.random() * pts.length);
         const p = pts[idx];
