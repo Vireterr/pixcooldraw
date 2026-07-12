@@ -38,8 +38,9 @@ interface Stroke {
   intensity: number;
   dynamics: number;
   rainbowFlow: boolean;
+  rainbowFlowSpeed: number;
   gradientSpeed: number;
-  gradientColors: number[];
+  gradientColors: { hue: number; weight: number }[];
   gradientAngle: number;
   points: StrokePoint[];
   born: number;
@@ -140,18 +141,28 @@ function hueToHex(hue: number): string {
   const toHex = (v: number) => Math.round((v + m) * 255).toString(16).padStart(2, "0");
   return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
 }
-// Cyclic interpolation across N user-picked hues. t travels continuously (not clamped to [0,1]),
-// so feeding it a growing time-based value makes the palette flow endlessly along the stroke.
-function sampleGradient(colors: number[], t: number): number {
-  const n = colors.length;
+// Cyclic interpolation across N user-picked hues, each with its own WEIGHT controlling how much
+// of the 0..1 cycle it occupies (higher weight = that color dominates a larger stretch, and the
+// transition into/out of it takes proportionally longer). t travels continuously (not clamped to
+// [0,1]), so feeding it a growing time-based value makes the palette flow endlessly along the stroke.
+function sampleGradient(stops: { hue: number; weight: number }[], t: number): number {
+  const n = stops.length;
   if (n === 0) return 0;
-  if (n === 1) return colors[0];
+  if (n === 1) return stops[0].hue;
+  const totalW = stops.reduce((a, s) => a + Math.max(0.05, s.weight), 0);
   const norm = ((t % 1) + 1) % 1;
-  const scaled = norm * n;
-  const idx = Math.floor(scaled) % n;
-  const frac = scaled - Math.floor(scaled);
-  const c0 = colors[idx];
-  const c1 = colors[(idx + 1) % n];
+  let acc = 0;
+  let idx = n - 1;
+  let segStart = 0, segEnd = 1;
+  for (let i = 0; i < n; i++) {
+    const w = Math.max(0.05, stops[i].weight) / totalW;
+    const next = acc + w;
+    if (norm < next || i === n - 1) { idx = i; segStart = acc; segEnd = next; break; }
+    acc = next;
+  }
+  const frac = segEnd > segStart ? (norm - segStart) / (segEnd - segStart) : 0;
+  const c0 = stops[idx].hue;
+  const c1 = stops[(idx + 1) % n].hue;
   const diff = ((c1 - c0 + 540) % 360) - 180; // shortest angular path between the two stops
   return (c0 + diff * frac + 360) % 360;
 }
@@ -178,7 +189,7 @@ function serializeLayers(layers: Layer[]): string {
       id: s.id, kind: s.kind, mode: s.mode, size: s.size, hue: s.hue,
       speed: s.speed, density: s.density, noise: s.noise,
       intensity: s.intensity, dynamics: s.dynamics,
-      rainbowFlow: s.rainbowFlow, gradientSpeed: s.gradientSpeed,
+      rainbowFlow: s.rainbowFlow, rainbowFlowSpeed: s.rainbowFlowSpeed, gradientSpeed: s.gradientSpeed,
       gradientColors: s.gradientColors, gradientAngle: s.gradientAngle,
       points: s.points, born: s.born,
     })),
@@ -286,8 +297,11 @@ function Index() {
   const [intensity, setIntensity] = useState(0.7);
   const [dynamics, setDynamics] = useState(0.5);
   const [rainbowFlow, setRainbowFlow] = useState(true);
+  const [rainbowFlowSpeed, setRainbowFlowSpeed] = useState(0.5);
   const [gradientSpeed, setGradientSpeed] = useState(0.3);
-  const [gradientColors, setGradientColors] = useState<number[]>([200, 320, 60]);
+  const [gradientColors, setGradientColors] = useState<{ hue: number; weight: number }[]>([
+    { hue: 200, weight: 1 }, { hue: 320, weight: 1 }, { hue: 60, weight: 1 },
+  ]);
   const [gradientAngle, setGradientAngle] = useState(0);
   const [recording, setRecording] = useState<null | "gif" | "mp4">(null);
   const [recordProgress, setRecordProgress] = useState(0);
@@ -303,6 +317,7 @@ function Index() {
     speed: useRef(speed), density: useRef(density), noise: useRef(noise),
     intensity: useRef(intensity), dynamics: useRef(dynamics),
     rainbowFlow: useRef(rainbowFlow),
+    rainbowFlowSpeed: useRef(rainbowFlowSpeed),
     gradientSpeed: useRef(gradientSpeed), gradientColors: useRef(gradientColors),
     gradientAngle: useRef(gradientAngle),
   };
@@ -316,6 +331,7 @@ function Index() {
   useEffect(() => { refs.intensity.current = intensity; });
   useEffect(() => { refs.dynamics.current = dynamics; });
   useEffect(() => { refs.rainbowFlow.current = rainbowFlow; });
+  useEffect(() => { refs.rainbowFlowSpeed.current = rainbowFlowSpeed; });
   useEffect(() => { refs.gradientSpeed.current = gradientSpeed; });
   useEffect(() => { refs.gradientColors.current = gradientColors; });
   useEffect(() => { refs.gradientAngle.current = gradientAngle; });
@@ -415,7 +431,7 @@ function Index() {
     // the auto direction is 0, so the slider becomes the sole, absolute angle control there.
     const rainbowFlowActive = s.mode === "rainbow" && s.rainbowFlow;
     const legacySpread = rainbowFlowActive ? 360 : 0;
-    const legacyFlow = rainbowFlowActive ? (tt * 40) % 360 : 0;
+    const legacyFlow = rainbowFlowActive ? (tt * (10 + s.rainbowFlowSpeed * 150)) % 360 : 0;
     const nSeg = Math.max(1, pts.length - 1);
     const gradAutoAngle = s.mode === "gradient" ? strokeAutoAngleDeg(pts) : 0;
     const gradAngleRad = ((gradAutoAngle + s.gradientAngle) * Math.PI) / 180;
@@ -440,11 +456,29 @@ function Index() {
     };
 
     if (s.kind === "fill") {
-      const p = pts[0] || { x: w / 2, y: h / 2, t: 0 };
-      const hueF = hueAt(0, 0);
-      ctx.fillStyle = `hsla(${hueF}, 85%, 55%, ${Math.min(1, 0.3 + s.intensity * 0.8) * modePulse})`;
+      const alpha = Math.min(1, 0.3 + s.intensity * 0.8) * modePulse;
+      if (s.mode === "gradient") {
+        // A flat single hue washing the whole canvas every frame reads as "blinking" — instead,
+        // bake the same weighted multi-color gradient into a real spatial canvas gradient, sampled
+        // at several fixed positions along the chosen angle. gradTravel still animates it, but now
+        // as a smoothly scrolling spatial gradient instead of the whole screen flashing one color.
+        const halfExtent = gradExtent / 2;
+        const cx = w / 2, cy = h / 2;
+        const x0 = cx - gradCos * halfExtent, y0 = cy - gradSin * halfExtent;
+        const x1 = cx + gradCos * halfExtent, y1 = cy + gradSin * halfExtent;
+        const lg = ctx.createLinearGradient(x0, y0, x1, y1);
+        const STOPS = 16;
+        for (let k = 0; k <= STOPS; k++) {
+          const posK = k / STOPS;
+          const hueK = sampleGradient(s.gradientColors, posK + gradTravel);
+          lg.addColorStop(posK, `hsla(${hueK}, 85%, 55%, ${alpha})`);
+        }
+        ctx.fillStyle = lg;
+      } else {
+        const hueF = hueAt(0, 0);
+        ctx.fillStyle = `hsla(${hueF}, 85%, 55%, ${alpha})`;
+      }
       ctx.fillRect(0, 0, w, h);
-      void p;
       return;
     }
 
@@ -622,7 +656,21 @@ function Index() {
           const x0 = p.x - widthLine / 2 + shift;
           const y0 = Math.round((p.y + yOff) / grid) * grid;
           const offs = [-grid, 0, grid];
-          const hues = [hueG % 360, (hueG + 120) % 360, (hueG + 240) % 360];
+          let hues: number[];
+          if (s.mode === "gradient") {
+            // Sample the actual chosen palette at three nearby positions instead of a synthetic
+            // +120/+240 hue offset — otherwise the channel-split always looks like a generic RGB
+            // trio no matter which colors were picked, making the tool feel unresponsive to them.
+            const spread = 0.035;
+            const basePos = (p.x * gradCos + p.y * gradSin) / gradExtent + gradTravel;
+            hues = [
+              sampleGradient(s.gradientColors, basePos - spread),
+              sampleGradient(s.gradientColors, basePos),
+              sampleGradient(s.gradientColors, basePos + spread),
+            ];
+          } else {
+            hues = [hueG % 360, (hueG + 120) % 360, (hueG + 240) % 360];
+          }
           for (let c2 = 0; c2 < 3; c2++) {
             ctx.fillStyle = `hsla(${hues[c2]}, 100%, 55%, ${alphaMul * 0.55})`;
             for (let xb = 0; xb < widthLine; xb += grid) {
@@ -713,8 +761,9 @@ function Index() {
       intensity: refs.intensity.current,
       dynamics: refs.dynamics.current,
       rainbowFlow: refs.rainbowFlow.current,
+      rainbowFlowSpeed: refs.rainbowFlowSpeed.current,
       gradientSpeed: refs.gradientSpeed.current,
-      gradientColors: [...refs.gradientColors.current],
+      gradientColors: refs.gradientColors.current.map(c => ({ ...c })),
       gradientAngle: refs.gradientAngle.current,
       points: [],
       born: performance.now(),
@@ -1021,6 +1070,11 @@ function Index() {
               {rainbowFlow ? "Радуга: Поток вдоль мазка" : "Радуга: Мигание целиком"}
             </button>
           )}
+          {mode === "rainbow" && rainbowFlow && (
+            <div className="mt-2 border-t border-white/10 pt-2">
+              <ParamSlider label="Скорость потока" value={rainbowFlowSpeed} set={setRainbowFlowSpeed} />
+            </div>
+          )}
         </section>
 
         {/* Dedicated Gradient tool menu — only visible while the Gradient mode is active */}
@@ -1028,23 +1082,35 @@ function Index() {
           <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
             <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Градиент — цвета</div>
 
-            <div className="flex flex-wrap gap-1.5">
+            <div className="space-y-1.5">
               {gradientColors.map((c, i) => (
-                <div key={i} className="relative">
+                <div key={i} className="flex items-center gap-2 rounded border border-white/5 bg-black/20 px-1.5 py-1">
                   <input
                     type="color"
-                    value={hueToHex(c)}
+                    value={hueToHex(c.hue)}
                     onChange={(e) => {
                       const hue = hexToHue(e.target.value);
-                      setGradientColors(cols => cols.map((cc, ci) => ci === i ? hue : cc));
+                      setGradientColors(cols => cols.map((cc, ci) => ci === i ? { ...cc, hue } : cc));
                     }}
-                    className="h-7 w-7 cursor-pointer rounded border border-white/20 bg-transparent p-0"
+                    className="h-6 w-6 shrink-0 cursor-pointer rounded border border-white/20 bg-transparent p-0"
                     title={`Цвет ${i + 1}`}
+                  />
+                  <input
+                    type="range"
+                    min={1}
+                    max={100}
+                    value={Math.round(c.weight * 50)}
+                    onChange={(e) => {
+                      const weight = +e.target.value / 50;
+                      setGradientColors(cols => cols.map((cc, ci) => ci === i ? { ...cc, weight } : cc));
+                    }}
+                    className="w-full accent-white"
+                    title="Доля этого цвета в смеси"
                   />
                   {gradientColors.length > 2 && (
                     <button
                       onClick={() => setGradientColors(cols => cols.filter((_, ci) => ci !== i))}
-                      className="absolute -right-1 -top-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-black/80 text-[8px] text-white/70 hover:text-red-400"
+                      className="shrink-0 text-[11px] text-white/40 hover:text-red-400"
                       title="Удалить цвет"
                     >
                       ✕
@@ -1054,11 +1120,10 @@ function Index() {
               ))}
               {gradientColors.length < 6 && (
                 <button
-                  onClick={() => setGradientColors(cols => [...cols, Math.round(Math.random() * 360)])}
-                  className="flex h-7 w-7 items-center justify-center rounded border border-dashed border-white/30 text-[13px] text-white/50 hover:border-white/60 hover:text-white"
-                  title="Добавить цвет"
+                  onClick={() => setGradientColors(cols => [...cols, { hue: Math.round(Math.random() * 360), weight: 1 }])}
+                  className="w-full rounded border border-dashed border-white/30 py-1 text-[10px] text-white/50 hover:border-white/60 hover:text-white"
                 >
-                  +
+                  + Добавить цвет
                 </button>
               )}
             </div>
