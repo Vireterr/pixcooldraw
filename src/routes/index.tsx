@@ -1528,7 +1528,7 @@ function Index() {
               </span>
             </label>
 
-            <ParamSlider label="Скорость потока" value={gradientSpeed} set={setGradientSpeed} />
+            {gradientFlow && <ParamSlider label="Скорость потока" value={gradientSpeed} set={setGradientSpeed} />}
           </section>
         )}
 
