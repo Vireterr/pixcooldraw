@@ -1394,6 +1394,33 @@ function Index() {
           </div>
         </section>
 
+        {/* Fill tool config — only when Заливка is the active brush. Тolerance drives how far
+            the flood-fill spreads into neighboring shades of the clicked pixel. */}
+        {brush === "fill" && (
+          <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
+            <div className="text-[9px] uppercase tracking-widest text-white/40">Заливка</div>
+            <label className="block text-[10px] uppercase tracking-widest text-white/50">
+              <span className="mb-1 flex justify-between">
+                <span>Допуск</span>
+                <span className="text-white/80">{Math.round(fillTolerance * 100)}%</span>
+              </span>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={1}
+                value={Math.round(fillTolerance * 100)}
+                onChange={(e) => setFillTolerance(+e.target.value / 100)}
+                className="w-full accent-white"
+              />
+              <span className="mt-1 block text-[8px] normal-case tracking-normal text-white/30">
+                0% — только точный цвет · 100% — вся сцена
+              </span>
+            </label>
+          </section>
+        )}
+
+
         {/* Modes */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Режим</div>
