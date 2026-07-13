@@ -311,7 +311,56 @@ function getSegCache(s: Stroke, pts: StrokePoint[], grid: number): { nx: number;
   return cache;
 }
 
+// Scanline flood-fill on RGBA source data. Returns a 1-byte-per-pixel mask (1 = filled) of the
+// connected region around (sx, sy) whose color is within `tolerance` of the seed pixel color.
+// tolerance is 0..1, mapped to a squared RGB distance so tol=0 means "exact match only" and tol=1
+// means "everything".
+function floodFillMask(src: Uint8ClampedArray, w: number, h: number, sx: number, sy: number, tolerance: number): Uint8Array {
+  const mask = new Uint8Array(w * h);
+  sx = Math.max(0, Math.min(w - 1, Math.floor(sx)));
+  sy = Math.max(0, Math.min(h - 1, Math.floor(sy)));
+  const idx0 = (sy * w + sx) * 4;
+  const sr = src[idx0], sg = src[idx0 + 1], sb = src[idx0 + 2];
+  // Squared distance threshold; max squared RGB distance is 3 * 255^2 = 195075.
+  const tolSq = Math.round((tolerance * tolerance) * 3 * 255 * 255);
+  const match = (i: number): boolean => {
+    const dr = src[i] - sr, dg = src[i + 1] - sg, db = src[i + 2] - sb;
+    return dr * dr + dg * dg + db * db <= tolSq;
+  };
+  // Scanline stack: [x, y]
+  const stack: number[] = [sx, sy];
+  while (stack.length) {
+    const y = stack.pop()!;
+    let x = stack.pop()!;
+    let i = (y * w + x) * 4;
+    if (mask[y * w + x] || !match(i)) continue;
+    // Walk left
+    let xl = x;
+    while (xl >= 0 && !mask[y * w + xl] && match((y * w + xl) * 4)) xl--;
+    xl++;
+    // Walk right
+    let xr = x;
+    while (xr < w && !mask[y * w + xr] && match((y * w + xr) * 4)) xr++;
+    xr--;
+    // Fill row and probe neighbors above/below
+    for (let cx = xl; cx <= xr; cx++) {
+      mask[y * w + cx] = 1;
+      if (y > 0) {
+        const up = ((y - 1) * w + cx) * 4;
+        if (!mask[(y - 1) * w + cx] && match(up)) stack.push(cx, y - 1);
+      }
+      if (y < h - 1) {
+        const dn = ((y + 1) * w + cx) * 4;
+        if (!mask[(y + 1) * w + cx] && match(dn)) stack.push(cx, y + 1);
+      }
+    }
+    void i;
+  }
+  return mask;
+}
+
 function Index() {
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // PERF: one persistent RGBA buffer, reused every frame (reallocated only when canvas size changes)
   // instead of letting the canvas API do per-pixel work thousands of times a frame.
