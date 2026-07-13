@@ -42,8 +42,6 @@ interface Stroke {
   gradientSpeed: number;
   gradientColors: { hue: number; weight: number }[];
   gradientAngle: number;
-  // Fill-only: tolerance (0..1) for the flood-fill color match. Undefined for non-fill strokes.
-  fillTolerance?: number;
   // Set once when the stroke is created from the "Анимация" toggle's state at that moment — frozen
   // strokes render with time locked to their birth instant, so they paint once and never animate
   // again. Toggling the button later never touches strokes that already exist (see tick()/onDown()).
@@ -58,11 +56,7 @@ interface Stroke {
   // count grows while actively drawing. Built lazily, extended as new points arrive, reset by
   // eraseAt() whenever points get removed/reindexed (see there for why).
   segCache?: { nx: number; ny: number; len: number; num: number }[];
-  // Fill-only transient: cached scanline flood-fill mask (1 byte per pixel, 1 = filled). Computed
-  // lazily on first render from a snapshot of the pixels UNDER the fill at that moment.
-  fillMask?: { w: number; h: number; data: Uint8Array } | null;
 }
-
 
 interface Layer {
   id: number;
@@ -252,8 +246,7 @@ function serializeLayers(layers: Layer[]): string {
       speed: s.speed, density: s.density, noise: s.noise,
       intensity: s.intensity, dynamics: s.dynamics,
       rainbowFlow: s.rainbowFlow, rainbowFlowSpeed: s.rainbowFlowSpeed, gradientSpeed: s.gradientSpeed,
-      gradientColors: s.gradientColors, gradientAngle: s.gradientAngle,
-      fillTolerance: s.fillTolerance, frozen: s.frozen,
+      gradientColors: s.gradientColors, gradientAngle: s.gradientAngle, frozen: s.frozen,
       points: s.points, born: s.born,
     })),
   })));
@@ -261,7 +254,6 @@ function serializeLayers(layers: Layer[]): string {
 function deserializeLayers(str: string): Layer[] {
   return JSON.parse(str) as Layer[];
 }
-
 
 // ==== PERF: cached pixelDither offset patterns ====
 // Previously recomputed a nested dx/dy loop with Math.hypot for EVERY sampled point, EVERY frame.
@@ -311,56 +303,7 @@ function getSegCache(s: Stroke, pts: StrokePoint[], grid: number): { nx: number;
   return cache;
 }
 
-// Scanline flood-fill on RGBA source data. Returns a 1-byte-per-pixel mask (1 = filled) of the
-// connected region around (sx, sy) whose color is within `tolerance` of the seed pixel color.
-// tolerance is 0..1, mapped to a squared RGB distance so tol=0 means "exact match only" and tol=1
-// means "everything".
-function floodFillMask(src: Uint8ClampedArray, w: number, h: number, sx: number, sy: number, tolerance: number): Uint8Array {
-  const mask = new Uint8Array(w * h);
-  sx = Math.max(0, Math.min(w - 1, Math.floor(sx)));
-  sy = Math.max(0, Math.min(h - 1, Math.floor(sy)));
-  const idx0 = (sy * w + sx) * 4;
-  const sr = src[idx0], sg = src[idx0 + 1], sb = src[idx0 + 2];
-  // Squared distance threshold; max squared RGB distance is 3 * 255^2 = 195075.
-  const tolSq = Math.round((tolerance * tolerance) * 3 * 255 * 255);
-  const match = (i: number): boolean => {
-    const dr = src[i] - sr, dg = src[i + 1] - sg, db = src[i + 2] - sb;
-    return dr * dr + dg * dg + db * db <= tolSq;
-  };
-  // Scanline stack: [x, y]
-  const stack: number[] = [sx, sy];
-  while (stack.length) {
-    const y = stack.pop()!;
-    let x = stack.pop()!;
-    let i = (y * w + x) * 4;
-    if (mask[y * w + x] || !match(i)) continue;
-    // Walk left
-    let xl = x;
-    while (xl >= 0 && !mask[y * w + xl] && match((y * w + xl) * 4)) xl--;
-    xl++;
-    // Walk right
-    let xr = x;
-    while (xr < w && !mask[y * w + xr] && match((y * w + xr) * 4)) xr++;
-    xr--;
-    // Fill row and probe neighbors above/below
-    for (let cx = xl; cx <= xr; cx++) {
-      mask[y * w + cx] = 1;
-      if (y > 0) {
-        const up = ((y - 1) * w + cx) * 4;
-        if (!mask[(y - 1) * w + cx] && match(up)) stack.push(cx, y - 1);
-      }
-      if (y < h - 1) {
-        const dn = ((y + 1) * w + cx) * 4;
-        if (!mask[(y + 1) * w + cx] && match(dn)) stack.push(cx, y + 1);
-      }
-    }
-    void i;
-  }
-  return mask;
-}
-
 function Index() {
-
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // PERF: one persistent RGBA buffer, reused every frame (reallocated only when canvas size changes)
   // instead of letting the canvas API do per-pixel work thousands of times a frame.
@@ -440,11 +383,6 @@ function Index() {
     { hue: 200, weight: 1 }, { hue: 320, weight: 1 }, { hue: 60, weight: 1 },
   ]);
   const [gradientAngle, setGradientAngle] = useState(0);
-  // "Градиент: Поток" toggle — when off, gradientSpeed is ignored at render time so the palette
-  // stays static along the stroke instead of animating.
-  const [gradientFlow, setGradientFlow] = useState(true);
-  // "Заливка" tolerance (0..1). Small = only near-identical pixels, large = spreads across shades.
-  const [fillTolerance, setFillTolerance] = useState(0.18);
   const [recording, setRecording] = useState<null | "gif" | "mp4">(null);
   const [recordProgress, setRecordProgress] = useState(0);
   const [gifQ, setGifQ] = useState<GifQ>("medium");
@@ -485,8 +423,6 @@ function Index() {
     rainbowFlowSpeed: useRef(rainbowFlowSpeed),
     gradientSpeed: useRef(gradientSpeed), gradientColors: useRef(gradientColors),
     gradientAngle: useRef(gradientAngle),
-    gradientFlow: useRef(gradientFlow),
-    fillTolerance: useRef(fillTolerance),
     animEnabled: useRef(animEnabled),
   };
   useEffect(() => { refs.brush.current = brush; });
@@ -503,8 +439,6 @@ function Index() {
   useEffect(() => { refs.gradientSpeed.current = gradientSpeed; });
   useEffect(() => { refs.gradientColors.current = gradientColors; });
   useEffect(() => { refs.gradientAngle.current = gradientAngle; });
-  useEffect(() => { refs.gradientFlow.current = gradientFlow; });
-  useEffect(() => { refs.fillTolerance.current = fillTolerance; });
   useEffect(() => { refs.animEnabled.current = animEnabled; });
 
   // resize canvas backing store to logical canvasSize
@@ -652,8 +586,7 @@ function Index() {
     const gradCos = Math.cos(gradAngleRad), gradSin = Math.sin(gradAngleRad);
     // Normalize the projection so the picked colors span roughly the visible canvas regardless of angle.
     const gradExtent = Math.abs(w * gradCos) + Math.abs(h * gradSin) || 1;
-    // gradientFlow=false freezes the palette in place (still spatial along the stroke, no drift).
-    const gradTravel = s.mode === "gradient" && s.gradientSpeed > 0 ? tt * (0.03 + s.gradientSpeed * 0.5) : 0;
+    const gradTravel = tt * (0.03 + s.gradientSpeed * 0.5);
     const gradientHueAtXY = (x: number, y: number): number => {
       const proj = (x * gradCos + y * gradSin) / gradExtent;
       return sampleGradient(s.gradientColors, proj + gradTravel);
@@ -671,58 +604,32 @@ function Index() {
     };
 
     if (s.kind === "fill") {
-      const fctx = target.ctx!; // fill always routes through the real canvas context — see tick()
       const alpha = Math.min(1, 0.3 + s.intensity * 0.8) * modePulse;
-      const seed = pts[0];
-      const tol = Math.max(0, Math.min(1, s.fillTolerance ?? 0.18));
-
-      // Compute the flood-fill mask ONCE, lazily, from a snapshot of the pixels underneath the
-      // fill at that moment. Cached on the stroke; a resize or history restore invalidates it and
-      // it rebuilds against the current frame. This is what stops the fill from painting on top
-      // of everything — it stays inside a connected region of similar-color pixels.
-      if (!s.fillMask || s.fillMask.w !== w || s.fillMask.h !== h) {
-        const src = fctx.getImageData(0, 0, w, h).data;
-        const data = floodFillMask(src, w, h, seed.x, seed.y, tol);
-        s.fillMask = { w, h, data };
-      }
-      const mask = s.fillMask.data;
-
-      // Build an overlay ImageData: mask=1 pixels hold the fill color (flat or per-pixel gradient)
-      // at the chosen alpha, everything else is fully transparent. Blitting it via drawImage
-      // triggers source-over blending against what's already on ctx, so existing content shows
-      // through with proper alpha inside the region and is untouched outside it.
-      const overlay = fctx.createImageData(w, h);
-      const od = overlay.data;
-      const aByte = Math.round(alpha * 255);
+      const fctx = target.ctx!; // fill always routes through the real canvas context — see tick()
       if (s.mode === "gradient") {
-        for (let y = 0; y < h; y++) {
-          const rowBase = y * w;
-          for (let x = 0; x < w; x++) {
-            const mi = rowBase + x;
-            if (!mask[mi]) continue;
-            const hueK = gradientHueAtXY(x, y);
-            const [r, g, b] = hslToRgb(hueK, 85, 55);
-            const oi = mi * 4;
-            od[oi] = r; od[oi + 1] = g; od[oi + 2] = b; od[oi + 3] = aByte;
-          }
+        // A flat single hue washing the whole canvas every frame reads as "blinking" — instead,
+        // bake the same weighted multi-color gradient into a real spatial canvas gradient, sampled
+        // at several fixed positions along the chosen angle. gradTravel still animates it, but now
+        // as a smoothly scrolling spatial gradient instead of the whole screen flashing one color.
+        const halfExtent = gradExtent / 2;
+        const cx = w / 2, cy = h / 2;
+        const x0 = cx - gradCos * halfExtent, y0 = cy - gradSin * halfExtent;
+        const x1 = cx + gradCos * halfExtent, y1 = cy + gradSin * halfExtent;
+        const lg = fctx.createLinearGradient(x0, y0, x1, y1);
+        const STOPS = 16;
+        for (let k = 0; k <= STOPS; k++) {
+          const posK = k / STOPS;
+          const hueK = sampleGradient(s.gradientColors, posK + gradTravel);
+          lg.addColorStop(posK, `hsla(${hueK}, 85%, 55%, ${alpha})`);
         }
+        fctx.fillStyle = lg;
       } else {
         const hueF = hueAt(0, 0);
-        const [r, g, b] = hslToRgb(hueF, 85, 55);
-        for (let i = 0; i < mask.length; i++) {
-          if (!mask[i]) continue;
-          const oi = i * 4;
-          od[oi] = r; od[oi + 1] = g; od[oi + 2] = b; od[oi + 3] = aByte;
-        }
+        fctx.fillStyle = `hsla(${hueF}, 85%, 55%, ${alpha})`;
       }
-
-      const tmp = document.createElement("canvas");
-      tmp.width = w; tmp.height = h;
-      tmp.getContext("2d")!.putImageData(overlay, 0, 0);
-      fctx.drawImage(tmp, 0, 0);
+      fctx.fillRect(0, 0, w, h);
       return;
     }
-
 
     if (s.kind === "ink") {
       // Pixelated animated line — pixel dots along smooth path with breathing thickness
@@ -822,9 +729,9 @@ function Index() {
       // blocked new particles from ever spawning once old ones fell off-canvas.)
       const currentRainCount = s.rain?.length ?? 0;
       const wantRain = Math.floor(10 + s.density * 80);
-      const rainTarget = Math.min(wantRain, currentRainCount + Math.max(0, opts.rainBudget.left));
+      const target = Math.min(wantRain, currentRainCount + Math.max(0, opts.rainBudget.left));
       if (!s.rain) s.rain = [];
-      while (s.rain.length < rainTarget && opts.rainBudget.left > 0) {
+      while (s.rain.length < target && opts.rainBudget.left > 0) {
         const idx = Math.floor(Math.random() * pts.length);
         const p = pts[idx];
         s.rain.push({
@@ -1025,10 +932,9 @@ function Index() {
       dynamics: refs.dynamics.current,
       rainbowFlow: refs.rainbowFlow.current,
       rainbowFlowSpeed: refs.rainbowFlowSpeed.current,
-      gradientSpeed: refs.gradientFlow.current ? refs.gradientSpeed.current : 0,
+      gradientSpeed: refs.gradientSpeed.current,
       gradientColors: refs.gradientColors.current.map(c => ({ ...c })),
       gradientAngle: refs.gradientAngle.current,
-      fillTolerance: refs.brush.current === "fill" ? refs.fillTolerance.current : undefined,
       frozen: !refs.animEnabled.current,
       points: [],
       born: performance.now(),
@@ -1113,26 +1019,6 @@ function Index() {
     setLayers(next);
     pushHistory();
   };
-
-  // Freeze every currently-live stroke in place — animated brushes stop breathing/wobbling/flowing
-  // and stay exactly as they are right now. Undo returns them to live if needed.
-  const freezeAll = () => {
-    const next = layersRef.current.map(l => ({
-      ...l,
-      strokes: l.strokes.map(s => (s.frozen ? s : { ...s, frozen: true })),
-    }));
-    layersRef.current = next;
-    setLayers(next);
-    pushHistory();
-  };
-  // Also flip the toggle so subsequent brand-new strokes are born frozen — matches user intent
-  // of a single "stop all animation" button.
-  const stopAllAnimations = () => {
-    freezeAll();
-    setAnimEnabled(false);
-  };
-
-
 
   // === New canvas ===
   const [newW, setNewW] = useState(1280);
@@ -1324,31 +1210,20 @@ function Index() {
           <button onClick={redo} disabled={!canRedo || !!recording} className="flex-1 rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/10 disabled:opacity-30">Вернуть ↷</button>
         </div>
 
-        {/* Global animation toggle + hard-stop button. The toggle affects only NEW strokes; the
-            Stop button also freezes every currently-live stroke on the canvas right now. */}
-        <div className="flex flex-col gap-1.5 rounded-md border border-white/10 bg-white/[0.02] px-2.5 py-1.5">
-          <label className="flex cursor-pointer items-center gap-2 text-[11px] text-white/70 select-none">
-            <input
-              type="checkbox"
-              checked={animEnabled}
-              onChange={(e) => setAnimEnabled(e.target.checked)}
-              className="h-3.5 w-3.5 accent-white"
-            />
-            <span>Анимация</span>
-            <span className="ml-auto text-[9px] uppercase tracking-widest text-white/35">
-              {animEnabled ? "новые мазки живые" : "новые мазки статичны"}
-            </span>
-          </label>
-          <button
-            onClick={stopAllAnimations}
-            disabled={!!recording}
-            className="w-full rounded border border-white/15 bg-white/5 px-2 py-1 text-[10px] uppercase tracking-widest text-white/70 transition hover:bg-white/15 disabled:opacity-30"
-            title="Заморозить все живые мазки на холсте"
-          >
-            ⏸ Остановить всё
-          </button>
-        </div>
-
+        {/* Global animation toggle — only affects strokes drawn AFTER this is flipped; strokes
+            already on the canvas keep animating (or stay static) exactly as they were born. */}
+        <label className="flex cursor-pointer items-center gap-2 rounded-md border border-white/10 bg-white/[0.02] px-2.5 py-1.5 text-[11px] text-white/70 select-none">
+          <input
+            type="checkbox"
+            checked={animEnabled}
+            onChange={(e) => setAnimEnabled(e.target.checked)}
+            className="h-3.5 w-3.5 accent-white"
+          />
+          <span>Анимация</span>
+          <span className="ml-auto text-[9px] uppercase tracking-widest text-white/35">
+            {animEnabled ? "новые мазки живые" : "новые мазки статичны"}
+          </span>
+        </label>
 
         {/* New canvas */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
@@ -1394,33 +1269,6 @@ function Index() {
           </div>
         </section>
 
-        {/* Fill tool config — only when Заливка is the active brush. Тolerance drives how far
-            the flood-fill spreads into neighboring shades of the clicked pixel. */}
-        {brush === "fill" && (
-          <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
-            <div className="text-[9px] uppercase tracking-widest text-white/40">Заливка</div>
-            <label className="block text-[10px] uppercase tracking-widest text-white/50">
-              <span className="mb-1 flex justify-between">
-                <span>Допуск</span>
-                <span className="text-white/80">{Math.round(fillTolerance * 100)}%</span>
-              </span>
-              <input
-                type="range"
-                min={0}
-                max={100}
-                step={1}
-                value={Math.round(fillTolerance * 100)}
-                onChange={(e) => setFillTolerance(+e.target.value / 100)}
-                className="w-full accent-white"
-              />
-              <span className="mt-1 block text-[8px] normal-case tracking-normal text-white/30">
-                0% — только точный цвет · 100% — вся сцена
-              </span>
-            </label>
-          </section>
-        )}
-
-
         {/* Modes */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Режим</div>
@@ -1447,17 +1295,7 @@ function Index() {
         {/* Dedicated Gradient tool menu — only visible while the Gradient mode is active */}
         {mode === "gradient" && (
           <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
-            <div className="mb-1.5 flex items-center justify-between">
-              <div className="text-[9px] uppercase tracking-widest text-white/40">Градиент</div>
-              <button
-                onClick={() => setGradientFlow(v => !v)}
-                className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-widest transition ${gradientFlow ? "border-white/40 bg-white/10 text-white" : "border-white/10 bg-transparent text-white/40 hover:text-white/70"}`}
-                title="Анимировать движение палитры по мазку"
-              >
-                {gradientFlow ? "Поток вкл" : "Статично"}
-              </button>
-            </div>
-
+            <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Градиент — цвета</div>
 
             <div className="space-y-1.5">
               {gradientColors.map((c, i) => {
@@ -1528,7 +1366,7 @@ function Index() {
               </span>
             </label>
 
-            {gradientFlow && <ParamSlider label="Скорость потока" value={gradientSpeed} set={setGradientSpeed} />}
+            <ParamSlider label="Скорость потока" value={gradientSpeed} set={setGradientSpeed} />
           </section>
         )}
 
