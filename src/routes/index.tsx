@@ -1324,20 +1324,31 @@ function Index() {
           <button onClick={redo} disabled={!canRedo || !!recording} className="flex-1 rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/10 disabled:opacity-30">Вернуть ↷</button>
         </div>
 
-        {/* Global animation toggle — only affects strokes drawn AFTER this is flipped; strokes
-            already on the canvas keep animating (or stay static) exactly as they were born. */}
-        <label className="flex cursor-pointer items-center gap-2 rounded-md border border-white/10 bg-white/[0.02] px-2.5 py-1.5 text-[11px] text-white/70 select-none">
-          <input
-            type="checkbox"
-            checked={animEnabled}
-            onChange={(e) => setAnimEnabled(e.target.checked)}
-            className="h-3.5 w-3.5 accent-white"
-          />
-          <span>Анимация</span>
-          <span className="ml-auto text-[9px] uppercase tracking-widest text-white/35">
-            {animEnabled ? "новые мазки живые" : "новые мазки статичны"}
-          </span>
-        </label>
+        {/* Global animation toggle + hard-stop button. The toggle affects only NEW strokes; the
+            Stop button also freezes every currently-live stroke on the canvas right now. */}
+        <div className="flex flex-col gap-1.5 rounded-md border border-white/10 bg-white/[0.02] px-2.5 py-1.5">
+          <label className="flex cursor-pointer items-center gap-2 text-[11px] text-white/70 select-none">
+            <input
+              type="checkbox"
+              checked={animEnabled}
+              onChange={(e) => setAnimEnabled(e.target.checked)}
+              className="h-3.5 w-3.5 accent-white"
+            />
+            <span>Анимация</span>
+            <span className="ml-auto text-[9px] uppercase tracking-widest text-white/35">
+              {animEnabled ? "новые мазки живые" : "новые мазки статичны"}
+            </span>
+          </label>
+          <button
+            onClick={stopAllAnimations}
+            disabled={!!recording}
+            className="w-full rounded border border-white/15 bg-white/5 px-2 py-1 text-[10px] uppercase tracking-widest text-white/70 transition hover:bg-white/15 disabled:opacity-30"
+            title="Заморозить все живые мазки на холсте"
+          >
+            ⏸ Остановить всё
+          </button>
+        </div>
+
 
         {/* New canvas */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
