@@ -42,6 +42,10 @@ interface Stroke {
   gradientSpeed: number;
   gradientColors: { hue: number; weight: number }[];
   gradientAngle: number;
+  // Set once when the stroke is created from the "Анимация" toggle's state at that moment — frozen
+  // strokes render with time locked to their birth instant, so they paint once and never animate
+  // again. Toggling the button later never touches strokes that already exist (see tick()/onDown()).
+  frozen: boolean;
   points: StrokePoint[];
   born: number;
   // transient per-brush buckets (not serialized in history)
@@ -242,7 +246,7 @@ function serializeLayers(layers: Layer[]): string {
       speed: s.speed, density: s.density, noise: s.noise,
       intensity: s.intensity, dynamics: s.dynamics,
       rainbowFlow: s.rainbowFlow, rainbowFlowSpeed: s.rainbowFlowSpeed, gradientSpeed: s.gradientSpeed,
-      gradientColors: s.gradientColors, gradientAngle: s.gradientAngle,
+      gradientColors: s.gradientColors, gradientAngle: s.gradientAngle, frozen: s.frozen,
       points: s.points, born: s.born,
     })),
   })));
@@ -361,6 +365,10 @@ function Index() {
 
   const [brush, setBrush] = useState<BrushKind>("ribbon");
   const [mode, setMode] = useState<ModeKind>("normal");
+  // "Анимация" toggle: when off, every NEW stroke is born frozen (see Stroke.frozen) — it paints
+  // once and stops, instead of animating every frame. Strokes drawn before the toggle was flipped
+  // keep whatever behavior they were born with.
+  const [animEnabled, setAnimEnabled] = useState(true);
   const [hue, setHue] = useState(200);
   const [size, setSize] = useState(28);
   const [speed, setSpeed] = useState(0.5);
@@ -415,6 +423,7 @@ function Index() {
     rainbowFlowSpeed: useRef(rainbowFlowSpeed),
     gradientSpeed: useRef(gradientSpeed), gradientColors: useRef(gradientColors),
     gradientAngle: useRef(gradientAngle),
+    animEnabled: useRef(animEnabled),
   };
   useEffect(() => { refs.brush.current = brush; });
   useEffect(() => { refs.mode.current = mode; });
@@ -430,15 +439,21 @@ function Index() {
   useEffect(() => { refs.gradientSpeed.current = gradientSpeed; });
   useEffect(() => { refs.gradientColors.current = gradientColors; });
   useEffect(() => { refs.gradientAngle.current = gradientAngle; });
+  useEffect(() => { refs.animEnabled.current = animEnabled; });
 
   // resize canvas backing store to logical canvasSize
   useEffect(() => {
     const c = canvasRef.current;
     if (!c) return;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    c.width = canvasSize.w * dpr;
-    c.height = canvasSize.h * dpr;
-    c.getContext("2d")!.setTransform(dpr, 0, 0, dpr, 0, 0);
+    // NOTE: the render loop below paints via putImageData/getImageData at (canvasSize.w, canvasSize.h).
+    // Those APIs write/read raw device pixels and ignore any ctx transform, so the backing store must
+    // stay exactly canvasSize.w x canvasSize.h — scaling it by devicePixelRatio (as before) left
+    // putImageData only covering the top-left 1/dpr fraction of the canvas, which is invisible on any
+    // high-DPI screen (all phones, dpr 2-3) since strokes drawn in the rest of the logical canvas
+    // never reached a painted pixel. CSS width/height (set via `style`) still stretch this to the
+    // desired on-screen size, so zoom/export quality is unaffected.
+    c.width = canvasSize.w;
+    c.height = canvasSize.h;
   }, [canvasSize]);
 
   const eraseAt = useCallback((x: number, y: number, r: number) => {
@@ -512,6 +527,13 @@ function Index() {
         if (!layer.visible) continue;
         for (const s of layer.strokes) {
           if (s.points.length === 0) continue;
+          // Frozen strokes (born while "Анимация" was off) always render as if it's still the
+          // instant they were created — same t/dt/now every frame — so their pattern is painted
+          // once and stays put instead of flowing/wobbling/pulsing forever. Non-frozen strokes are
+          // unaffected, whatever the toggle's CURRENT state is — only stroke creation reads it.
+          const effT = s.frozen ? s.born / 1000 : t;
+          const effDt = s.frozen ? 0 : dtRaw;
+          const effNow = s.frozen ? s.born : now;
           if (s.kind === "fill") {
             // "Заливка" stays a direct canvas draw (its native gradient path is genuinely cheaper
             // done natively than resampled per-pixel). To keep stacking order correct relative to
@@ -519,10 +541,10 @@ function Index() {
             // canvas first, draw the fill directly on top, then read the canvas back into the
             // buffer so later buffer-painted strokes keep compositing on top of it correctly.
             ctx.putImageData(bufObj.imgData, 0, 0);
-            renderStroke({ mode: "ctx", ctx }, s, w, h, t, dtRaw, now, liveOpts);
+            renderStroke({ mode: "ctx", ctx }, s, w, h, effT, effDt, effNow, liveOpts);
             buf.set(ctx.getImageData(0, 0, w, h).data);
           } else {
-            renderStroke(bufferTarget, s, w, h, t, dtRaw, now, liveOpts);
+            renderStroke(bufferTarget, s, w, h, effT, effDt, effNow, liveOpts);
           }
         }
       }
@@ -913,6 +935,7 @@ function Index() {
       gradientSpeed: refs.gradientSpeed.current,
       gradientColors: refs.gradientColors.current.map(c => ({ ...c })),
       gradientAngle: refs.gradientAngle.current,
+      frozen: !refs.animEnabled.current,
       points: [],
       born: performance.now(),
     };
@@ -1027,7 +1050,10 @@ function Index() {
       if (!layer.visible) continue;
       for (const s of layer.strokes) {
         if (s.points.length === 0) continue;
-        renderStroke(target, s, w, h, t, dtRaw, now, FULL_QUALITY_OPTS);
+        const effT = s.frozen ? s.born / 1000 : t;
+        const effDt = s.frozen ? 0 : dtRaw;
+        const effNow = s.frozen ? s.born : now;
+        renderStroke(target, s, w, h, effT, effDt, effNow, FULL_QUALITY_OPTS);
       }
     }
   }, []);
@@ -1184,6 +1210,21 @@ function Index() {
           <button onClick={redo} disabled={!canRedo || !!recording} className="flex-1 rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/10 disabled:opacity-30">Вернуть ↷</button>
         </div>
 
+        {/* Global animation toggle — only affects strokes drawn AFTER this is flipped; strokes
+            already on the canvas keep animating (or stay static) exactly as they were born. */}
+        <label className="flex cursor-pointer items-center gap-2 rounded-md border border-white/10 bg-white/[0.02] px-2.5 py-1.5 text-[11px] text-white/70 select-none">
+          <input
+            type="checkbox"
+            checked={animEnabled}
+            onChange={(e) => setAnimEnabled(e.target.checked)}
+            className="h-3.5 w-3.5 accent-white"
+          />
+          <span>Анимация</span>
+          <span className="ml-auto text-[9px] uppercase tracking-widest text-white/35">
+            {animEnabled ? "новые мазки живые" : "новые мазки статичны"}
+          </span>
+        </label>
+
         {/* New canvas */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Холст</div>
@@ -1257,7 +1298,10 @@ function Index() {
             <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Градиент — цвета</div>
 
             <div className="space-y-1.5">
-              {gradientColors.map((c, i) => (
+              {gradientColors.map((c, i) => {
+                const totalWeight = gradientColors.reduce((a, cc) => a + Math.max(0.05, cc.weight), 0);
+                const sharePct = Math.round((Math.max(0.05, c.weight) / totalWeight) * 100);
+                return (
                 <div key={i} className="flex items-center gap-2 rounded border border-white/5 bg-black/20 px-1.5 py-1">
                   <input
                     type="color"
@@ -1271,16 +1315,17 @@ function Index() {
                   />
                   <input
                     type="range"
-                    min={1}
-                    max={100}
-                    value={Math.round(c.weight * 50)}
+                    min={5}
+                    max={300}
+                    value={Math.round(c.weight * 100)}
                     onChange={(e) => {
-                      const weight = +e.target.value / 50;
+                      const weight = +e.target.value / 100;
                       setGradientColors(cols => cols.map((cc, ci) => ci === i ? { ...cc, weight } : cc));
                     }}
                     className="w-full accent-white"
-                    title="Доля этого цвета в смеси"
+                    title="Тяжесть этого цвета в смеси"
                   />
+                  <span className="w-8 shrink-0 text-right text-[10px] tabular-nums text-white/50">{sharePct}%</span>
                   {gradientColors.length > 2 && (
                     <button
                       onClick={() => setGradientColors(cols => cols.filter((_, ci) => ci !== i))}
@@ -1291,7 +1336,8 @@ function Index() {
                     </button>
                   )}
                 </div>
-              ))}
+                );
+              })}
               {gradientColors.length < 6 && (
                 <button
                   onClick={() => setGradientColors(cols => [...cols, { hue: Math.round(Math.random() * 360), weight: 1 }])}
