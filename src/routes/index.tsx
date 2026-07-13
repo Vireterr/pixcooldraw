@@ -652,7 +652,8 @@ function Index() {
     const gradCos = Math.cos(gradAngleRad), gradSin = Math.sin(gradAngleRad);
     // Normalize the projection so the picked colors span roughly the visible canvas regardless of angle.
     const gradExtent = Math.abs(w * gradCos) + Math.abs(h * gradSin) || 1;
-    const gradTravel = tt * (0.03 + s.gradientSpeed * 0.5);
+    // gradientFlow=false freezes the palette in place (still spatial along the stroke, no drift).
+    const gradTravel = s.mode === "gradient" && s.gradientSpeed > 0 ? tt * (0.03 + s.gradientSpeed * 0.5) : 0;
     const gradientHueAtXY = (x: number, y: number): number => {
       const proj = (x * gradCos + y * gradSin) / gradExtent;
       return sampleGradient(s.gradientColors, proj + gradTravel);
