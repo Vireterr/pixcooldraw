@@ -670,32 +670,58 @@ function Index() {
     };
 
     if (s.kind === "fill") {
-      const alpha = Math.min(1, 0.3 + s.intensity * 0.8) * modePulse;
       const fctx = target.ctx!; // fill always routes through the real canvas context — see tick()
+      const alpha = Math.min(1, 0.3 + s.intensity * 0.8) * modePulse;
+      const seed = pts[0];
+      const tol = Math.max(0, Math.min(1, s.fillTolerance ?? 0.18));
+
+      // Compute the flood-fill mask ONCE, lazily, from a snapshot of the pixels underneath the
+      // fill at that moment. Cached on the stroke; a resize or history restore invalidates it and
+      // it rebuilds against the current frame. This is what stops the fill from painting on top
+      // of everything — it stays inside a connected region of similar-color pixels.
+      if (!s.fillMask || s.fillMask.w !== w || s.fillMask.h !== h) {
+        const src = fctx.getImageData(0, 0, w, h).data;
+        const data = floodFillMask(src, w, h, seed.x, seed.y, tol);
+        s.fillMask = { w, h, data };
+      }
+      const mask = s.fillMask.data;
+
+      // Build an overlay ImageData: mask=1 pixels hold the fill color (flat or per-pixel gradient)
+      // at the chosen alpha, everything else is fully transparent. Blitting it via drawImage
+      // triggers source-over blending against what's already on ctx, so existing content shows
+      // through with proper alpha inside the region and is untouched outside it.
+      const overlay = fctx.createImageData(w, h);
+      const od = overlay.data;
+      const aByte = Math.round(alpha * 255);
       if (s.mode === "gradient") {
-        // A flat single hue washing the whole canvas every frame reads as "blinking" — instead,
-        // bake the same weighted multi-color gradient into a real spatial canvas gradient, sampled
-        // at several fixed positions along the chosen angle. gradTravel still animates it, but now
-        // as a smoothly scrolling spatial gradient instead of the whole screen flashing one color.
-        const halfExtent = gradExtent / 2;
-        const cx = w / 2, cy = h / 2;
-        const x0 = cx - gradCos * halfExtent, y0 = cy - gradSin * halfExtent;
-        const x1 = cx + gradCos * halfExtent, y1 = cy + gradSin * halfExtent;
-        const lg = fctx.createLinearGradient(x0, y0, x1, y1);
-        const STOPS = 16;
-        for (let k = 0; k <= STOPS; k++) {
-          const posK = k / STOPS;
-          const hueK = sampleGradient(s.gradientColors, posK + gradTravel);
-          lg.addColorStop(posK, `hsla(${hueK}, 85%, 55%, ${alpha})`);
+        for (let y = 0; y < h; y++) {
+          const rowBase = y * w;
+          for (let x = 0; x < w; x++) {
+            const mi = rowBase + x;
+            if (!mask[mi]) continue;
+            const hueK = gradientHueAtXY(x, y);
+            const [r, g, b] = hslToRgb(hueK, 85, 55);
+            const oi = mi * 4;
+            od[oi] = r; od[oi + 1] = g; od[oi + 2] = b; od[oi + 3] = aByte;
+          }
         }
-        fctx.fillStyle = lg;
       } else {
         const hueF = hueAt(0, 0);
-        fctx.fillStyle = `hsla(${hueF}, 85%, 55%, ${alpha})`;
+        const [r, g, b] = hslToRgb(hueF, 85, 55);
+        for (let i = 0; i < mask.length; i++) {
+          if (!mask[i]) continue;
+          const oi = i * 4;
+          od[oi] = r; od[oi + 1] = g; od[oi + 2] = b; od[oi + 3] = aByte;
+        }
       }
-      fctx.fillRect(0, 0, w, h);
+
+      const tmp = document.createElement("canvas");
+      tmp.width = w; tmp.height = h;
+      tmp.getContext("2d")!.putImageData(overlay, 0, 0);
+      fctx.drawImage(tmp, 0, 0);
       return;
     }
+
 
     if (s.kind === "ink") {
       // Pixelated animated line — pixel dots along smooth path with breathing thickness
