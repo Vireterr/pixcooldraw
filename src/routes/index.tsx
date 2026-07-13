@@ -1447,7 +1447,17 @@ function Index() {
         {/* Dedicated Gradient tool menu — only visible while the Gradient mode is active */}
         {mode === "gradient" && (
           <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
-            <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Градиент — цвета</div>
+            <div className="mb-1.5 flex items-center justify-between">
+              <div className="text-[9px] uppercase tracking-widest text-white/40">Градиент</div>
+              <button
+                onClick={() => setGradientFlow(v => !v)}
+                className={`rounded border px-1.5 py-0.5 text-[9px] uppercase tracking-widest transition ${gradientFlow ? "border-white/40 bg-white/10 text-white" : "border-white/10 bg-transparent text-white/40 hover:text-white/70"}`}
+                title="Анимировать движение палитры по мазку"
+              >
+                {gradientFlow ? "Поток вкл" : "Статично"}
+              </button>
+            </div>
+
 
             <div className="space-y-1.5">
               {gradientColors.map((c, i) => {
