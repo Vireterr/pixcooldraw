@@ -1025,7 +1025,7 @@ function Index() {
       dynamics: refs.dynamics.current,
       rainbowFlow: refs.rainbowFlow.current,
       rainbowFlowSpeed: refs.rainbowFlowSpeed.current,
-      gradientSpeed: refs.gradientSpeed.current,
+      gradientSpeed: refs.gradientFlow.current ? refs.gradientSpeed.current : 0,
       gradientColors: refs.gradientColors.current.map(c => ({ ...c })),
       gradientAngle: refs.gradientAngle.current,
       fillTolerance: refs.brush.current === "fill" ? refs.fillTolerance.current : undefined,
