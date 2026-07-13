@@ -42,6 +42,8 @@ interface Stroke {
   gradientSpeed: number;
   gradientColors: { hue: number; weight: number }[];
   gradientAngle: number;
+  // Fill-only: tolerance (0..1) for the flood-fill color match. Undefined for non-fill strokes.
+  fillTolerance?: number;
   // Set once when the stroke is created from the "Анимация" toggle's state at that moment — frozen
   // strokes render with time locked to their birth instant, so they paint once and never animate
   // again. Toggling the button later never touches strokes that already exist (see tick()/onDown()).
@@ -56,7 +58,11 @@ interface Stroke {
   // count grows while actively drawing. Built lazily, extended as new points arrive, reset by
   // eraseAt() whenever points get removed/reindexed (see there for why).
   segCache?: { nx: number; ny: number; len: number; num: number }[];
+  // Fill-only transient: cached scanline flood-fill mask (1 byte per pixel, 1 = filled). Computed
+  // lazily on first render from a snapshot of the pixels UNDER the fill at that moment.
+  fillMask?: { w: number; h: number; data: Uint8Array } | null;
 }
+
 
 interface Layer {
   id: number;
