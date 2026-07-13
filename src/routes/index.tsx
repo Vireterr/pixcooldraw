@@ -252,7 +252,8 @@ function serializeLayers(layers: Layer[]): string {
       speed: s.speed, density: s.density, noise: s.noise,
       intensity: s.intensity, dynamics: s.dynamics,
       rainbowFlow: s.rainbowFlow, rainbowFlowSpeed: s.rainbowFlowSpeed, gradientSpeed: s.gradientSpeed,
-      gradientColors: s.gradientColors, gradientAngle: s.gradientAngle, frozen: s.frozen,
+      gradientColors: s.gradientColors, gradientAngle: s.gradientAngle,
+      fillTolerance: s.fillTolerance, frozen: s.frozen,
       points: s.points, born: s.born,
     })),
   })));
@@ -260,6 +261,7 @@ function serializeLayers(layers: Layer[]): string {
 function deserializeLayers(str: string): Layer[] {
   return JSON.parse(str) as Layer[];
 }
+
 
 // ==== PERF: cached pixelDither offset patterns ====
 // Previously recomputed a nested dx/dy loop with Math.hypot for EVERY sampled point, EVERY frame.
