@@ -1001,6 +1001,7 @@ function Index() {
       gradientSpeed: refs.gradientSpeed.current,
       gradientColors: refs.gradientColors.current.map(c => ({ ...c })),
       gradientAngle: refs.gradientAngle.current,
+      fillTolerance: refs.brush.current === "fill" ? refs.fillTolerance.current : undefined,
       frozen: !refs.animEnabled.current,
       points: [],
       born: performance.now(),
