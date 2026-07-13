@@ -1114,6 +1114,26 @@ function Index() {
     pushHistory();
   };
 
+  // Freeze every currently-live stroke in place — animated brushes stop breathing/wobbling/flowing
+  // and stay exactly as they are right now. Undo returns them to live if needed.
+  const freezeAll = () => {
+    const next = layersRef.current.map(l => ({
+      ...l,
+      strokes: l.strokes.map(s => (s.frozen ? s : { ...s, frozen: true })),
+    }));
+    layersRef.current = next;
+    setLayers(next);
+    pushHistory();
+  };
+  // Also flip the toggle so subsequent brand-new strokes are born frozen — matches user intent
+  // of a single "stop all animation" button.
+  const stopAllAnimations = () => {
+    freezeAll();
+    setAnimEnabled(false);
+  };
+
+
+
   // === New canvas ===
   const [newW, setNewW] = useState(1280);
   const [newH, setNewH] = useState(800);
