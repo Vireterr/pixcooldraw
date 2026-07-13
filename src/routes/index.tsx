@@ -47,6 +47,11 @@ interface Stroke {
   // transient per-brush buckets (not serialized in history)
   ink?: { phase: number };
   rain?: { x: number; y: number; vy: number; hue: number; len: number; seed: number }[];
+  // PERF: cached per-segment geometry for ink/ribbon (nx,ny = unit normal, len = segment length,
+  // num = interpolation steps) — these never change once a segment is finalized, only the point
+  // count grows while actively drawing. Built lazily, extended as new points arrive, reset by
+  // eraseAt() whenever points get removed/reindexed (see there for why).
+  segCache?: { nx: number; ny: number; len: number; num: number }[];
 }
 
 interface Layer {
@@ -91,8 +96,6 @@ const MP4_PRESETS = {
 type Mp4Q = keyof typeof MP4_PRESETS;
 
 const SCALES = [1, 2, 3] as const;
-const DURATIONS = [2, 3, 4, 6, 8, 10] as const;
-const FPS_OPTIONS = [10, 15, 24, 30, 60] as const;
 
 const HISTORY_LIMIT = 60;
 const MAX_POINTS_PER_STROKE = 600;
@@ -279,6 +282,23 @@ interface RenderOpts {
 }
 const FULL_QUALITY_OPTS: RenderOpts = { step: 1, rainBudget: { left: Infinity } };
 
+// PERF: lazily build/extend the per-segment geometry cache on a stroke (used by ink/ribbon). Only
+// ever APPENDS — a segment that's already cached never changes (points aren't mutated in place,
+// only added by drawing or removed wholesale by the eraser, which resets segCache — see eraseAt).
+// So this loop only actually does work for brand-new segments; for a finished stroke it's a no-op.
+function getSegCache(s: Stroke, pts: StrokePoint[], grid: number): { nx: number; ny: number; len: number; num: number }[] {
+  if (!s.segCache) s.segCache = [];
+  const cache = s.segCache;
+  while (cache.length < pts.length - 1) {
+    const i = cache.length;
+    const p = pts[i], nxt = pts[i + 1];
+    const dx = nxt.x - p.x, dy = nxt.y - p.y;
+    const len = Math.hypot(dx, dy) || 1;
+    cache.push({ nx: -dy / len, ny: dx / len, len, num: Math.max(1, Math.floor(len / grid)) });
+  }
+  return cache;
+}
+
 function Index() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // PERF: one persistent RGBA buffer, reused every frame (reallocated only when canvas size changes)
@@ -363,6 +383,29 @@ function Index() {
   const [exportSec, setExportSec] = useState<number>(4);
   const [exportFps, setExportFps] = useState<number>(24);
   const [zoom, setZoom] = useState(1);
+  // Free camera: pan is a CSS-pixel offset of the canvas from the viewport center. spaceHeld lets
+  // a single mouse drag pan (desktop convention); two simultaneous touch pointers pinch-zoom/pan
+  // (mobile convention) regardless of whether they land on the canvas or the surrounding space.
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [spaceHeld, setSpaceHeld] = useState(false);
+  const activePointersRef = useRef(new Map<number, { x: number; y: number }>());
+  const pinchStateRef = useRef<{ initialDist: number; initialZoom: number; initialMid: { x: number; y: number }; initialPan: { x: number; y: number } } | null>(null);
+  const panDragRef = useRef<{ startX: number; startY: number; startPan: { x: number; y: number } } | null>(null);
+
+  useEffect(() => {
+    const kd = (e: KeyboardEvent) => { if (e.code === "Space" && !e.repeat) setSpaceHeld(true); };
+    const ku = (e: KeyboardEvent) => { if (e.code === "Space") setSpaceHeld(false); };
+    window.addEventListener("keydown", kd);
+    window.addEventListener("keyup", ku);
+    return () => { window.removeEventListener("keydown", kd); window.removeEventListener("keyup", ku); };
+  }, []);
+
+  const getPinchInfo = () => {
+    const pts = Array.from(activePointersRef.current.values());
+    if (pts.length < 2) return null;
+    const [a, b] = pts;
+    return { dist: Math.hypot(a.x - b.x, a.y - b.y), mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } };
+  };
 
   const refs = {
     brush: useRef(brush), mode: useRef(mode), hue: useRef(hue), size: useRef(size),
@@ -404,10 +447,14 @@ function Index() {
     const layer = layersRef.current.find(l => l.id === id);
     if (!layer) return;
     for (const s of layer.strokes) {
+      const before = s.points.length;
       s.points = s.points.filter(p => {
         const dx = p.x - x, dy = p.y - y;
         return dx * dx + dy * dy > r2;
       });
+      // Erasing removes points from arbitrary positions, so cached segment indices no longer line
+      // up with the (now shorter/reindexed) points array — drop the cache, it'll rebuild lazily.
+      if (s.points.length !== before) s.segCache = undefined;
       if (s.rain) s.rain = s.rain.filter(i => (i.x - x) ** 2 + (i.y - y) ** 2 > r2);
     }
     layer.strokes = layer.strokes.filter(s => s.points.length > 0);
@@ -570,13 +617,15 @@ function Index() {
       const thickness = Math.max(grid, s.size * (0.45 + s.intensity * 0.55) * modePulse * modeSpray);
       const half = thickness / 2;
       const phaseI = s.ink.phase;
-      // PERF: skip `step` points at a time under load instead of always walking every single segment.
+      // PERF: segment geometry (unit normal + step count) is cached per stroke — it's the same
+      // for a given segment forever once drawn, so we stop recomputing Math.hypot + the normal for
+      // every already-finished segment on every single frame. Only the wobble/color stay live.
+      const segsInk = getSegCache(s, pts, grid);
       for (let i = 0; i < pts.length - 1; i += step) {
         const p = pts[i], nxt = pts[Math.min(i + 1, pts.length - 1)];
+        const seg = segsInk[Math.min(i, segsInk.length - 1)];
         const dx = nxt.x - p.x, dy = nxt.y - p.y;
-        const len = Math.hypot(dx, dy) || 1;
-        const nx = -dy / len, ny = dx / len;
-        const num = Math.max(1, Math.floor(len / grid));
+        const { nx, ny, num } = seg;
         for (let k = 0; k <= num; k++) {
           const f = k / num;
           const cx = p.x + dx * f, cy = p.y + dy * f;
@@ -596,16 +645,16 @@ function Index() {
     else if (s.kind === "ribbon") {
       const grid = Math.max(2, Math.round(s.size / 8));
       const passes = Math.max(1, Math.floor(1 + s.density * 3));
+      const segsRibbon = getSegCache(s, pts, grid);
       for (let pass = 0; pass < passes; pass++) {
         const phase = tt * 2 + pass * 0.7;
         const amp = s.size * 0.6 * (0.3 + s.dynamics) + Math.sin(tt + pass) * s.size * 0.2;
-        // PERF: same decimation as ink — walk fewer segments as scene load grows.
+        // PERF: same cached geometry as ink — only the wave/color are recomputed each frame.
         for (let i = 0; i < pts.length - 1; i += step) {
           const p = pts[i], nxt = pts[Math.min(i + 1, pts.length - 1)];
+          const seg = segsRibbon[Math.min(i, segsRibbon.length - 1)];
           const dx = nxt.x - p.x, dy = nxt.y - p.y;
-          const len = Math.hypot(dx, dy) || 1;
-          const nx = -dy / len, ny = dx / len;
-          const num = Math.max(1, Math.floor(len / grid));
+          const { nx, ny, num } = seg;
           for (let k = 0; k <= num; k++) {
             const f = k / num;
             const wave = Math.sin(p.t * 3 + phase + (i + f) * 0.15) * amp
@@ -818,11 +867,31 @@ function Index() {
       const dec: StrokePoint[] = [];
       for (let i = 0; i < old.length; i += 2) dec.push(old[i]);
       s.points = dec.concat(recent);
+      // Indices are completely reshuffled by decimation — drop the segment cache, it rebuilds
+      // lazily from the new point layout on the next frame.
+      s.segCache = undefined;
     }
   };
 
   const onDown = (e: React.PointerEvent) => {
-    (e.target as Element).setPointerCapture(e.pointerId);
+    (e.currentTarget as Element).setPointerCapture(e.pointerId);
+    activePointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (activePointersRef.current.size >= 2) {
+      // Second finger arrived — this is now a pinch/pan gesture, not a draw. Abandon any stroke a
+      // single first finger might already have started.
+      if (pointerRef.current.down) { pointerRef.current.down = false; currentStrokeRef.current = null; }
+      panDragRef.current = null;
+      const info = getPinchInfo()!;
+      pinchStateRef.current = { initialDist: info.dist, initialZoom: zoom, initialMid: info.mid, initialPan: { ...pan } };
+      return;
+    }
+
+    if (spaceHeld) {
+      panDragRef.current = { startX: e.clientX, startY: e.clientY, startPan: { ...pan } };
+      return;
+    }
+
     const { x, y } = getPoint(e);
     pointerRef.current = { x, y, px: x, py: y, down: true };
     if (refs.brush.current === "eraser") { eraseAt(x, y, refs.size.current); return; }
@@ -852,6 +921,26 @@ function Index() {
     addPoint(x, y);
   };
   const onMove = (e: React.PointerEvent) => {
+    if (activePointersRef.current.has(e.pointerId)) activePointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (activePointersRef.current.size >= 2 && pinchStateRef.current) {
+      const info = getPinchInfo()!;
+      const scaleFactor = info.dist / (pinchStateRef.current.initialDist || 1);
+      const newZoom = Math.min(6, Math.max(0.1, pinchStateRef.current.initialZoom * scaleFactor));
+      setZoom(newZoom);
+      setPan({
+        x: pinchStateRef.current.initialPan.x + (info.mid.x - pinchStateRef.current.initialMid.x),
+        y: pinchStateRef.current.initialPan.y + (info.mid.y - pinchStateRef.current.initialMid.y),
+      });
+      return;
+    }
+
+    if (panDragRef.current) {
+      const pd = panDragRef.current;
+      setPan({ x: pd.startPan.x + (e.clientX - pd.startX), y: pd.startPan.y + (e.clientY - pd.startY) });
+      return;
+    }
+
     const { x, y } = getPoint(e);
     pointerRef.current.x = x; pointerRef.current.y = y;
     if (!pointerRef.current.down) return;
@@ -863,7 +952,10 @@ function Index() {
     for (let i = 1; i <= steps; i++) addPoint(px + dx * (i / steps), py + dy * (i / steps));
     pointerRef.current.px = x; pointerRef.current.py = y;
   };
-  const onUp = () => {
+  const onUp = (e: React.PointerEvent) => {
+    activePointersRef.current.delete(e.pointerId);
+    if (activePointersRef.current.size < 2) pinchStateRef.current = null;
+    panDragRef.current = null;
     if (!pointerRef.current.down) return;
     pointerRef.current.down = false;
     currentStrokeRef.current = null;
@@ -910,6 +1002,8 @@ function Index() {
   const [newH, setNewH] = useState(800);
   const newCanvas = () => {
     setCanvasSize({ w: newW, h: newH });
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
     const layer: Layer = { id: ++layerIdCounter, name: "Слой 1", visible: true, strokes: [] };
     const next = [layer];
     layersRef.current = next;
@@ -1271,28 +1365,14 @@ function Index() {
               ))}
             </div>
           </div>
-          <div className="space-y-1">
-            <div className="flex items-center justify-between text-[9px] uppercase tracking-widest text-white/40">
-              <span>Длительность</span>
-              <span className="text-white/70 normal-case tracking-normal">{exportSec}s</span>
-            </div>
-            <div className="flex flex-wrap gap-1">
-              {DURATIONS.map(sec => (
-                <button key={sec} onClick={() => setExportSec(sec)} className={`flex-1 rounded border px-1 py-1 text-[10px] tracking-wider transition ${exportSec === sec ? "border-white/60 bg-white/10" : "border-white/5 text-white/40 hover:text-white/80"}`}>{sec}s</button>
-              ))}
-            </div>
-          </div>
-          <div className="space-y-1">
-            <div className="flex items-center justify-between text-[9px] uppercase tracking-widest text-white/40">
-              <span>FPS</span>
-              <span className="text-white/70 normal-case tracking-normal">{exportFps} fps</span>
-            </div>
-            <div className="flex gap-1">
-              {FPS_OPTIONS.map(f => (
-                <button key={f} onClick={() => setExportFps(f)} className={`flex-1 rounded border px-1 py-1 text-[10px] tracking-wider transition ${exportFps === f ? "border-white/60 bg-white/10" : "border-white/5 text-white/40 hover:text-white/80"}`}>{f}</button>
-              ))}
-            </div>
-          </div>
+          <label className="block text-[10px] uppercase tracking-widest text-white/50">
+            <span className="mb-1 flex justify-between"><span>Длительность</span><span className="text-white/80">{exportSec}s</span></span>
+            <input type="range" min={1} max={30} step={1} value={exportSec} onChange={(e) => setExportSec(+e.target.value)} className="w-full accent-white" />
+          </label>
+          <label className="block text-[10px] uppercase tracking-widest text-white/50">
+            <span className="mb-1 flex justify-between"><span>FPS</span><span className="text-white/80">{exportFps} fps</span></span>
+            <input type="range" min={5} max={60} step={1} value={exportFps} onChange={(e) => setExportFps(+e.target.value)} className="w-full accent-white" />
+          </label>
 
           <button onClick={savePng} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">PNG · {exportScale}x</button>
 
@@ -1322,31 +1402,53 @@ function Index() {
         <div className="text-center text-[9px] text-white/30">Ctrl+Z / Ctrl+Shift+Z</div>
       </aside>
 
-      {/* Canvas area */}
+      {/* Canvas area — a free camera flying over a fixed-size canvas, not a scrolling page.
+          Space+drag or two-finger touch pans; Ctrl/Cmd+wheel or pinch zooms. The dotted background
+          extends past the canvas's own visible border so its edges are always apparent. */}
       <div
         ref={wrapRef}
         onWheel={(e) => {
-          if (!(e.ctrlKey || e.metaKey)) return;
-          e.preventDefault();
-          setZoom((z) => Math.min(6, Math.max(0.1, z * (e.deltaY < 0 ? 1.1 : 1 / 1.1))));
+          if (e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+            setZoom((z) => Math.min(6, Math.max(0.1, z * (e.deltaY < 0 ? 1.1 : 1 / 1.1))));
+          } else {
+            e.preventDefault();
+            setPan((p) => ({ x: p.x - e.deltaX, y: p.y - e.deltaY }));
+          }
         }}
-        className="relative flex flex-1 items-center justify-center overflow-auto p-4"
+        onPointerDown={onDown}
+        onPointerMove={onMove}
+        onPointerUp={onUp}
+        onPointerCancel={onUp}
+        className="relative flex-1 touch-none select-none overflow-hidden"
+        style={{
+          background: "#0a0b12",
+          backgroundImage: "radial-gradient(circle, rgba(255,255,255,0.05) 1px, transparent 1px)",
+          backgroundSize: "24px 24px",
+          cursor: spaceHeld ? (panDragRef.current ? "grabbing" : "grab") : "crosshair",
+        }}
       >
-        <div style={{ width: canvasSize.w * zoom, height: canvasSize.h * zoom }} className="flex items-center justify-center">
+        <div
+          style={{
+            position: "absolute",
+            left: "50%",
+            top: "50%",
+            transform: `translate(-50%, -50%) translate(${pan.x}px, ${pan.y}px)`,
+          }}
+        >
           <canvas
             ref={canvasRef}
-            onPointerDown={onDown}
-            onPointerMove={onMove}
-            onPointerUp={onUp}
-            onPointerCancel={onUp}
             style={{ width: canvasSize.w * zoom, height: canvasSize.h * zoom, imageRendering: "pixelated" }}
-            className="block touch-none rounded-lg border border-white/10 bg-[#080a12] shadow-2xl cursor-crosshair"
+            className="block rounded-lg border border-white/10 bg-[#080a12] shadow-2xl"
           />
         </div>
         <div className="pointer-events-none absolute bottom-3 right-3 flex items-center gap-1 rounded-md border border-white/10 bg-black/60 p-1 text-[11px] backdrop-blur">
           <button onClick={() => setZoom((z) => Math.max(0.1, z / 1.2))} className="pointer-events-auto rounded px-2 py-0.5 hover:bg-white/10">−</button>
-          <button onClick={() => setZoom(1)} className="pointer-events-auto rounded px-2 py-0.5 tabular-nums hover:bg-white/10">{Math.round(zoom * 100)}%</button>
+          <button onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }} className="pointer-events-auto rounded px-2 py-0.5 tabular-nums hover:bg-white/10">{Math.round(zoom * 100)}%</button>
           <button onClick={() => setZoom((z) => Math.min(6, z * 1.2))} className="pointer-events-auto rounded px-2 py-0.5 hover:bg-white/10">+</button>
+        </div>
+        <div className="pointer-events-none absolute bottom-3 left-3 rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[9px] uppercase tracking-widest text-white/40 backdrop-blur">
+          Пробел+перетаскивание или два пальца — панорама
         </div>
       </div>
     </main>
