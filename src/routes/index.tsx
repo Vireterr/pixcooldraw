@@ -485,6 +485,8 @@ function Index() {
     rainbowFlowSpeed: useRef(rainbowFlowSpeed),
     gradientSpeed: useRef(gradientSpeed), gradientColors: useRef(gradientColors),
     gradientAngle: useRef(gradientAngle),
+    gradientFlow: useRef(gradientFlow),
+    fillTolerance: useRef(fillTolerance),
     animEnabled: useRef(animEnabled),
   };
   useEffect(() => { refs.brush.current = brush; });
