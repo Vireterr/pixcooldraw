@@ -440,6 +440,11 @@ function Index() {
     { hue: 200, weight: 1 }, { hue: 320, weight: 1 }, { hue: 60, weight: 1 },
   ]);
   const [gradientAngle, setGradientAngle] = useState(0);
+  // "Градиент: Поток" toggle — when off, gradientSpeed is ignored at render time so the palette
+  // stays static along the stroke instead of animating.
+  const [gradientFlow, setGradientFlow] = useState(true);
+  // "Заливка" tolerance (0..1). Small = only near-identical pixels, large = spreads across shades.
+  const [fillTolerance, setFillTolerance] = useState(0.18);
   const [recording, setRecording] = useState<null | "gif" | "mp4">(null);
   const [recordProgress, setRecordProgress] = useState(0);
   const [gifQ, setGifQ] = useState<GifQ>("medium");
