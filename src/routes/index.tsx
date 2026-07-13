@@ -735,9 +735,9 @@ function Index() {
       // blocked new particles from ever spawning once old ones fell off-canvas.)
       const currentRainCount = s.rain?.length ?? 0;
       const wantRain = Math.floor(10 + s.density * 80);
-      const target = Math.min(wantRain, currentRainCount + Math.max(0, opts.rainBudget.left));
+      const rainTarget = Math.min(wantRain, currentRainCount + Math.max(0, opts.rainBudget.left));
       if (!s.rain) s.rain = [];
-      while (s.rain.length < target && opts.rainBudget.left > 0) {
+      while (s.rain.length < rainTarget && opts.rainBudget.left > 0) {
         const idx = Math.floor(Math.random() * pts.length);
         const p = pts[idx];
         s.rain.push({
