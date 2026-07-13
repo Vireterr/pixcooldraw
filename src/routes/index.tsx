@@ -99,7 +99,7 @@ const MAX_POINTS_PER_STROKE = 600;
 
 // ==== PERF: tunables ====
 // Global cap on live pixelRain particles across the ENTIRE scene (was 200 PER STROKE before).
-const GLOBAL_RAIN_CAP = 500;
+const GLOBAL_RAIN_CAP = 2000;
 
 function hash(n: number) {
   n = (n << 13) ^ n;
@@ -162,6 +162,59 @@ function sampleGradient(stops: { hue: number; weight: number }[], t: number): nu
   const diff = ((c1 - c0 + 540) % 360) - 180; // shortest angular path between the two stops
   return (c0 + diff * frac + 360) % 360;
 }
+
+// ==== PERF: pixel-buffer painting (replaces per-pixel ctx.fillStyle/fillRect calls) ====
+// Every brush used to do `ctx.fillStyle = \`hsla(...)\`; ctx.fillRect(x,y,w,h);` per pixel-block —
+// building and parsing a color string on the canvas API is real, measurable overhead at thousands
+// of calls/frame. paint() instead writes straight into a raw RGBA byte buffer (blended in memory,
+// same source-over alpha math the canvas itself uses), and the whole frame is flushed to the
+// screen with ONE putImageData call. Pixel-for-pixel identical output, far cheaper to compute.
+// Exports keep using the direct-to-canvas path (mode: "ctx") since createLinearGradient etc. are
+// genuinely cheaper done natively for a one-off render — export speed was never the complaint.
+interface PaintTarget {
+  mode: "buffer" | "ctx";
+  buf?: Uint8ClampedArray;
+  bw?: number;
+  bh?: number;
+  ctx?: CanvasRenderingContext2D;
+}
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  h = ((h % 360) + 360) % 360;
+  s = Math.min(1, Math.max(0, s / 100));
+  l = Math.min(1, Math.max(0, l / 100));
+  const k = (n: number) => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n: number) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  return [Math.round(255 * f(0)), Math.round(255 * f(8)), Math.round(255 * f(4))];
+}
+// Plot a solid sizeW×sizeH block at (x,y) in hue/sat%/light%/alpha — the ONE call brush code makes
+// instead of touching ctx.fillStyle/fillRect directly. Same call works for either painting mode.
+function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: number, h: number, s: number, l: number, a: number) {
+  if (a <= 0) return;
+  if (target.mode === "ctx") {
+    target.ctx!.fillStyle = `hsla(${h}, ${s}%, ${l}%, ${a})`;
+    target.ctx!.fillRect(x, y, sizeW, sizeH);
+    return;
+  }
+  const buf = target.buf!, bw = target.bw!, bh = target.bh!;
+  const [r, g, b] = hslToRgb(h, s, l);
+  const x0 = Math.max(0, Math.floor(x));
+  const y0 = Math.max(0, Math.floor(y));
+  const x1 = Math.min(bw, Math.floor(x) + Math.max(1, Math.round(sizeW)));
+  const y1 = Math.min(bh, Math.floor(y) + Math.max(1, Math.round(sizeH)));
+  if (x1 <= x0 || y1 <= y0) return;
+  const alpha = Math.min(1, a), ia = 1 - alpha;
+  for (let yy = y0; yy < y1; yy++) {
+    let idx = (yy * bw + x0) * 4;
+    for (let xx = x0; xx < x1; xx++, idx += 4) {
+      buf[idx] = r * alpha + buf[idx] * ia;
+      buf[idx + 1] = g * alpha + buf[idx + 1] * ia;
+      buf[idx + 2] = b * alpha + buf[idx + 2] * ia;
+      buf[idx + 3] = 255;
+    }
+  }
+}
+
 // Direction the brush actually travelled, from the first point to the last, in degrees.
 // Falls back to 0 for a stroke with no real movement (e.g. a single-click "Заливка" — in that
 // case the gradientAngle slider becomes the sole, absolute angle control since there's no
@@ -228,6 +281,9 @@ const FULL_QUALITY_OPTS: RenderOpts = { step: 1, rainBudget: { left: Infinity } 
 
 function Index() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  // PERF: one persistent RGBA buffer, reused every frame (reallocated only when canvas size changes)
+  // instead of letting the canvas API do per-pixel work thousands of times a frame.
+  const pixelBufRef = useRef<{ imgData: ImageData; data: Uint8ClampedArray; w: number; h: number } | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
 
   // canvas size config
@@ -370,8 +426,19 @@ function Index() {
       const ctx = c.getContext("2d")!;
       const w = canvasSize.w, h = canvasSize.h;
 
-      ctx.fillStyle = "#080a12";
-      ctx.fillRect(0, 0, w, h);
+      // Reuse one persistent buffer across frames — only reallocate on an actual canvas resize.
+      let bufObj = pixelBufRef.current;
+      if (!bufObj || bufObj.w !== w || bufObj.h !== h) {
+        const imgData = ctx.createImageData(w, h);
+        bufObj = { imgData, data: imgData.data, w, h };
+        pixelBufRef.current = bufObj;
+      }
+      const buf = bufObj.data;
+      // Seed the opaque background fast via a 32-bit view instead of a per-byte loop — .fill() on a
+      // typed array is a native, heavily optimized operation.
+      const buf32 = new Uint32Array(buf.buffer);
+      const BG_PACKED = (255 << 24) | (18 << 16) | (10 << 8) | 8; // little-endian bytes: R=8 G=10 B=18 A=255 (#080a12)
+      buf32.fill(BG_PACKED);
 
       const t = now / 1000;
 
@@ -392,13 +459,30 @@ function Index() {
         rainBudget: { left: Math.max(0, GLOBAL_RAIN_CAP - existingRain) },
       };
 
+      const bufferTarget: PaintTarget = { mode: "buffer", buf, bw: w, bh: h };
+
       for (const layer of layersRef.current) {
         if (!layer.visible) continue;
         for (const s of layer.strokes) {
           if (s.points.length === 0) continue;
-          renderStroke(ctx, s, w, h, t, dtRaw, now, liveOpts);
+          if (s.kind === "fill") {
+            // "Заливка" stays a direct canvas draw (its native gradient path is genuinely cheaper
+            // done natively than resampled per-pixel). To keep stacking order correct relative to
+            // buffer-painted strokes before/after it in the same layer, flush the buffer to the
+            // canvas first, draw the fill directly on top, then read the canvas back into the
+            // buffer so later buffer-painted strokes keep compositing on top of it correctly.
+            ctx.putImageData(bufObj.imgData, 0, 0);
+            renderStroke({ mode: "ctx", ctx }, s, w, h, t, dtRaw, now, liveOpts);
+            buf.set(ctx.getImageData(0, 0, w, h).data);
+          } else {
+            renderStroke(bufferTarget, s, w, h, t, dtRaw, now, liveOpts);
+          }
         }
       }
+
+      // Final flush: whatever was last painted into the buffer (buffer-mode strokes after the last
+      // fill, or the whole frame if there was no fill at all) reaches the screen with one call.
+      ctx.putImageData(bufObj.imgData, 0, 0);
 
       raf = requestAnimationFrame(tick);
     };
@@ -407,7 +491,7 @@ function Index() {
   }, [canvasSize]);
 
   // === Stroke renderer ===
-  function renderStroke(ctx: CanvasRenderingContext2D, s: Stroke, w: number, h: number, t: number, dtRaw: number, now: number, opts: RenderOpts) {
+  function renderStroke(target: PaintTarget, s: Stroke, w: number, h: number, t: number, dtRaw: number, now: number, opts: RenderOpts) {
     const step = Math.max(1, opts.step);
     const dt = dtRaw * (0.3 + s.speed * 2.4);
     const tt = t * (0.3 + s.speed * 2.4);
@@ -452,6 +536,7 @@ function Index() {
 
     if (s.kind === "fill") {
       const alpha = Math.min(1, 0.3 + s.intensity * 0.8) * modePulse;
+      const fctx = target.ctx!; // fill always routes through the real canvas context — see tick()
       if (s.mode === "gradient") {
         // A flat single hue washing the whole canvas every frame reads as "blinking" — instead,
         // bake the same weighted multi-color gradient into a real spatial canvas gradient, sampled
@@ -461,19 +546,19 @@ function Index() {
         const cx = w / 2, cy = h / 2;
         const x0 = cx - gradCos * halfExtent, y0 = cy - gradSin * halfExtent;
         const x1 = cx + gradCos * halfExtent, y1 = cy + gradSin * halfExtent;
-        const lg = ctx.createLinearGradient(x0, y0, x1, y1);
+        const lg = fctx.createLinearGradient(x0, y0, x1, y1);
         const STOPS = 16;
         for (let k = 0; k <= STOPS; k++) {
           const posK = k / STOPS;
           const hueK = sampleGradient(s.gradientColors, posK + gradTravel);
           lg.addColorStop(posK, `hsla(${hueK}, 85%, 55%, ${alpha})`);
         }
-        ctx.fillStyle = lg;
+        fctx.fillStyle = lg;
       } else {
         const hueF = hueAt(0, 0);
-        ctx.fillStyle = `hsla(${hueF}, 85%, 55%, ${alpha})`;
+        fctx.fillStyle = `hsla(${hueF}, 85%, 55%, ${alpha})`;
       }
-      ctx.fillRect(0, 0, w, h);
+      fctx.fillRect(0, 0, w, h);
       return;
     }
 
@@ -502,8 +587,7 @@ function Index() {
             const gy = Math.round((cy + ny * (t2 + wob)) / grid) * grid;
             const edge = 1 - Math.abs(t2) / (half + 1);
             const l = 55 + edge * 25;
-            ctx.fillStyle = `hsla(${hueAt(i, f)}, 85%, ${l}%, ${alphaMul * edge})`;
-            ctx.fillRect(gx, gy, grid, grid);
+            paint(target, gx, gy, grid, grid, hueAt(i, f), 85, l, alphaMul * edge);
           }
         }
       }
@@ -528,8 +612,7 @@ function Index() {
                        + hash(i + f + tt) * s.noise * s.size * 0.5;
             const gx = Math.round((p.x + dx * f + nx * wave) / grid) * grid;
             const gy = Math.round((p.y + dy * f + ny * wave) / grid) * grid;
-            ctx.fillStyle = `hsla(${(hueAt(i, f) + pass * 20) % 360}, 100%, 65%, ${alphaMul * 0.75})`;
-            ctx.fillRect(gx, gy, grid, grid);
+            paint(target, gx, gy, grid, grid, (hueAt(i, f) + pass * 20) % 360, 100, 65, alphaMul * 0.75);
           }
         }
       }
@@ -544,8 +627,6 @@ function Index() {
         const i1 = Math.min(pts.length - 1, i0 + 1 + Math.floor(Math.random() * (5 + s.dynamics * 30)));
         const p0 = pts[i0], p1 = pts[i1];
         const hueL = hueAt(i0);
-        const coreCol = `hsla(${hueL}, 100%, 82%, ${alphaMul})`;
-        const glowCol = `hsla(${hueL}, 100%, 60%, ${alphaMul * 0.45})`;
         const segs = 6 + Math.floor(s.dynamics * 10);
         let ppx = p0.x, ppy = p0.y;
         for (let i = 1; i <= segs; i++) {
@@ -562,10 +643,8 @@ function Index() {
             // PERF: was 4 separate fillRect calls for the glow (one per side) + 1 core = 5 draws
             // per point. Now it's 1 bigger glow rect + 1 core = 2 draws. Same visual read at this
             // grid size, far fewer canvas calls (which is where the real cost is).
-            ctx.fillStyle = glowCol;
-            ctx.fillRect(gx - grid, gy - grid, grid * 3, grid * 3);
-            ctx.fillStyle = coreCol;
-            ctx.fillRect(gx, gy, grid, grid);
+            paint(target, gx - grid, gy - grid, grid * 3, grid * 3, hueL, 100, 60, alphaMul * 0.45);
+            paint(target, gx, gy, grid, grid, hueL, 100, 82, alphaMul);
           }
           ppx = nxx; ppy = nyy;
         }
@@ -598,12 +677,19 @@ function Index() {
         const r = s.rain[i];
         r.y += r.vy * dt * 0.1;
         r.x += hash(tt + r.seed) * s.noise * 0.8;
-        if (r.y > h + 40) { s.rain.splice(i, 1); continue; }
+        if (r.y > h + 40) {
+          // Swap-pop instead of splice: splice shifts every following element down by one (O(n) —
+          // real cost with hundreds of particles). Swapping in the last element and shortening the
+          // array is O(1) — array order doesn't matter for particles, so nothing is lost visually.
+          const last = s.rain.length - 1;
+          if (i !== last) s.rain[i] = s.rain[last];
+          s.rain.pop();
+          continue;
+        }
         const hueP = (r.hue + modeHueShift) % 360;
         for (let k = 0; k < r.len; k++) {
           const a = alphaMul * (1 - k / r.len);
-          ctx.fillStyle = `hsla(${hueP}, 95%, ${55 + k * 3}%, ${a})`;
-          ctx.fillRect(Math.round((r.x) / grid) * grid, Math.round((r.y - k * grid) / grid) * grid, grid, grid);
+          paint(target, Math.round((r.x) / grid) * grid, Math.round((r.y - k * grid) / grid) * grid, grid, grid, hueP, 95, 55 + k * 3, a);
         }
       }
     }
@@ -630,8 +716,7 @@ function Index() {
           if (dist > threshold) continue;
           if (Math.random() > 0.05 + s.density * 0.4) continue;
           const lit = 50 + (1 - dist) * 30;
-          ctx.fillStyle = `hsla(${hueD + (bayer ? 30 : 0)}, 95%, ${lit}%, ${alphaMul * (1 - dist)})`;
-          ctx.fillRect(gx, gy, grid, grid);
+          paint(target, gx, gy, grid, grid, hueD + (bayer ? 30 : 0), 95, lit, alphaMul * (1 - dist));
         }
       }
     }
@@ -667,10 +752,9 @@ function Index() {
             hues = [hueG % 360, (hueG + 120) % 360, (hueG + 240) % 360];
           }
           for (let c2 = 0; c2 < 3; c2++) {
-            ctx.fillStyle = `hsla(${hues[c2]}, 100%, 55%, ${alphaMul * 0.55})`;
             for (let xb = 0; xb < widthLine; xb += grid) {
               if (Math.random() > 0.4 + s.intensity * 0.5) continue;
-              ctx.fillRect(Math.round((x0 + xb + offs[c2]) / grid) * grid, y0, grid, grid);
+              paint(target, Math.round((x0 + xb + offs[c2]) / grid) * grid, y0, grid, grid, hues[c2], 100, 55, alphaMul * 0.55);
             }
           }
         }
@@ -844,11 +928,12 @@ function Index() {
     tctx.fillStyle = "#080a12";
     tctx.fillRect(0, 0, w, h);
     const t = now / 1000;
+    const target: PaintTarget = { mode: "ctx", ctx: tctx };
     for (const layer of layersRef.current) {
       if (!layer.visible) continue;
       for (const s of layer.strokes) {
         if (s.points.length === 0) continue;
-        renderStroke(tctx, s, w, h, t, dtRaw, now, FULL_QUALITY_OPTS);
+        renderStroke(target, s, w, h, t, dtRaw, now, FULL_QUALITY_OPTS);
       }
     }
   }, []);
