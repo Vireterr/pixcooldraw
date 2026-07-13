@@ -503,6 +503,8 @@ function Index() {
   useEffect(() => { refs.gradientSpeed.current = gradientSpeed; });
   useEffect(() => { refs.gradientColors.current = gradientColors; });
   useEffect(() => { refs.gradientAngle.current = gradientAngle; });
+  useEffect(() => { refs.gradientFlow.current = gradientFlow; });
+  useEffect(() => { refs.fillTolerance.current = fillTolerance; });
   useEffect(() => { refs.animEnabled.current = animEnabled; });
 
   // resize canvas backing store to logical canvasSize
