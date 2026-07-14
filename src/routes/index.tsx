@@ -402,7 +402,10 @@ function Index() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // PERF: one persistent RGBA buffer, reused every frame (reallocated only when canvas size changes)
   // instead of letting the canvas API do per-pixel work thousands of times a frame.
-  const pixelBufRef = useRef<{ imgData: ImageData; data: Uint8ClampedArray; w: number; h: number } | null>(null);
+  const pixelBufRef = useRef<{
+    imgData: ImageData; data: Uint8ClampedArray; w: number; h: number;
+    buf32: Uint32Array; rainBudget: { left: number }; bufferTarget: PaintTarget;
+  } | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
 
   // canvas size config
@@ -596,26 +599,37 @@ function Index() {
       const w = canvasSize.w, h = canvasSize.h;
 
       // Reuse one persistent buffer across frames — only reallocate on an actual canvas resize.
+      // PERF: the Uint32Array view, the mutable rainBudget object, and the PaintTarget wrapper used
+      // to belong to this scope and got reallocated 60 times a second regardless of what's on the
+      // canvas — pure GC churn with zero effect on a single output pixel. All three now live on the
+      // buffer object itself and are only rebuilt when the buffer itself is (re)allocated.
       let bufObj = pixelBufRef.current;
       if (!bufObj || bufObj.w !== w || bufObj.h !== h) {
         const imgData = ctx.createImageData(w, h);
-        bufObj = { imgData, data: imgData.data, w, h };
+        const data = imgData.data;
+        bufObj = {
+          imgData, data, w, h,
+          buf32: new Uint32Array(data.buffer),
+          rainBudget: { left: 0 },
+          bufferTarget: { mode: "buffer", buf: data, bw: w, bh: h },
+        };
         pixelBufRef.current = bufObj;
       }
       const buf = bufObj.data;
       // Seed the opaque background fast via a 32-bit view instead of a per-byte loop — .fill() on a
       // typed array is a native, heavily optimized operation.
-      const buf32 = new Uint32Array(buf.buffer);
       const BG_PACKED = (255 << 24) | (18 << 16) | (10 << 8) | 8; // little-endian bytes: R=8 G=10 B=18 A=255 (#080a12)
-      buf32.fill(BG_PACKED);
+      bufObj.buf32.fill(BG_PACKED);
 
       const t = now / 1000;
 
-      // Rain still shares one global budget across the scene (this doesn't touch visual quality of
-      // any individual particle — it just caps total particle COUNT once truly enormous, same as
-      // exports would need some cap too). Everything else always renders at full detail now — no
-      // point/segment skipping based on scene load, so drawing never visibly degrades as you add
-      // more strokes.
+      // Rain shares one global budget across the scene (caps total particle COUNT once truly
+      // enormous — doesn't touch any individual particle's look). Kept as an exact scan rather than
+      // an incrementally-tracked running total: undo/redo, clear, and layer deletion can all remove
+      // whole strokes (and their rain) without going through pixelRain's own spawn/despawn code, so
+      // a running counter could silently drift and change how much rain is allowed to spawn later —
+      // a real visual difference, not just a performance one. This scan itself is cheap compared to
+      // the actual per-particle rendering below.
       let existingRain = 0;
       for (const layer of layersRef.current) {
         if (!layer.visible) continue;
@@ -623,12 +637,9 @@ function Index() {
           if (s.rain) existingRain += s.rain.length;
         }
       }
-      const liveOpts: RenderOpts = {
-        step: 1,
-        rainBudget: { left: Math.max(0, GLOBAL_RAIN_CAP - existingRain) },
-      };
-
-      const bufferTarget: PaintTarget = { mode: "buffer", buf, bw: w, bh: h };
+      bufObj.rainBudget.left = Math.max(0, GLOBAL_RAIN_CAP - existingRain);
+      const liveOpts: RenderOpts = { step: 1, rainBudget: bufObj.rainBudget };
+      const bufferTarget = bufObj.bufferTarget;
 
       for (const layer of layersRef.current) {
         if (!layer.visible) continue;
