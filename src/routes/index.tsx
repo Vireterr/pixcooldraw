@@ -42,15 +42,30 @@ interface Stroke {
   gradientSpeed: number;
   gradientColors: { hue: number; weight: number }[];
   gradientAngle: number;
+  // false = shortest hue-wheel arc between adjacent stops (default), true = the long way around
+  // (passes through every intervening hue). Set once at stroke creation, like the other params.
+  gradientLongPath: boolean;
   // Set once when the stroke is created from the "Анимация" toggle's state at that moment — frozen
   // strokes render with time locked to their birth instant, so they paint once and never animate
   // again. Toggling the button later never touches strokes that already exist (see tick()/onDown()).
   frozen: boolean;
   points: StrokePoint[];
   born: number;
+  // Real flood-fill data (kind === "fill" only): which pixels of the canvas, at the moment of the
+  // click, got selected — run-length encoded (alternating not-filled/filled run lengths, starting
+  // with a not-filled run) so a fill covering most of a large canvas doesn't bloat undo/redo history
+  // the way a raw per-pixel boolean array would. fillW/fillH record the canvas size the mask was
+  // built for; if the canvas is resized later the stale mask is simply skipped (see renderStroke).
+  fillRuns?: number[];
+  fillW?: number;
+  fillH?: number;
   // transient per-brush buckets (not serialized in history)
   ink?: { phase: number };
   rain?: { x: number; y: number; vy: number; hue: number; len: number; seed: number }[];
+  // Lazily decoded from fillRuns the first time this stroke is rendered (same lazy/cached pattern
+  // as segCache below) — decoding a run-length list into a full pixel mask every single animation
+  // frame would be wasted work since fillRuns never changes after the fill is made.
+  fillMaskCache?: Uint8Array;
   // PERF: cached per-segment geometry for ink/ribbon (nx,ny = unit normal, len = segment length,
   // num = interpolation steps) — these never change once a segment is finalized, only the point
   // count grows while actively drawing. Built lazily, extended as new points arrive, reset by
@@ -148,7 +163,10 @@ function hueToHex(hue: number): string {
 // of the 0..1 cycle it occupies (higher weight = that color dominates a larger stretch, and the
 // transition into/out of it takes proportionally longer). t travels continuously (not clamped to
 // [0,1]), so feeding it a growing time-based value makes the palette flow endlessly along the stroke.
-function sampleGradient(stops: { hue: number; weight: number }[], t: number): number {
+// longPath: false (default) takes the shortest hue-wheel arc between two adjacent stops (e.g. blue
+// -> magenta goes straight through violet). true takes the OTHER way around the wheel instead, so
+// the same two stops sweep through every intervening hue (a full rainbow pass) before arriving.
+function sampleGradient(stops: { hue: number; weight: number }[], t: number, longPath = false): number {
   const n = stops.length;
   if (n === 0) return 0;
   if (n === 1) return stops[0].hue;
@@ -166,7 +184,8 @@ function sampleGradient(stops: { hue: number; weight: number }[], t: number): nu
   const frac = segEnd > segStart ? (norm - segStart) / (segEnd - segStart) : 0;
   const c0 = stops[idx].hue;
   const c1 = stops[(idx + 1) % n].hue;
-  const diff = ((c1 - c0 + 540) % 360) - 180; // shortest angular path between the two stops
+  const shortDiff = ((c1 - c0 + 540) % 360) - 180; // shortest angular path between the two stops
+  const diff = longPath && shortDiff !== 0 ? shortDiff - Math.sign(shortDiff) * 360 : shortDiff;
   return (c0 + diff * frac + 360) % 360;
 }
 
@@ -222,7 +241,81 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
   }
 }
 
-// Direction the brush actually travelled, from the first point to the last, in degrees.
+// ==== Bucket fill: flood-fill against the REAL composited pixel buffer ====
+// Reads whatever is actually on screen at the click point (not brush params) and selects either
+// the connected region of similar color ("Связная") or every matching pixel on the canvas
+// regardless of position ("Всё выделение"), within a tolerance threshold (0..255, max channel diff).
+function pixelAt(buf: Uint8ClampedArray, w: number, x: number, y: number): [number, number, number] {
+  const idx = (y * w + x) * 4;
+  return [buf[idx], buf[idx + 1], buf[idx + 2]];
+}
+function computeFloodMask(
+  buf: Uint8ClampedArray, w: number, h: number, sx: number, sy: number,
+  tolerance: number, contiguous: boolean
+): Uint8Array {
+  const mask = new Uint8Array(w * h);
+  const [tr, tg, tb] = pixelAt(buf, w, sx, sy);
+  const matches = (x: number, y: number) => {
+    const idx = (y * w + x) * 4;
+    return Math.max(Math.abs(buf[idx] - tr), Math.abs(buf[idx + 1] - tg), Math.abs(buf[idx + 2] - tb)) <= tolerance;
+  };
+  if (!contiguous) {
+    for (let i = 0, y = 0; y < h; y++) for (let x = 0; x < w; x++, i++) if (matches(x, y)) mask[i] = 1;
+    return mask;
+  }
+  // Stack-based scanline flood fill (4-connected) — expands each seed left/right along its row,
+  // then scans the rows directly above/below that span for new seeds. Far fewer stack pushes than
+  // a naive 4-neighbor flood fill, which matters at up to millions of pixels on a large canvas.
+  const stack: number[] = [sy * w + sx];
+  mask[sy * w + sx] = 1;
+  while (stack.length) {
+    const seed = stack.pop()!;
+    const y = Math.floor(seed / w);
+    let xl = seed - y * w, xr = xl;
+    while (xl > 0 && !mask[y * w + xl - 1] && matches(xl - 1, y)) { xl--; mask[y * w + xl] = 1; }
+    while (xr < w - 1 && !mask[y * w + xr + 1] && matches(xr + 1, y)) { xr++; mask[y * w + xr] = 1; }
+    for (const ny of [y - 1, y + 1]) {
+      if (ny < 0 || ny >= h) continue;
+      let inSpan = false;
+      for (let xx = xl; xx <= xr; xx++) {
+        const idx = ny * w + xx;
+        if (!mask[idx] && matches(xx, ny)) {
+          mask[idx] = 1;
+          if (!inSpan) { stack.push(idx); inSpan = true; }
+        } else {
+          inSpan = false;
+        }
+      }
+    }
+  }
+  return mask;
+}
+// Run-length encode a 0/1 mask as alternating (not-filled, filled, not-filled, filled, ...) run
+// lengths, always starting with a (possibly zero) not-filled run. Cheap to store in undo/redo
+// history even for a fill that covers most of a large canvas — far smaller than a raw byte array.
+function encodeMaskRLE(mask: Uint8Array): number[] {
+  const runs: number[] = [];
+  let cur = 0, runLen = 0;
+  for (let i = 0; i < mask.length; i++) {
+    const v = mask[i] ? 1 : 0;
+    if (v === cur) runLen++;
+    else { runs.push(runLen); cur = v; runLen = 1; }
+  }
+  runs.push(runLen);
+  return runs;
+}
+function decodeMaskRLE(runs: number[], size: number): Uint8Array {
+  const mask = new Uint8Array(size);
+  let pos = 0, v = 0;
+  for (const runLen of runs) {
+    if (v) mask.fill(1, pos, pos + runLen);
+    pos += runLen;
+    v = 1 - v;
+  }
+  return mask;
+}
+
+
 // Falls back to 0 for a stroke with no real movement (e.g. a single-click "Заливка" — in that
 // case the gradientAngle slider becomes the sole, absolute angle control since there's no
 // natural stroke direction to derive from).
@@ -246,8 +339,10 @@ function serializeLayers(layers: Layer[]): string {
       speed: s.speed, density: s.density, noise: s.noise,
       intensity: s.intensity, dynamics: s.dynamics,
       rainbowFlow: s.rainbowFlow, rainbowFlowSpeed: s.rainbowFlowSpeed, gradientSpeed: s.gradientSpeed,
-      gradientColors: s.gradientColors, gradientAngle: s.gradientAngle, frozen: s.frozen,
+      gradientColors: s.gradientColors, gradientAngle: s.gradientAngle, gradientLongPath: s.gradientLongPath,
+      frozen: s.frozen,
       points: s.points, born: s.born,
+      fillRuns: s.fillRuns, fillW: s.fillW, fillH: s.fillH,
     })),
   })));
 }
@@ -383,6 +478,12 @@ function Index() {
     { hue: 200, weight: 1 }, { hue: 320, weight: 1 }, { hue: 60, weight: 1 },
   ]);
   const [gradientAngle, setGradientAngle] = useState(0);
+  const [gradientLongPath, setGradientLongPath] = useState(false);
+  // Bucket fill ("Заливка") settings: contiguous selects only the region connected to the click
+  // point; global selects every matching pixel on the canvas regardless of position. Tolerance is
+  // the max per-channel color difference (0-255) still counted as "the same color".
+  const [fillContiguous, setFillContiguous] = useState(true);
+  const [fillTolerance, setFillTolerance] = useState(32);
   const [recording, setRecording] = useState<null | "gif" | "mp4">(null);
   const [recordProgress, setRecordProgress] = useState(0);
   const [gifQ, setGifQ] = useState<GifQ>("medium");
@@ -423,7 +524,10 @@ function Index() {
     rainbowFlowSpeed: useRef(rainbowFlowSpeed),
     gradientSpeed: useRef(gradientSpeed), gradientColors: useRef(gradientColors),
     gradientAngle: useRef(gradientAngle),
+    gradientLongPath: useRef(gradientLongPath),
     animEnabled: useRef(animEnabled),
+    fillContiguous: useRef(fillContiguous),
+    fillTolerance: useRef(fillTolerance),
   };
   useEffect(() => { refs.brush.current = brush; });
   useEffect(() => { refs.mode.current = mode; });
@@ -439,7 +543,10 @@ function Index() {
   useEffect(() => { refs.gradientSpeed.current = gradientSpeed; });
   useEffect(() => { refs.gradientColors.current = gradientColors; });
   useEffect(() => { refs.gradientAngle.current = gradientAngle; });
+  useEffect(() => { refs.gradientLongPath.current = gradientLongPath; });
   useEffect(() => { refs.animEnabled.current = animEnabled; });
+  useEffect(() => { refs.fillContiguous.current = fillContiguous; });
+  useEffect(() => { refs.fillTolerance.current = fillTolerance; });
 
   // resize canvas backing store to logical canvasSize
   useEffect(() => {
@@ -534,18 +641,7 @@ function Index() {
           const effT = s.frozen ? s.born / 1000 : t;
           const effDt = s.frozen ? 0 : dtRaw;
           const effNow = s.frozen ? s.born : now;
-          if (s.kind === "fill") {
-            // "Заливка" stays a direct canvas draw (its native gradient path is genuinely cheaper
-            // done natively than resampled per-pixel). To keep stacking order correct relative to
-            // buffer-painted strokes before/after it in the same layer, flush the buffer to the
-            // canvas first, draw the fill directly on top, then read the canvas back into the
-            // buffer so later buffer-painted strokes keep compositing on top of it correctly.
-            ctx.putImageData(bufObj.imgData, 0, 0);
-            renderStroke({ mode: "ctx", ctx }, s, w, h, effT, effDt, effNow, liveOpts);
-            buf.set(ctx.getImageData(0, 0, w, h).data);
-          } else {
-            renderStroke(bufferTarget, s, w, h, effT, effDt, effNow, liveOpts);
-          }
+          renderStroke(bufferTarget, s, w, h, effT, effDt, effNow, liveOpts);
         }
       }
 
@@ -589,7 +685,7 @@ function Index() {
     const gradTravel = tt * (0.03 + s.gradientSpeed * 0.5);
     const gradientHueAtXY = (x: number, y: number): number => {
       const proj = (x * gradCos + y * gradSin) / gradExtent;
-      return sampleGradient(s.gradientColors, proj + gradTravel);
+      return sampleGradient(s.gradientColors, proj + gradTravel, s.gradientLongPath);
     };
     const hueAt = (i: number, f = 0): number => {
       if (s.mode === "gradient") {
@@ -604,30 +700,75 @@ function Index() {
     };
 
     if (s.kind === "fill") {
+      const bw = w, bh = h;
+      // Canvas was resized since this fill was made — the mask no longer lines up with pixel
+      // positions, so skip rather than smear stale data across a differently-sized canvas.
+      if (s.fillW !== bw || s.fillH !== bh) return;
+      if (!s.fillMaskCache) s.fillMaskCache = decodeMaskRLE(s.fillRuns!, bw * bh);
+      const mask = s.fillMaskCache;
       const alpha = Math.min(1, 0.3 + s.intensity * 0.8) * modePulse;
-      const fctx = target.ctx!; // fill always routes through the real canvas context — see tick()
+
       if (s.mode === "gradient") {
-        // A flat single hue washing the whole canvas every frame reads as "blinking" — instead,
-        // bake the same weighted multi-color gradient into a real spatial canvas gradient, sampled
-        // at several fixed positions along the chosen angle. gradTravel still animates it, but now
-        // as a smoothly scrolling spatial gradient instead of the whole screen flashing one color.
-        const halfExtent = gradExtent / 2;
-        const cx = w / 2, cy = h / 2;
-        const x0 = cx - gradCos * halfExtent, y0 = cy - gradSin * halfExtent;
-        const x1 = cx + gradCos * halfExtent, y1 = cy + gradSin * halfExtent;
-        const lg = fctx.createLinearGradient(x0, y0, x1, y1);
-        const STOPS = 16;
-        for (let k = 0; k <= STOPS; k++) {
-          const posK = k / STOPS;
-          const hueK = sampleGradient(s.gradientColors, posK + gradTravel);
-          lg.addColorStop(posK, `hsla(${hueK}, 85%, 55%, ${alpha})`);
+        // Precompute a coarse hue ramp along the gradient's projection axis ONCE per frame instead
+        // of calling sampleGradient()+hslToRgb() per pixel — a fill can cover hundreds of thousands
+        // of pixels, so per-pixel trig/interpolation every frame would be far too slow.
+        const RAMP = 96;
+        const ramp: [number, number, number][] = new Array(RAMP);
+        for (let k = 0; k < RAMP; k++) {
+          const hueK = sampleGradient(s.gradientColors, k / RAMP + gradTravel, s.gradientLongPath);
+          ramp[k] = hslToRgb(hueK, 85, 55);
         }
-        fctx.fillStyle = lg;
+        if (target.mode === "buffer") {
+          const buf = target.buf!;
+          const ia = 1 - alpha;
+          let mi = 0;
+          for (let yy = 0; yy < bh; yy++) {
+            for (let xx = 0; xx < bw; xx++, mi++) {
+              if (!mask[mi]) continue;
+              const proj = (xx * gradCos + yy * gradSin) / gradExtent + gradTravel;
+              const norm = ((proj % 1) + 1) % 1;
+              const [r, g, b] = ramp[Math.min(RAMP - 1, Math.floor(norm * RAMP))];
+              const idx = mi * 4;
+              buf[idx] = r * alpha + buf[idx] * ia;
+              buf[idx + 1] = g * alpha + buf[idx + 1] * ia;
+              buf[idx + 2] = b * alpha + buf[idx + 2] * ia;
+              buf[idx + 3] = 255;
+            }
+          }
+        } else {
+          // Export path — runs far less often than live playback, fine to go through the shared
+          // paint() helper at full per-pixel precision.
+          for (let yy = 0; yy < bh; yy++) {
+            for (let xx = 0; xx < bw; xx++) {
+              if (!mask[yy * bw + xx]) continue;
+              paint(target, xx, yy, 1, 1, gradientHueAtXY(xx, yy), 85, 55, alpha);
+            }
+          }
+        }
       } else {
+        // normal / rainbow / pulse: one solid (possibly time-shifting) color for the whole fill —
+        // same "wash" behavior these modes always had for Заливка, just restricted to the mask.
         const hueF = hueAt(0, 0);
-        fctx.fillStyle = `hsla(${hueF}, 85%, 55%, ${alpha})`;
+        if (target.mode === "buffer") {
+          const [r, g, b] = hslToRgb(hueF, 85, 55);
+          const buf = target.buf!;
+          const ia = 1 - alpha;
+          for (let mi = 0; mi < mask.length; mi++) {
+            if (!mask[mi]) continue;
+            const idx = mi * 4;
+            buf[idx] = r * alpha + buf[idx] * ia;
+            buf[idx + 1] = g * alpha + buf[idx + 1] * ia;
+            buf[idx + 2] = b * alpha + buf[idx + 2] * ia;
+            buf[idx + 3] = 255;
+          }
+        } else {
+          for (let mi = 0; mi < mask.length; mi++) {
+            if (!mask[mi]) continue;
+            const xx = mi % bw, yy = (mi - xx) / bw;
+            paint(target, xx, yy, 1, 1, hueF, 85, 55, alpha);
+          }
+        }
       }
-      fctx.fillRect(0, 0, w, h);
       return;
     }
 
@@ -729,9 +870,9 @@ function Index() {
       // blocked new particles from ever spawning once old ones fell off-canvas.)
       const currentRainCount = s.rain?.length ?? 0;
       const wantRain = Math.floor(10 + s.density * 80);
-      const target = Math.min(wantRain, currentRainCount + Math.max(0, opts.rainBudget.left));
+      const rainTargetCount = Math.min(wantRain, currentRainCount + Math.max(0, opts.rainBudget.left));
       if (!s.rain) s.rain = [];
-      while (s.rain.length < target && opts.rainBudget.left > 0) {
+      while (s.rain.length < rainTargetCount && opts.rainBudget.left > 0) {
         const idx = Math.floor(Math.random() * pts.length);
         const p = pts[idx];
         s.rain.push({
@@ -815,9 +956,9 @@ function Index() {
             const spread = 0.035;
             const basePos = (p.x * gradCos + p.y * gradSin) / gradExtent + gradTravel;
             hues = [
-              sampleGradient(s.gradientColors, basePos - spread),
-              sampleGradient(s.gradientColors, basePos),
-              sampleGradient(s.gradientColors, basePos + spread),
+              sampleGradient(s.gradientColors, basePos - spread, s.gradientLongPath),
+              sampleGradient(s.gradientColors, basePos, s.gradientLongPath),
+              sampleGradient(s.gradientColors, basePos + spread, s.gradientLongPath),
             ];
           } else {
             hues = [hueG % 360, (hueG + 120) % 360, (hueG + 240) % 360];
@@ -917,6 +1058,50 @@ function Index() {
     const { x, y } = getPoint(e);
     pointerRef.current = { x, y, px: x, py: y, down: true };
     if (refs.brush.current === "eraser") { eraseAt(x, y, refs.size.current); return; }
+
+    if (refs.brush.current === "fill") {
+      // Bucket fill is a single click, not a draggable stroke — it reads whatever is actually
+      // composited on screen right now (not brush history) and commits its result immediately.
+      pointerRef.current.down = false;
+      const layerF = layersRef.current.find(l => l.id === activeLayerIdRef.current);
+      if (!layerF || !layerF.visible) return;
+      const bufObj = pixelBufRef.current;
+      if (!bufObj) return;
+      const w = canvasSize.w, h = canvasSize.h;
+      const sx = Math.min(w - 1, Math.max(0, Math.round(x)));
+      const sy = Math.min(h - 1, Math.max(0, Math.round(y)));
+      const mask = computeFloodMask(bufObj.data, w, h, sx, sy, refs.fillTolerance.current, refs.fillContiguous.current);
+      const fillStroke: Stroke = {
+        id: ++strokeIdCounter,
+        kind: "fill",
+        mode: refs.mode.current,
+        size: refs.size.current,
+        hue: refs.hue.current,
+        speed: refs.speed.current,
+        density: refs.density.current,
+        noise: refs.noise.current,
+        intensity: refs.intensity.current,
+        dynamics: refs.dynamics.current,
+        rainbowFlow: refs.rainbowFlow.current,
+        rainbowFlowSpeed: refs.rainbowFlowSpeed.current,
+        gradientSpeed: refs.gradientSpeed.current,
+        gradientColors: refs.gradientColors.current.map(c => ({ ...c })),
+        gradientAngle: refs.gradientAngle.current,
+        gradientLongPath: refs.gradientLongPath.current,
+        frozen: !refs.animEnabled.current,
+        // Single point, purely so the generic "empty stroke" skip-checks elsewhere don't drop this
+        // fill — its actual painted area comes entirely from fillRuns, never from points/segments.
+        points: [{ x: sx, y: sy, t: 0 }],
+        born: performance.now(),
+        fillRuns: encodeMaskRLE(mask),
+        fillW: w,
+        fillH: h,
+      };
+      layerF.strokes.push(fillStroke);
+      pushHistory();
+      return;
+    }
+
     const layer = layersRef.current.find(l => l.id === activeLayerIdRef.current);
     if (!layer || !layer.visible) return;
     const stroke: Stroke = {
@@ -935,6 +1120,7 @@ function Index() {
       gradientSpeed: refs.gradientSpeed.current,
       gradientColors: refs.gradientColors.current.map(c => ({ ...c })),
       gradientAngle: refs.gradientAngle.current,
+      gradientLongPath: refs.gradientLongPath.current,
       frozen: !refs.animEnabled.current,
       points: [],
       born: performance.now(),
@@ -1269,6 +1455,34 @@ function Index() {
           </div>
         </section>
 
+        {/* Dedicated Fill (bucket) tool menu — only visible while "Заливка" is selected */}
+        {brush === "fill" && (
+          <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
+            <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Заливка — область</div>
+            <div className="flex gap-1">
+              <button
+                onClick={() => setFillContiguous(true)}
+                className={`flex-1 rounded border px-1.5 py-1 text-[10px] tracking-wider transition ${fillContiguous ? "border-white/60 bg-white/15" : "border-white/10 bg-white/[0.02] text-white/60 hover:bg-white/[0.06]"}`}
+              >
+                Связная
+              </button>
+              <button
+                onClick={() => setFillContiguous(false)}
+                className={`flex-1 rounded border px-1.5 py-1 text-[10px] tracking-wider transition ${!fillContiguous ? "border-white/60 bg-white/15" : "border-white/10 bg-white/[0.02] text-white/60 hover:bg-white/[0.06]"}`}
+              >
+                Всё выд.
+              </button>
+            </div>
+            <label className="block text-[10px] uppercase tracking-widest text-white/50">
+              <span className="mb-1 flex justify-between"><span>Допуск</span><span className="text-white/80">{fillTolerance}</span></span>
+              <input type="range" min={0} max={255} value={fillTolerance} onChange={(e) => setFillTolerance(+e.target.value)} className="w-full accent-white" />
+            </label>
+            <div className="text-[8px] normal-case tracking-normal text-white/30">
+              Использует текущий цвет и режим (обычный/радуга/пульс/градиент)
+            </div>
+          </section>
+        )}
+
         {/* Modes */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Режим</div>
@@ -1347,6 +1561,14 @@ function Index() {
                 </button>
               )}
             </div>
+
+            <button
+              onClick={() => setGradientLongPath(v => !v)}
+              className="w-full rounded border border-white/10 bg-white/[0.02] px-1.5 py-1 text-[9px] uppercase tracking-widest text-white/60 transition hover:bg-white/5"
+              title="Как цвет переходит между соседними стопами"
+            >
+              {gradientLongPath ? "Переход: длинный путь (через все оттенки)" : "Переход: короткий путь (напрямую)"}
+            </button>
 
             <label className="block text-[10px] uppercase tracking-widest text-white/50">
               <span className="mb-1 flex justify-between">
