@@ -218,6 +218,12 @@ interface PaintTarget {
   // stroke in isolation starts from full transparency, so touches need real "over" compositing to
   // combine correctly no matter how many times the same stroke paints over itself.
   alphaBuf?: Uint8ClampedArray;
+  // Set for the duration of one stroke's render pass when its mode is "Зеркало" (mirror) — every
+  // paint() call additionally paints its horizontal mirror image (canvas-width flip) in the same
+  // color/alpha. Kept OUT of the stroke's own point data (see addPoint/renderStroke) so the brush's
+  // line-connect geometry (segCache, ink/ribbon path continuity) never has to deal with a point set
+  // that zigzags between real and mirrored positions.
+  mirrorW?: number;
 }
 function hslToRgb(h: number, s: number, l: number): [number, number, number] {
   h = ((h % 360) + 360) % 360;
@@ -245,6 +251,12 @@ function blendIsoPixel(buf: Uint8ClampedArray, alphaBuf: Uint8ClampedArray, idx:
 // instead of touching ctx.fillStyle/fillRect directly. Same call works for either painting mode.
 function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: number, h: number, s: number, l: number, a: number) {
   if (a <= 0) return;
+  paintOnce(target, x, y, sizeW, sizeH, h, s, l, a);
+  if (target.mirrorW !== undefined) {
+    paintOnce(target, target.mirrorW - x - sizeW, y, sizeW, sizeH, h, s, l, a);
+  }
+}
+function paintOnce(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: number, h: number, s: number, l: number, a: number) {
   if (target.mode === "ctx") {
     target.ctx!.fillStyle = `hsla(${h}, ${s}%, ${l}%, ${a})`;
     target.ctx!.fillRect(x, y, sizeW, sizeH);
@@ -443,6 +455,13 @@ function Index() {
     imgData: ImageData; data: Uint8ClampedArray; w: number; h: number;
     buf32: Uint32Array; rainBudget: { left: number }; bufferTarget: PaintTarget;
   } | null>(null);
+  // "Анимация" toggle: virtual clock used for all NON-frozen strokes. pauseOffset grows in lockstep
+  // with real time whenever the toggle is off, so `virtualNow = realNow - pauseOffset` stays pinned
+  // at exactly the instant the toggle was flipped off — a true pause, not just "new strokes only".
+  // Flipping it back on stops the offset from growing, so virtualNow resumes counting up smoothly
+  // from wherever it was frozen, with no jump. Read by both the 2D loop and the 3D preview loop.
+  const pauseOffsetRef = useRef(0);
+  const vNow = () => performance.now() - pauseOffsetRef.current;
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvas3DRef = useRef<HTMLCanvasElement>(null);
   const three3DRef = useRef<{
@@ -511,7 +530,7 @@ function Index() {
   // and stops existing strokes too — the direct fix for old animated gradient fills that are still
   // costing a full recompute every frame just to keep looking the same as last frame.
   const flattenAll = useCallback(() => {
-    const nowMs = performance.now();
+    const nowMs = vNow();
     let changed = false;
     for (const layer of layersRef.current) {
       for (const s of layer.strokes) {
@@ -526,9 +545,10 @@ function Index() {
 
   const [brush, setBrush] = useState<BrushKind>("ribbon");
   const [mode, setMode] = useState<ModeKind>("normal");
-  // "Анимация" toggle: when off, every NEW stroke is born frozen (see Stroke.frozen) — it paints
-  // once and stops, instead of animating every frame. Strokes drawn before the toggle was flipped
-  // keep whatever behavior they were born with.
+  // "Анимация" toggle: a real global pause/resume (see pauseOffsetRef/vNow above). While off, every
+  // stroke already on the canvas stops moving via the virtual clock, AND every NEW stroke is born
+  // frozen (see Stroke.frozen) so it paints once instead of animating. Flipping it back on resumes
+  // both smoothly.
   const [animEnabled, setAnimEnabled] = useState(true);
   const [hue, setHue] = useState(200);
   const [size, setSize] = useState(28);
@@ -706,19 +726,26 @@ function Index() {
       const liveOpts: RenderOpts = { step: 1, rainBudget: bufObj.rainBudget };
       const bufferTarget = bufObj.bufferTarget;
 
+      // While "Анимация" is off, pauseOffset grows exactly as fast as real time, which pins the
+      // virtual clock (and hands renderStroke a dt of 0) so every still-live stroke genuinely stops
+      // moving — not just future ones. See pauseOffsetRef above for how resuming picks back up.
+      if (!refs.animEnabled.current) pauseOffsetRef.current += dtRaw;
+      const virtualNow = now - pauseOffsetRef.current;
+      const virtualT = virtualNow / 1000;
+      const liveDt = refs.animEnabled.current ? dtRaw : 0;
+
       for (const layer of layersRef.current) {
         if (!layer.visible) continue;
         for (const s of layer.strokes) {
           if (s.points.length === 0) continue;
-          // Frozen strokes (born while "Анимация" was off) always render as if it's still the
-          // instant they were created — same t/dt/now every frame — so their pattern is painted
-          // once and stays put instead of flowing/wobbling/pulsing forever. Non-frozen strokes are
-          // unaffected, whatever the toggle's CURRENT state is — only stroke creation reads it.
+          // Frozen strokes (born while "Анимация" was off, or flattened via "Сплющить") always
+          // render as if it's still the instant they were created — same t/dt/now every frame — so
+          // their pattern is painted once and stays put instead of flowing/wobbling/pulsing forever.
           if (s.frozen) {
             if (!s.bakedCache) bakeFrozenStroke(s, w, h, s.born / 1000, 0, s.born, liveOpts);
             compositeBakedStroke(buf, s.bakedCache!);
           } else {
-            renderStroke(bufferTarget, s, w, h, t, dtRaw, now, liveOpts);
+            renderStroke(bufferTarget, s, w, h, virtualT, liveDt, virtualNow, liveOpts);
           }
         }
       }
@@ -790,7 +817,11 @@ function Index() {
       if (!state) return;
       const dtRaw = Math.min(50, now - last);
       last = now;
-      const t = now / 1000;
+      // Shares the same virtual (pausable) clock as the 2D canvas — pauseOffsetRef is advanced by
+      // the always-running 2D tick loop, so "Анимация" off freezes this view too, not just the flat one.
+      const virtualNow = now - pauseOffsetRef.current;
+      const t = virtualNow / 1000;
+      const liveDt = refs.animEnabled.current ? dtRaw : 0;
       // Rain gets a fresh full budget per layer here rather than sharing one global counter across
       // layers like the 2D loop does — layers are rendered fully independently for 3D, so there's no
       // single shared buffer to protect from over-spawning across all of them at once.
@@ -798,7 +829,7 @@ function Index() {
         const layer = layersRef.current.find(l => l.id === lm.layerId);
         if (!layer) continue;
         opts.rainBudget.left = GLOBAL_RAIN_CAP;
-        const { buf } = renderLayerIso(layer, w, h, t, dtRaw, now, opts);
+        const { buf } = renderLayerIso(layer, w, h, t, liveDt, virtualNow, opts);
         lm.imgData.data.set(buf);
         lm.ctx.putImageData(lm.imgData, 0, 0);
         lm.tex.needsUpdate = true;
@@ -875,14 +906,16 @@ function Index() {
     // the auto direction is 0, so the slider becomes the sole, absolute angle control there.
     const rainbowFlowActive = s.mode === "rainbow" && s.rainbowFlow;
     const legacySpread = rainbowFlowActive ? 360 : 0;
-    const legacyFlow = rainbowFlowActive ? (tt * (10 + s.rainbowFlowSpeed * 150)) % 360 : 0;
+    const legacyFlow = rainbowFlowActive ? (tt * (s.rainbowFlowSpeed * 150)) % 360 : 0;
     const nSeg = Math.max(1, pts.length - 1);
     const gradAutoAngle = s.mode === "gradient" ? strokeAutoAngleDeg(pts) : 0;
     const gradAngleRad = ((gradAutoAngle + s.gradientAngle) * Math.PI) / 180;
     const gradCos = Math.cos(gradAngleRad), gradSin = Math.sin(gradAngleRad);
     // Normalize the projection so the picked colors span roughly the visible canvas regardless of angle.
     const gradExtent = Math.abs(w * gradCos) + Math.abs(h * gradSin) || 1;
-    const gradTravel = tt * (0.03 + s.gradientSpeed * 0.5);
+    // No baseline drift: at gradientSpeed = 0 this is exactly 0, so the gradient holds perfectly
+    // still — a fixed stretch from one chosen color to the next — instead of always creeping.
+    const gradTravel = tt * (s.gradientSpeed * 0.5);
     const gradientHueAtXY = (x: number, y: number): number => {
       const proj = (x * gradCos + y * gradSin) / gradExtent;
       return sampleGradient(s.gradientColors, proj + gradTravel, s.gradientLongPath);
@@ -993,6 +1026,9 @@ function Index() {
       }
       return;
     }
+
+    const isMirror = s.mode === "mirror";
+    if (isMirror) target.mirrorW = w;
 
     if (s.kind === "ink") {
       // Pixelated animated line — pixel dots along smooth path with breathing thickness
@@ -1194,6 +1230,8 @@ function Index() {
         }
       }
     }
+
+    if (isMirror) target.mirrorW = undefined;
   }
 
   // PERF: build a frozen stroke's render ONCE and cache it, instead of re-running its full
@@ -1298,11 +1336,11 @@ function Index() {
   const addPoint = (x: number, y: number) => {
     const s = currentStrokeRef.current;
     if (!s) return;
-    const now = performance.now();
+    const now = vNow();
     s.points.push({ x, y, t: (now - s.born) / 1000 });
-    if (s.mode === "mirror") {
-      s.points.push({ x: canvasSize.w - x, y, t: (now - s.born) / 1000 });
-    }
+    // Mirroring is applied at paint time (see renderStroke/paint's mirrorW), not by inserting a
+    // second mirrored point into this same path — that used to make ink/ribbon zigzag across the
+    // entire canvas every other point since consecutive points are connected as one line.
     if (s.points.length > MAX_POINTS_PER_STROKE) {
       // decimate: keep every other point from the older half
       const half = Math.floor(MAX_POINTS_PER_STROKE / 2);
@@ -1318,6 +1356,11 @@ function Index() {
   };
 
   const onDown = (e: React.PointerEvent) => {
+    // The 3D overlay sits on top of this same wrapper and has its own rotation-drag handlers
+    // (on3DPointerDown etc.) — without this guard, every pointer event there also bubbles up here,
+    // stealing pointer capture from the 3D canvas and silently starting a real stroke on the hidden
+    // 2D layer underneath while the person is just trying to rotate the 3D view.
+    if (view3D) return;
     (e.currentTarget as Element).setPointerCapture(e.pointerId);
     activePointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
@@ -1373,7 +1416,7 @@ function Index() {
         // Single point, purely so the generic "empty stroke" skip-checks elsewhere don't drop this
         // fill — its actual painted area comes entirely from fillRuns, never from points/segments.
         points: [{ x: sx, y: sy, t: 0 }],
-        born: performance.now(),
+        born: vNow(),
         fillRuns: encodeMaskRLE(mask),
         fillW: w,
         fillH: h,
@@ -1404,13 +1447,14 @@ function Index() {
       gradientLongPath: refs.gradientLongPath.current,
       frozen: !refs.animEnabled.current,
       points: [],
-      born: performance.now(),
+      born: vNow(),
     };
     currentStrokeRef.current = stroke;
     layer.strokes.push(stroke);
     addPoint(x, y);
   };
   const onMove = (e: React.PointerEvent) => {
+    if (view3D) return;
     if (activePointersRef.current.has(e.pointerId)) activePointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
     if (activePointersRef.current.size >= 2 && pinchStateRef.current) {
@@ -1443,6 +1487,7 @@ function Index() {
     pointerRef.current.px = x; pointerRef.current.py = y;
   };
   const onUp = (e: React.PointerEvent) => {
+    if (view3D) return;
     activePointersRef.current.delete(e.pointerId);
     if (activePointersRef.current.size < 2) pinchStateRef.current = null;
     panDragRef.current = null;
@@ -1677,8 +1722,9 @@ function Index() {
           <button onClick={redo} disabled={!canRedo || !!recording} className="flex-1 rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/10 disabled:opacity-30">Вернуть ↷</button>
         </div>
 
-        {/* Global animation toggle — only affects strokes drawn AFTER this is flipped; strokes
-            already on the canvas keep animating (or stay static) exactly as they were born. */}
+        {/* Global animation toggle — a real pause/resume. Turning it off freezes every stroke on the
+            canvas right where it is (via the virtual clock in pauseOffsetRef) and halts new strokes
+            too; turning it back on resumes everything smoothly, with no jump. */}
         <label className="flex cursor-pointer items-center gap-2 rounded-md border border-white/10 bg-white/[0.02] px-2.5 py-1.5 text-[11px] text-white/70 select-none">
           <input
             type="checkbox"
@@ -1688,7 +1734,7 @@ function Index() {
           />
           <span>Анимация</span>
           <span className="ml-auto text-[9px] uppercase tracking-widest text-white/35">
-            {animEnabled ? "новые мазки живые" : "новые мазки статичны"}
+            {animEnabled ? "играет" : "на паузе"}
           </span>
         </label>
 
@@ -1975,6 +2021,7 @@ function Index() {
       <div
         ref={wrapRef}
         onWheel={(e) => {
+          if (view3D) return;
           if (e.ctrlKey || e.metaKey) {
             e.preventDefault();
             setZoom((z) => Math.min(6, Math.max(0.1, z * (e.deltaY < 0 ? 1.1 : 1 / 1.1))));
