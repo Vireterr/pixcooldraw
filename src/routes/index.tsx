@@ -2,7 +2,6 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { GIFEncoder, quantize, applyPalette } from "gifenc";
 import * as THREE from "three";
-import * as PIXI from "pixi.js";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -445,13 +444,6 @@ function Index() {
     buf32: Uint32Array; rainBudget: { left: number }; bufferTarget: PaintTarget;
   } | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
-  // PixiJS: `canvasRef` above stays exactly as before — the existing render loop still paints into
-  // it every frame via putImageData/getImageData, untouched. It's just no longer shown directly;
-  // instead its pixels are pushed onto a PIXI.Sprite's texture, and Pixi (WebGL) owns the on-screen
-  // canvas that lives in `pixiContainerRef`. This keeps 100% of the drawing/tool logic unchanged
-  // while moving on-screen compositing to PixiJS, per the migration plan.
-  const pixiContainerRef = useRef<HTMLDivElement>(null);
-  const pixiRef = useRef<{ app: PIXI.Application; sprite: PIXI.Sprite } | null>(null);
   const canvas3DRef = useRef<HTMLCanvasElement>(null);
   const three3DRef = useRef<{
     renderer: THREE.WebGLRenderer;
@@ -639,61 +631,6 @@ function Index() {
     c.height = canvasSize.h;
   }, [canvasSize]);
 
-  // PixiJS: create the on-screen renderer once. It owns a single Sprite whose texture wraps the
-  // existing offscreen `canvasRef` — every frame we just tell that texture "your source pixels
-  // changed" (see the render loop below) instead of re-creating anything here. Basic integration
-  // only: no scene graph, no extra Pixi objects yet, just swapping who paints pixels to the screen.
-  useEffect(() => {
-    let cancelled = false;
-    const app = new PIXI.Application();
-
-    (async () => {
-      await app.init({
-        width: canvasSize.w,
-        height: canvasSize.h,
-        backgroundAlpha: 0,
-        antialias: false,
-        resolution: 1,
-        autoDensity: false,
-      });
-      if (cancelled) {
-        app.destroy(true, { children: true });
-        return;
-      }
-      app.canvas.style.display = "block";
-      app.canvas.style.width = "100%";
-      app.canvas.style.height = "100%";
-      app.canvas.style.imageRendering = "pixelated";
-      pixiContainerRef.current?.appendChild(app.canvas);
-
-      const srcCanvas = canvasRef.current;
-      const texture = srcCanvas ? PIXI.Texture.from(srcCanvas) : PIXI.Texture.EMPTY;
-      const sprite = new PIXI.Sprite(texture);
-      app.stage.addChild(sprite);
-
-      pixiRef.current = { app, sprite };
-    })();
-
-    return () => {
-      cancelled = true;
-      if (pixiRef.current) {
-        pixiRef.current.sprite.destroy();
-        pixiRef.current.app.destroy(true, { children: true });
-        pixiRef.current = null;
-      }
-    };
-  }, []);
-
-  // Keep the Pixi renderer's size in sync with logical canvasSize (same value the offscreen canvas
-  // and the render loop's pixel buffer use).
-  useEffect(() => {
-    const p = pixiRef.current;
-    if (!p) return;
-    p.app.renderer.resize(canvasSize.w, canvasSize.h);
-    p.sprite.width = canvasSize.w;
-    p.sprite.height = canvasSize.h;
-  }, [canvasSize]);
-
   const eraseAt = useCallback((x: number, y: number, r: number) => {
     const r2 = r * r;
     const id = activeLayerIdRef.current;
@@ -789,11 +726,6 @@ function Index() {
       // Final flush: whatever was last painted into the buffer (buffer-mode strokes after the last
       // fill, or the whole frame if there was no fill at all) reaches the screen with one call.
       ctx.putImageData(bufObj.imgData, 0, 0);
-
-      // PixiJS: the offscreen canvas above just changed — mark the Sprite's texture source dirty so
-      // Pixi re-uploads it to the GPU this frame. This is the only line that actually gets the
-      // freshly-painted pixels on screen now that Pixi (not the 2D canvas) owns the visible surface.
-      pixiRef.current?.sprite.texture.source.update();
 
       raf = requestAnimationFrame(tick);
     };
@@ -1356,10 +1288,7 @@ function Index() {
 
   // === Pointer ===
   const getPoint = (e: React.PointerEvent) => {
-    // PixiJS: the offscreen canvasRef is display:none now (zero layout size), so pointer mapping
-    // uses the visible Pixi container's rect instead — same position/size the old on-screen canvas
-    // had, since pixiContainerRef is styled identically (canvasSize.w * zoom / canvasSize.h * zoom).
-    const c = pixiContainerRef.current!;
+    const c = canvasRef.current!;
     const r = c.getBoundingClientRect();
     const sx = canvasSize.w / r.width;
     const sy = canvasSize.h / r.height;
@@ -2074,16 +2003,11 @@ function Index() {
             transform: `translate(-50%, -50%) translate(${pan.x}px, ${pan.y}px)`,
           }}
         >
-          {/* PixiJS now owns the on-screen surface — this div hosts its (WebGL) canvas, sized/styled
-              exactly like the old 2D <canvas> was (same zoom-driven CSS size, pixelated scaling). */}
-          <div
-            ref={pixiContainerRef}
-            style={{ width: canvasSize.w * zoom, height: canvasSize.h * zoom }}
-            className="block overflow-hidden rounded-lg border border-white/10 bg-[#080a12] shadow-2xl"
+          <canvas
+            ref={canvasRef}
+            style={{ width: canvasSize.w * zoom, height: canvasSize.h * zoom, imageRendering: "pixelated" }}
+            className="block rounded-lg border border-white/10 bg-[#080a12] shadow-2xl"
           />
-          {/* Offscreen source buffer: unchanged drawing/tool logic still paints here every frame via
-              putImageData; PixiJS just reads its pixels into a texture (see render loop above). */}
-          <canvas ref={canvasRef} style={{ display: "none" }} />
         </div>
         <div className="pointer-events-none absolute bottom-3 right-3 flex items-center gap-1 rounded-md border border-white/10 bg-black/60 p-1 text-[11px] backdrop-blur">
           <button onClick={() => setZoom((z) => Math.max(0.1, z / 1.2))} className="pointer-events-auto rounded px-2 py-0.5 hover:bg-white/10">−</button>
