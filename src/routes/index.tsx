@@ -1,6 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { GIFEncoder, quantize, applyPalette } from "gifenc";
+import * as THREE from "three";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -71,6 +72,14 @@ interface Stroke {
   // count grows while actively drawing. Built lazily, extended as new points arrive, reset by
   // eraseAt() whenever points get removed/reindexed (see there for why).
   segCache?: { nx: number; ny: number; len: number; num: number }[];
+  // PERF (frozen strokes only): a one-time full-canvas-sized render of this stroke, built the first
+  // time it's drawn while s.frozen is true. From then on tick() blits only this cache's touched
+  // pixels instead of recomputing the stroke's animation math every frame — safe because a frozen
+  // stroke's output never changes. Invalidated (set back to null) by eraseAt() when this stroke's
+  // points change, so a partially-erased frozen stroke re-bakes instead of showing stale pixels.
+  // Never serialized — always rebuilt lazily after undo/redo since deserialized strokes are fresh
+  // objects.
+  bakedCache?: { data: Uint8ClampedArray; alpha: Uint8ClampedArray; touched: number[] } | null;
 }
 
 interface Layer {
@@ -198,11 +207,17 @@ function sampleGradient(stops: { hue: number; weight: number }[], t: number, lon
 // Exports keep using the direct-to-canvas path (mode: "ctx") since createLinearGradient etc. are
 // genuinely cheaper done natively for a one-off render — export speed was never the complaint.
 interface PaintTarget {
-  mode: "buffer" | "ctx";
+  mode: "buffer" | "ctx" | "iso";
   buf?: Uint8ClampedArray;
   bw?: number;
   bh?: number;
   ctx?: CanvasRenderingContext2D;
+  // "iso" mode only: a real per-pixel alpha channel (0-255), tracked separately because "buffer"
+  // mode's buf always carries alpha=255 as a "something was painted here" flag, not true opacity —
+  // that shortcut only works when compositing straight onto an already-opaque background. Baking a
+  // stroke in isolation starts from full transparency, so touches need real "over" compositing to
+  // combine correctly no matter how many times the same stroke paints over itself.
+  alphaBuf?: Uint8ClampedArray;
 }
 function hslToRgb(h: number, s: number, l: number): [number, number, number] {
   h = ((h % 360) + 360) % 360;
@@ -212,6 +227,19 @@ function hslToRgb(h: number, s: number, l: number): [number, number, number] {
   const a = s * Math.min(l, 1 - l);
   const f = (n: number) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
   return [Math.round(255 * f(0)), Math.round(255 * f(8)), Math.round(255 * f(4))];
+}
+// Real Porter-Duff "over" for one pixel of an isolated (non-opaque) buffer — used only while baking
+// a frozen stroke, which happens once per stroke rather than every frame, so the extra per-pixel
+// cost here is a one-time bill instead of a recurring one.
+function blendIsoPixel(buf: Uint8ClampedArray, alphaBuf: Uint8ClampedArray, idx: number, aIdx: number, r: number, g: number, b: number, srcA: number) {
+  const dstA = alphaBuf[aIdx] / 255;
+  const outA = srcA + dstA * (1 - srcA);
+  if (outA <= 0) return;
+  const ia = dstA * (1 - srcA);
+  buf[idx] = (r * srcA + buf[idx] * ia) / outA;
+  buf[idx + 1] = (g * srcA + buf[idx + 1] * ia) / outA;
+  buf[idx + 2] = (b * srcA + buf[idx + 2] * ia) / outA;
+  alphaBuf[aIdx] = outA * 255;
 }
 // Plot a solid sizeW×sizeH block at (x,y) in hue/sat%/light%/alpha — the ONE call brush code makes
 // instead of touching ctx.fillStyle/fillRect directly. Same call works for either painting mode.
@@ -229,7 +257,16 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
   const x1 = Math.min(bw, Math.floor(x) + Math.max(1, Math.round(sizeW)));
   const y1 = Math.min(bh, Math.floor(y) + Math.max(1, Math.round(sizeH)));
   if (x1 <= x0 || y1 <= y0) return;
-  const alpha = Math.min(1, a), ia = 1 - alpha;
+  const alpha = Math.min(1, a);
+  if (target.mode === "iso") {
+    const alphaBuf = target.alphaBuf!;
+    for (let yy = y0; yy < y1; yy++) {
+      let idx = (yy * bw + x0) * 4, aIdx = yy * bw + x0;
+      for (let xx = x0; xx < x1; xx++, idx += 4, aIdx++) blendIsoPixel(buf, alphaBuf, idx, aIdx, r, g, b, alpha);
+    }
+    return;
+  }
+  const ia = 1 - alpha;
   for (let yy = y0; yy < y1; yy++) {
     let idx = (yy * bw + x0) * 4;
     for (let xx = x0; xx < x1; xx++, idx += 4) {
@@ -407,6 +444,17 @@ function Index() {
     buf32: Uint32Array; rainBudget: { left: number }; bufferTarget: PaintTarget;
   } | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const canvas3DRef = useRef<HTMLCanvasElement>(null);
+  const three3DRef = useRef<{
+    renderer: THREE.WebGLRenderer;
+    scene: THREE.Scene;
+    camera: THREE.PerspectiveCamera;
+    group: THREE.Group;
+    layers: { layerId: number; mesh: THREE.Mesh; tex: THREE.CanvasTexture; canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; imgData: ImageData }[];
+    raf: number;
+    rotX: number; rotY: number;
+    dragging: boolean; lastX: number; lastY: number;
+  } | null>(null);
 
   // canvas size config
   const [canvasSize, setCanvasSize] = useState<{ w: number; h: number }>({ w: 1280, h: 800 });
@@ -458,6 +506,21 @@ function Index() {
   const canRedo = historyIdxRef.current < historyRef.current.length - 1;
   void historyVer;
 
+  // "Сплющить" — freezes every currently-still-animating stroke at exactly how it looks right now.
+  // Unlike the "Анимация" toggle (which only decides how NEW strokes are born), this reaches back
+  // and stops existing strokes too — the direct fix for old animated gradient fills that are still
+  // costing a full recompute every frame just to keep looking the same as last frame.
+  const flattenAll = useCallback(() => {
+    const nowMs = performance.now();
+    let changed = false;
+    for (const layer of layersRef.current) {
+      for (const s of layer.strokes) {
+        if (!s.frozen) { s.frozen = true; s.born = nowMs; s.bakedCache = null; changed = true; }
+      }
+    }
+    if (changed) pushHistory();
+  }, [pushHistory]);
+
   const currentStrokeRef = useRef<Stroke | null>(null);
   const pointerRef = useRef({ x: 0, y: 0, down: false, px: 0, py: 0 });
 
@@ -488,6 +551,8 @@ function Index() {
   const [fillContiguous, setFillContiguous] = useState(true);
   const [fillTolerance, setFillTolerance] = useState(32);
   const [recording, setRecording] = useState<null | "gif" | "mp4">(null);
+  // "Layers in depth" 3D preview — off by default, doesn't affect the normal 2D editor at all.
+  const [view3D, setView3D] = useState(false);
   const [recordProgress, setRecordProgress] = useState(0);
   const [gifQ, setGifQ] = useState<GifQ>("medium");
   const [mp4Q, setMp4Q] = useState<Mp4Q>("medium");
@@ -579,7 +644,7 @@ function Index() {
       });
       // Erasing removes points from arbitrary positions, so cached segment indices no longer line
       // up with the (now shorter/reindexed) points array — drop the cache, it'll rebuild lazily.
-      if (s.points.length !== before) s.segCache = undefined;
+      if (s.points.length !== before) { s.segCache = undefined; s.bakedCache = null; }
       if (s.rain) s.rain = s.rain.filter(i => (i.x - x) ** 2 + (i.y - y) ** 2 > r2);
     }
     layer.strokes = layer.strokes.filter(s => s.points.length > 0);
@@ -649,10 +714,12 @@ function Index() {
           // instant they were created — same t/dt/now every frame — so their pattern is painted
           // once and stays put instead of flowing/wobbling/pulsing forever. Non-frozen strokes are
           // unaffected, whatever the toggle's CURRENT state is — only stroke creation reads it.
-          const effT = s.frozen ? s.born / 1000 : t;
-          const effDt = s.frozen ? 0 : dtRaw;
-          const effNow = s.frozen ? s.born : now;
-          renderStroke(bufferTarget, s, w, h, effT, effDt, effNow, liveOpts);
+          if (s.frozen) {
+            if (!s.bakedCache) bakeFrozenStroke(s, w, h, s.born / 1000, 0, s.born, liveOpts);
+            compositeBakedStroke(buf, s.bakedCache!);
+          } else {
+            renderStroke(bufferTarget, s, w, h, t, dtRaw, now, liveOpts);
+          }
         }
       }
 
@@ -665,6 +732,128 @@ function Index() {
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
   }, [canvasSize]);
+
+  // === 3D "layers in depth" preview ===
+  // Builds one textured plane per visible layer, stacked along Z, and keeps every plane's texture
+  // live-updated every frame so animated brushes keep flowing/pulsing in 3D too — genuinely more
+  // expensive than the flat 2D editor (each layer needs its OWN full render pass now, instead of all
+  // layers sharing one combined pass), which is why this only runs while the 3D view is open.
+  useEffect(() => {
+    if (!view3D) return;
+    const canvasEl = canvas3DRef.current;
+    const parent = canvasEl?.parentElement;
+    if (!canvasEl || !parent) return;
+
+    const w = canvasSize.w, h = canvasSize.h;
+    const renderer = new THREE.WebGLRenderer({ canvas: canvasEl, antialias: true, alpha: true });
+    const setSize = () => renderer.setSize(parent.clientWidth, parent.clientHeight, false);
+    setSize();
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, parent.clientWidth / Math.max(1, parent.clientHeight), 0.1, 100);
+    camera.position.set(0, 0, 6);
+
+    const group = new THREE.Group();
+    scene.add(group);
+
+    const aspect = w / h;
+    const planeW = 3.4, planeH = planeW / aspect;
+    const visibleLayers = layersRef.current.filter(l => l.visible);
+    const spacing = 0.22;
+    const layerMeshes: NonNullable<typeof three3DRef.current>["layers"] = [];
+
+    visibleLayers.forEach((layer, i) => {
+      const c = document.createElement("canvas");
+      c.width = w; c.height = h;
+      const cctx = c.getContext("2d")!;
+      const imgData = cctx.createImageData(w, h);
+      const tex = new THREE.CanvasTexture(c);
+      const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, depthWrite: false });
+      const geo = new THREE.PlaneGeometry(planeW, planeH);
+      const mesh = new THREE.Mesh(geo, mat);
+      // Front-to-back stacking order matches the layer list (later layers drawn on top in 2D →
+      // placed closer to the camera here), centered on the group's own origin.
+      mesh.position.z = (visibleLayers.length - 1 - i) * spacing - ((visibleLayers.length - 1) * spacing) / 2;
+      group.add(mesh);
+      layerMeshes.push({ layerId: layer.id, mesh, tex, canvas: c, ctx: cctx, imgData });
+    });
+
+    three3DRef.current = { renderer, scene, camera, group, layers: layerMeshes, raf: 0, rotX: -0.2, rotY: 0.5, dragging: false, lastX: 0, lastY: 0 };
+    group.rotation.x = -0.2;
+    group.rotation.y = 0.5;
+
+    let last = performance.now();
+    const opts: RenderOpts = { step: 1, rainBudget: { left: GLOBAL_RAIN_CAP } };
+    const tick3D = (now: number) => {
+      const state = three3DRef.current;
+      if (!state) return;
+      const dtRaw = Math.min(50, now - last);
+      last = now;
+      const t = now / 1000;
+      // Rain gets a fresh full budget per layer here rather than sharing one global counter across
+      // layers like the 2D loop does — layers are rendered fully independently for 3D, so there's no
+      // single shared buffer to protect from over-spawning across all of them at once.
+      for (const lm of state.layers) {
+        const layer = layersRef.current.find(l => l.id === lm.layerId);
+        if (!layer) continue;
+        opts.rainBudget.left = GLOBAL_RAIN_CAP;
+        const { buf } = renderLayerIso(layer, w, h, t, dtRaw, now, opts);
+        lm.imgData.data.set(buf);
+        lm.ctx.putImageData(lm.imgData, 0, 0);
+        lm.tex.needsUpdate = true;
+      }
+      group.rotation.x = state.rotX;
+      group.rotation.y = state.rotY;
+      renderer.render(scene, camera);
+      state.raf = requestAnimationFrame(tick3D);
+    };
+    three3DRef.current.raf = requestAnimationFrame(tick3D);
+
+    const onResize = () => {
+      setSize();
+      camera.aspect = parent.clientWidth / Math.max(1, parent.clientHeight);
+      camera.updateProjectionMatrix();
+    };
+    window.addEventListener("resize", onResize);
+
+    return () => {
+      window.removeEventListener("resize", onResize);
+      const state = three3DRef.current;
+      if (state) {
+        cancelAnimationFrame(state.raf);
+        for (const lm of state.layers) {
+          lm.tex.dispose();
+          (lm.mesh.material as THREE.Material).dispose();
+          lm.mesh.geometry.dispose();
+        }
+        state.renderer.dispose();
+      }
+      three3DRef.current = null;
+    };
+  }, [view3D, canvasSize]);
+
+  const on3DPointerDown = (e: React.PointerEvent) => {
+    const st = three3DRef.current;
+    if (!st) return;
+    st.dragging = true;
+    st.lastX = e.clientX;
+    st.lastY = e.clientY;
+    (e.currentTarget as Element).setPointerCapture(e.pointerId);
+  };
+  const on3DPointerMove = (e: React.PointerEvent) => {
+    const st = three3DRef.current;
+    if (!st || !st.dragging) return;
+    const dx = e.clientX - st.lastX, dy = e.clientY - st.lastY;
+    st.lastX = e.clientX;
+    st.lastY = e.clientY;
+    st.rotY += dx * 0.008;
+    st.rotX = Math.max(-1.2, Math.min(1.2, st.rotX + dy * 0.008));
+  };
+  const on3DPointerUp = () => {
+    const st = three3DRef.current;
+    if (st) st.dragging = false;
+  };
 
   // === Stroke renderer ===
   function renderStroke(target: PaintTarget, s: Stroke, w: number, h: number, t: number, dtRaw: number, now: number, opts: RenderOpts) {
@@ -746,6 +935,21 @@ function Index() {
               buf[idx + 3] = 255;
             }
           }
+        } else if (target.mode === "iso") {
+          // Bake path — runs once per frozen fill instead of every frame, so real per-pixel alpha
+          // compositing (needed to seed the isolated buffer correctly) is affordable here even
+          // though the "buffer" fast path above skips it as unnecessary overhead for live redraw.
+          const buf = target.buf!, alphaBuf = target.alphaBuf!;
+          let mi = 0;
+          for (let yy = 0; yy < bh; yy++) {
+            for (let xx = 0; xx < bw; xx++, mi++) {
+              if (!mask[mi]) continue;
+              const proj = (xx * gradCos + yy * gradSin) / gradExtent + gradTravel;
+              const norm = ((proj % 1) + 1) % 1;
+              const [r, g, b] = ramp[Math.min(RAMP - 1, Math.floor(norm * RAMP))];
+              blendIsoPixel(buf, alphaBuf, mi * 4, mi, r, g, b, alpha);
+            }
+          }
         } else {
           // Export path — runs far less often than live playback, fine to go through the shared
           // paint() helper at full per-pixel precision.
@@ -771,6 +975,13 @@ function Index() {
             buf[idx + 1] = g * alpha + buf[idx + 1] * ia;
             buf[idx + 2] = b * alpha + buf[idx + 2] * ia;
             buf[idx + 3] = 255;
+          }
+        } else if (target.mode === "iso") {
+          const [r, g, b] = hslToRgb(hueF, 85, 55);
+          const buf = target.buf!, alphaBuf = target.alphaBuf!;
+          for (let mi = 0; mi < mask.length; mi++) {
+            if (!mask[mi]) continue;
+            blendIsoPixel(buf, alphaBuf, mi * 4, mi, r, g, b, alpha);
           }
         } else {
           for (let mi = 0; mi < mask.length; mi++) {
@@ -983,6 +1194,65 @@ function Index() {
         }
       }
     }
+  }
+
+  // PERF: build a frozen stroke's render ONCE and cache it, instead of re-running its full
+  // animation math (trig, noise, per-particle physics, per-pixel gradient sampling for fills) every
+  // single frame forever for a result that — because it's frozen — never changes. Safe specifically
+  // because renderStroke(frozenStroke, ...) is called with the SAME fixed effT/effDt/effNow every
+  // time (see tick()), making it a pure, idempotent function of the stroke's own data: baking once
+  // and blitting thereafter is indistinguishable from recomputing every frame, pixel for pixel.
+  function bakeFrozenStroke(s: Stroke, w: number, h: number, effT: number, effDt: number, effNow: number, opts: RenderOpts) {
+    const data = new Uint8ClampedArray(w * h * 4);
+    const alphaBuf = new Uint8ClampedArray(w * h);
+    const isoTarget: PaintTarget = { mode: "iso", buf: data, alphaBuf, bw: w, bh: h };
+    renderStroke(isoTarget, s, w, h, effT, effDt, effNow, opts);
+    const touched: number[] = [];
+    for (let i = 0; i < alphaBuf.length; i++) if (alphaBuf[i] > 0) touched.push(i);
+    s.bakedCache = { data, alpha: alphaBuf, touched };
+  }
+  // Composite a stroke's baked cache onto the live (always-opaque) frame buffer — only touches the
+  // pixels the stroke actually painted, so cost tracks the stroke's footprint, not canvas size.
+  function compositeBakedStroke(buf: Uint8ClampedArray, cache: NonNullable<Stroke["bakedCache"]>) {
+    const { data, alpha, touched } = cache;
+    for (let k = 0; k < touched.length; k++) {
+      const mi = touched[k], idx = mi * 4;
+      const a = alpha[mi] / 255, ia = 1 - a;
+      buf[idx] = data[idx] * a + buf[idx] * ia;
+      buf[idx + 1] = data[idx + 1] * a + buf[idx + 1] * ia;
+      buf[idx + 2] = data[idx + 2] * a + buf[idx + 2] * ia;
+      buf[idx + 3] = 255;
+    }
+  }
+  // Same idea, but onto a still-transparent destination (the per-layer 3D preview buffers) — needs
+  // real "over" compositing against whatever alpha is already there, not the opaque shortcut above.
+  function compositeBakedStrokeIso(buf: Uint8ClampedArray, alphaBuf: Uint8ClampedArray, cache: NonNullable<Stroke["bakedCache"]>) {
+    const { data, alpha, touched } = cache;
+    for (let k = 0; k < touched.length; k++) {
+      const mi = touched[k], idx = mi * 4;
+      blendIsoPixel(buf, alphaBuf, idx, mi, data[idx], data[idx + 1], data[idx + 2], alpha[mi] / 255);
+    }
+  }
+
+  // Renders ONE layer, alone, onto a transparent RGBA buffer — used to build each layer's own
+  // texture for the 3D "layers in depth" view. The normal 2D editor never needs this (it composites
+  // every layer straight into one shared opaque buffer, cheaper, but can't be pulled back apart into
+  // separate planes). Frozen strokes still use their bake cache, just composited with real alpha via
+  // compositeBakedStrokeIso instead of the opaque-destination shortcut the main loop uses.
+  function renderLayerIso(layer: Layer, w: number, h: number, t: number, dtRaw: number, now: number, opts: RenderOpts): { buf: Uint8ClampedArray; alphaBuf: Uint8ClampedArray } {
+    const buf = new Uint8ClampedArray(w * h * 4);
+    const alphaBuf = new Uint8ClampedArray(w * h);
+    const target: PaintTarget = { mode: "iso", buf, alphaBuf, bw: w, bh: h };
+    for (const s of layer.strokes) {
+      if (s.points.length === 0) continue;
+      if (s.frozen) {
+        if (!s.bakedCache) bakeFrozenStroke(s, w, h, s.born / 1000, 0, s.born, opts);
+        compositeBakedStrokeIso(buf, alphaBuf, s.bakedCache!);
+      } else {
+        renderStroke(target, s, w, h, t, dtRaw, now, opts);
+      }
+    }
+    return { buf, alphaBuf };
   }
 
   function drawSmoothPath(ctx: CanvasRenderingContext2D, pts: StrokePoint[], phase: number, wobble: number, noiseAmt: number) {
@@ -1422,6 +1692,24 @@ function Index() {
           </span>
         </label>
 
+        <button
+          onClick={flattenAll}
+          disabled={!!recording}
+          className="w-full rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/10 disabled:opacity-30"
+          title="Замораживает все ещё анимирующиеся мазки в их текущем виде — дальше они ничего не стоят каждый кадр"
+        >
+          ❄ Сплющить (заморозить всё как есть)
+        </button>
+
+        <button
+          onClick={() => setView3D(true)}
+          disabled={!!recording}
+          className="w-full rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/10 disabled:opacity-30"
+          title="Показывает слои как стопку карточек в 3D-пространстве, которую можно покрутить"
+        >
+          🧊 3D вид (слои в глубину)
+        </button>
+
         {/* New canvas */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Холст</div>
@@ -1729,6 +2017,28 @@ function Index() {
         <div className="pointer-events-none absolute bottom-3 left-3 rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[9px] uppercase tracking-widest text-white/40 backdrop-blur">
           Пробел+перетаскивание или два пальца — панорама
         </div>
+
+        {view3D && (
+          <div className="absolute inset-0 z-10 bg-[#0a0b12]">
+            <canvas
+              ref={canvas3DRef}
+              className="h-full w-full touch-none"
+              onPointerDown={on3DPointerDown}
+              onPointerMove={on3DPointerMove}
+              onPointerUp={on3DPointerUp}
+              onPointerCancel={on3DPointerUp}
+            />
+            <button
+              onClick={() => setView3D(false)}
+              className="absolute right-3 top-3 rounded-md border border-white/10 bg-black/60 px-3 py-1.5 text-[11px] tracking-wider backdrop-blur transition hover:bg-white/10"
+            >
+              ✕ Закрыть 3D
+            </button>
+            <div className="pointer-events-none absolute bottom-3 left-3 rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[9px] uppercase tracking-widest text-white/40 backdrop-blur">
+              Перетаскивание — вращение
+            </div>
+          </div>
+        )}
       </div>
     </main>
   );
