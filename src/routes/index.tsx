@@ -22,6 +22,9 @@ type BrushKind =
   | "pixelRain"
   | "pixelDither"
   | "pixelGlitch"
+  | "web"
+  | "mosaic"
+  | "embers"
   | "fill"
   | "eraser";
 
@@ -64,10 +67,16 @@ interface Stroke {
   // transient per-brush buckets (not serialized in history)
   ink?: { phase: number };
   rain?: { x: number; y: number; vy: number; hue: number; len: number; seed: number }[];
+  embers?: { x: number; y: number; hue: number; seed: number; period: number }[];
   // Lazily decoded from fillRuns the first time this stroke is rendered (same lazy/cached pattern
   // as segCache below) — decoding a run-length list into a full pixel mask every single animation
   // frame would be wasted work since fillRuns never changes after the fill is made.
   fillMaskCache?: Uint8Array;
+  // PERF: the tightest rectangle actually covered by the mask, computed once alongside
+  // fillMaskCache (not serialized, rebuilt the same lazy way). A fill's mask is almost always a
+  // small fraction of the full canvas, so every per-frame render loop below scans just this
+  // rectangle instead of every pixel on the canvas.
+  fillBBox?: { x0: number; y0: number; x1: number; y1: number };
   // PERF: cached per-segment geometry for ink/ribbon (nx,ny = unit normal, len = segment length,
   // num = interpolation steps) — these never change once a segment is finalized, only the point
   // count grows while actively drawing. Built lazily, extended as new points arrive, reset by
@@ -115,6 +124,9 @@ const BRUSHES: { id: BrushKind; label: string }[] = [
   { id: "pixelRain", label: "Пикс. дождь" },
   { id: "pixelDither", label: "Дизеринг" },
   { id: "pixelGlitch", label: "Глитч" },
+  { id: "web", label: "Паутина" },
+  { id: "mosaic", label: "Мозаика" },
+  { id: "embers", label: "Угли" },
   { id: "fill", label: "Заливка" },
   { id: "eraser", label: "Ластик" },
 ];
@@ -964,8 +976,23 @@ function Index() {
       // Canvas was resized since this fill was made — the mask no longer lines up with pixel
       // positions, so skip rather than smear stale data across a differently-sized canvas.
       if (s.fillW !== bw || s.fillH !== bh) return;
-      if (!s.fillMaskCache) s.fillMaskCache = decodeMaskRLE(s.fillRuns!, bw * bh);
+      if (!s.fillMaskCache) {
+        s.fillMaskCache = decodeMaskRLE(s.fillRuns!, bw * bh);
+        let bx0 = bw, by0 = bh, bx1 = -1, by1 = -1;
+        const m = s.fillMaskCache;
+        for (let yy = 0; yy < bh; yy++) {
+          for (let xx = 0; xx < bw; xx++) {
+            if (!m[yy * bw + xx]) continue;
+            if (xx < bx0) bx0 = xx;
+            if (xx > bx1) bx1 = xx;
+            if (yy < by0) by0 = yy;
+            if (yy > by1) by1 = yy;
+          }
+        }
+        s.fillBBox = bx1 < bx0 ? { x0: 0, y0: 0, x1: 0, y1: 0 } : { x0: bx0, y0: by0, x1: bx1 + 1, y1: by1 + 1 };
+      }
       const mask = s.fillMaskCache;
+      const { x0: bx0, y0: by0, x1: bx1, y1: by1 } = s.fillBBox!;
       const alpha = Math.min(1, 0.3 + s.intensity * 0.8) * modePulse;
 
       if (s.mode === "gradient") {
@@ -981,9 +1008,9 @@ function Index() {
         if (target.mode === "buffer") {
           const buf = target.buf!;
           const ia = 1 - alpha;
-          let mi = 0;
-          for (let yy = 0; yy < bh; yy++) {
-            for (let xx = 0; xx < bw; xx++, mi++) {
+          for (let yy = by0; yy < by1; yy++) {
+            let mi = yy * bw + bx0;
+            for (let xx = bx0; xx < bx1; xx++, mi++) {
               if (!mask[mi]) continue;
               const proj = ((xx * gradCos + yy * gradSin) / gradExtent) * s.gradientScale + gradTravel;
               const norm = ((proj % 1) + 1) % 1;
@@ -1000,9 +1027,9 @@ function Index() {
           // compositing (needed to seed the isolated buffer correctly) is affordable here even
           // though the "buffer" fast path above skips it as unnecessary overhead for live redraw.
           const buf = target.buf!, alphaBuf = target.alphaBuf!;
-          let mi = 0;
-          for (let yy = 0; yy < bh; yy++) {
-            for (let xx = 0; xx < bw; xx++, mi++) {
+          for (let yy = by0; yy < by1; yy++) {
+            let mi = yy * bw + bx0;
+            for (let xx = bx0; xx < bx1; xx++, mi++) {
               if (!mask[mi]) continue;
               const proj = ((xx * gradCos + yy * gradSin) / gradExtent) * s.gradientScale + gradTravel;
               const norm = ((proj % 1) + 1) % 1;
@@ -1013,8 +1040,8 @@ function Index() {
         } else {
           // Export path — runs far less often than live playback, fine to go through the shared
           // paint() helper at full per-pixel precision.
-          for (let yy = 0; yy < bh; yy++) {
-            for (let xx = 0; xx < bw; xx++) {
+          for (let yy = by0; yy < by1; yy++) {
+            for (let xx = bx0; xx < bx1; xx++) {
               if (!mask[yy * bw + xx]) continue;
               paint(target, xx, yy, 1, 1, gradientHueAtXY(xx, yy), 85, 55, alpha);
             }
@@ -1028,26 +1055,33 @@ function Index() {
           const [r, g, b] = getHslRgb(hueF, 85, 55);
           const buf = target.buf!;
           const ia = 1 - alpha;
-          for (let mi = 0; mi < mask.length; mi++) {
-            if (!mask[mi]) continue;
-            const idx = mi * 4;
-            buf[idx] = r * alpha + buf[idx] * ia;
-            buf[idx + 1] = g * alpha + buf[idx + 1] * ia;
-            buf[idx + 2] = b * alpha + buf[idx + 2] * ia;
-            buf[idx + 3] = 255;
+          for (let yy = by0; yy < by1; yy++) {
+            let mi = yy * bw + bx0;
+            for (let xx = bx0; xx < bx1; xx++, mi++) {
+              if (!mask[mi]) continue;
+              const idx = mi * 4;
+              buf[idx] = r * alpha + buf[idx] * ia;
+              buf[idx + 1] = g * alpha + buf[idx + 1] * ia;
+              buf[idx + 2] = b * alpha + buf[idx + 2] * ia;
+              buf[idx + 3] = 255;
+            }
           }
         } else if (target.mode === "iso") {
           const [r, g, b] = getHslRgb(hueF, 85, 55);
           const buf = target.buf!, alphaBuf = target.alphaBuf!;
-          for (let mi = 0; mi < mask.length; mi++) {
-            if (!mask[mi]) continue;
-            blendIsoPixel(buf, alphaBuf, mi * 4, mi, r, g, b, alpha);
+          for (let yy = by0; yy < by1; yy++) {
+            let mi = yy * bw + bx0;
+            for (let xx = bx0; xx < bx1; xx++, mi++) {
+              if (!mask[mi]) continue;
+              blendIsoPixel(buf, alphaBuf, mi * 4, mi, r, g, b, alpha);
+            }
           }
         } else {
-          for (let mi = 0; mi < mask.length; mi++) {
-            if (!mask[mi]) continue;
-            const xx = mi % bw, yy = (mi - xx) / bw;
-            paint(target, xx, yy, 1, 1, hueF, 85, 55, alpha);
+          for (let yy = by0; yy < by1; yy++) {
+            for (let xx = bx0; xx < bx1; xx++) {
+              if (!mask[yy * bw + xx]) continue;
+              paint(target, xx, yy, 1, 1, hueF, 85, 55, alpha);
+            }
           }
         }
       }
@@ -1241,17 +1275,28 @@ function Index() {
     else if (s.kind === "pixelGlitch") {
       const grid = Math.max(2, Math.round(s.size / 6));
       const stepPts = Math.max(1, Math.floor(pts.length / 30));
+      // Was always laid out as horizontal bars (slices stacked in Y, each extending along X) no
+      // matter which way the stroke was drawn — a single fixed "pose". Slices now stack along the
+      // LOCAL NORMAL of the path (perpendicular to the direction you're moving) and each slice
+      // extends along the LOCAL TANGENT (parallel to that direction), using the same per-segment
+      // direction data ink/ribbon already cache. For a stroke drawn left-to-right this reduces to
+      // exactly the old horizontal layout — it's the same shape, just rotated to follow the mazok.
+      const segs = getSegCache(s, pts, grid);
       for (let pi = 0; pi < pts.length; pi += stepPts) {
         const p = pts[pi];
         const hueG = hueAt(pi);
         const radius = s.size * (0.8 + s.dynamics * 1.5);
         const slices = 3 + Math.floor(s.density * 8);
+        const seg = segs[Math.min(pi, segs.length - 1)];
+        const nx = seg ? seg.nx : 0, ny = seg ? seg.ny : 1;
+        const tx = ny, ty = -nx; // tangent = normal rotated 90°
         for (let i = 0; i < slices; i++) {
           const yOff = (i / slices - 0.5) * radius * 2;
           const shift = (hash(Math.floor(tt * 8) + i + p.t) * 2) * s.size * (0.3 + s.noise * 2);
           const widthLine = radius * 2 * (0.6 + Math.random() * 0.4);
-          const x0 = p.x - widthLine / 2 + shift;
-          const y0 = Math.round((p.y + yOff) / grid) * grid;
+          const baseX = p.x + nx * yOff, baseY = p.y + ny * yOff;
+          const startX = baseX - tx * (widthLine / 2) + tx * shift;
+          const startY = baseY - ty * (widthLine / 2) + ty * shift;
           const offs = [-grid, 0, grid];
           let hues: number[];
           if (s.mode === "gradient") {
@@ -1271,10 +1316,102 @@ function Index() {
           for (let c2 = 0; c2 < 3; c2++) {
             for (let xb = 0; xb < widthLine; xb += grid) {
               if (Math.random() > 0.4 + s.intensity * 0.5) continue;
-              paint(target, Math.round((x0 + xb + offs[c2]) / grid) * grid, y0, grid, grid, hues[c2], 100, 55, alphaMul * 0.55);
+              const off = xb + offs[c2];
+              const px = startX + tx * off, py = startY + ty * off;
+              paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hues[c2], 100, 55, alphaMul * 0.55);
             }
           }
         }
+      }
+    }
+
+    else if (s.kind === "web") {
+      // Connects sampled points to their nearby OTHER points (not just the next one along the
+      // path) — a network of thin fading lines instead of one continuous stroke. Only checked
+      // against a coarse sample of the path (not every raw point) to keep the pairwise check cheap.
+      const stepPts = Math.max(1, Math.floor(pts.length / 26));
+      const grid = Math.max(2, Math.round(s.size / 10));
+      const radius = s.size * (2 + s.dynamics * 4);
+      // Slow shared "breathing" brightness so the whole web glimmers gently instead of sitting flat.
+      const pulse = 0.6 + 0.4 * Math.sin(tt * (1 + s.speed * 3));
+      const sample: { x: number; y: number; i: number }[] = [];
+      for (let pi = 0; pi < pts.length; pi += stepPts) sample.push({ x: pts[pi].x, y: pts[pi].y, i: pi });
+      for (let a = 0; a < sample.length; a++) {
+        for (let b = a + 1; b < sample.length; b++) {
+          const dx = sample[b].x - sample[a].x, dy = sample[b].y - sample[a].y;
+          const dist = Math.hypot(dx, dy);
+          if (dist > radius || dist < 1) continue;
+          const steps = Math.max(1, Math.floor(dist / grid));
+          const hueW = s.mode === "gradient" ? gradHueRampAt(((sample[a].x * gradCos + sample[a].y * gradSin) / gradExtent) * s.gradientScale + gradTravel) : hueAt(sample[a].i);
+          const fade = (1 - dist / radius) * pulse * (0.3 + s.intensity * 0.7);
+          for (let k = 0; k <= steps; k++) {
+            const fx = sample[a].x + dx * (k / steps), fy = sample[a].y + dy * (k / steps);
+            paint(target, Math.round(fx / grid) * grid, Math.round(fy / grid) * grid, grid, grid, hueW, 80, 60, alphaMul * fade * 0.5);
+          }
+        }
+      }
+    }
+
+    else if (s.kind === "mosaic") {
+      // Same "reveal by threshold" idea as Дизеринг, but the block size varies per sampled point
+      // (1x/2x/3x the base grid, picked from the noise table so it stays the same tile size for
+      // that point every frame instead of reshuffling) instead of one uniform cell size — reads as
+      // an irregular mosaic of tile sizes rather than a single fine grid.
+      const baseGrid = Math.max(3, Math.round(s.size / 4));
+      const stepPts = Math.max(1, Math.floor(pts.length / 40));
+      const radius = s.size * (1 + s.dynamics * 1.5);
+      const coverage = 0.2 + s.density * 0.8;
+      const sweep = 0.5 + 0.22 * Math.sin(tt * (0.35 + s.speed * 1.2) * Math.PI * 2);
+      for (let pi = 0; pi < pts.length; pi += stepPts) {
+        const p = pts[pi];
+        const hueM = hueAt(pi);
+        const sizeClass = noiseAt(pi * 131 + Math.floor(p.x) * 7 + Math.floor(p.y) * 13);
+        const grid = baseGrid * (sizeClass > 0.5 ? 3 : sizeClass > 0 ? 2 : 1);
+        const cx = Math.round(p.x / grid) * grid, cy = Math.round(p.y / grid) * grid;
+        const cellsAcross = Math.max(1, Math.ceil(radius / grid));
+        for (let gy = -cellsAcross; gy <= cellsAcross; gy++) {
+          for (let gx = -cellsAcross; gx <= cellsAcross; gx++) {
+            const wx = cx + gx * grid, wy = cy + gy * grid;
+            const dist = Math.hypot(wx - p.x, wy - p.y) / radius;
+            if (dist > 1) continue;
+            const grain = noiseAt(Math.round(wx / grid) * 7 + Math.round(wy / grid) * 13);
+            const threshold = (sweep + grain * s.noise * 0.4) * coverage;
+            if (dist > threshold) continue;
+            const lit = 42 + (1 - dist) * 26;
+            paint(target, wx, wy, grid, grid, hueM, 90, lit, alphaMul * (1 - dist));
+          }
+        }
+      }
+    }
+
+    else if (s.kind === "embers") {
+      // Roughly stationary glowing patches (unlike Пикс. дождь, which falls and despawns) — each
+      // one holds its position and just breathes brightness on its own independent slow cycle, so
+      // the patches flare and dim out of sync with each other like real smoldering embers instead
+      // of pulsing together. Shares the same global rain budget so a scene with lots of live rain
+      // AND embers still can't spawn unbounded particles between them.
+      const grid = Math.max(3, Math.round(s.size / 4));
+      const currentCount = s.embers?.length ?? 0;
+      const wantCount = Math.floor(8 + s.density * 60);
+      const targetCount = Math.min(wantCount, currentCount + Math.max(0, opts.rainBudget.left));
+      if (!s.embers) s.embers = [];
+      while (s.embers.length < targetCount && opts.rainBudget.left > 0) {
+        const idx = Math.floor(Math.random() * pts.length);
+        const p = pts[idx];
+        s.embers.push({
+          x: Math.round(p.x / grid) * grid + (Math.random() - 0.5) * s.size,
+          y: Math.round(p.y / grid) * grid + (Math.random() - 0.5) * s.size,
+          hue: s.mode === "gradient" ? gradientHueAtXY(p.x, p.y) : s.hue + (Math.random() - 0.5) * 30,
+          seed: Math.random() * 1000,
+          period: 1.2 + Math.random() * 2.5,
+        });
+        opts.rainBudget.left--;
+      }
+      for (const e of s.embers) {
+        const glow = 0.5 + 0.5 * Math.sin((tt * 2 * Math.PI) / e.period + e.seed);
+        const lit = 20 + glow * (30 + s.intensity * 20);
+        const hueE = s.mode === "gradient" ? gradientHueAtXY(e.x, e.y) : (e.hue + modeHueShift) % 360;
+        paint(target, Math.round(e.x / grid) * grid, Math.round(e.y / grid) * grid, grid, grid, hueE, 85, lit, alphaMul * (0.3 + glow * 0.7));
       }
     }
   }
