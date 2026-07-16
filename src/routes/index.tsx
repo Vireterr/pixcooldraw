@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { GIFEncoder, quantize, applyPalette } from "gifenc";
-
+import * as THREE from "three";
 
 export const Route = createFileRoute("/")({
   head: () => ({
