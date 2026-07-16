@@ -43,11 +43,9 @@ interface Stroke {
   rainbowFlow: boolean;
   rainbowFlowSpeed: number;
   gradientSpeed: number;
+  gradientScale: number;
   gradientColors: { hue: number; weight: number }[];
   gradientAngle: number;
-  // false = shortest hue-wheel arc between adjacent stops (default), true = the long way around
-  // (passes through every intervening hue). Set once at stroke creation, like the other params.
-  gradientLongPath: boolean;
   // Set once when the stroke is created from the "Анимация" toggle's state at that moment — frozen
   // strokes render with time locked to their birth instant, so they paint once and never animate
   // again. Toggling the button later never touches strokes that already exist (see tick()/onDown()).
@@ -77,11 +75,14 @@ interface Stroke {
   // PERF (frozen strokes only): a one-time full-canvas-sized render of this stroke, built the first
   // time it's drawn while s.frozen is true. From then on tick() blits only this cache's touched
   // pixels instead of recomputing the stroke's animation math every frame — safe because a frozen
-  // stroke's output never changes. Invalidated (set back to null) by eraseAt() when this stroke's
-  // points change, so a partially-erased frozen stroke re-bakes instead of showing stale pixels.
-  // Never serialized — always rebuilt lazily after undo/redo since deserialized strokes are fresh
-  // objects.
-  bakedCache?: { data: Uint8ClampedArray; alpha: Uint8ClampedArray; touched: number[] } | null;
+  // stroke's output never changes ONCE ITS POINTS STOP GROWING. Invalidated (set back to null) by
+  // eraseAt() when this stroke's points change, so a partially-erased frozen stroke re-bakes instead
+  // of showing stale pixels. Also carries pointCount so the bake/composite call sites can detect a
+  // still-in-progress frozen stroke (points still being added while the pointer drags) and rebuild
+  // instead of freezing on whatever partial path existed at the very first animation frame after
+  // the stroke was born. Never serialized — always rebuilt lazily after undo/redo since deserialized
+  // strokes are fresh objects.
+  bakedCache?: { data: Uint8ClampedArray; alpha: Uint8ClampedArray; touched: number[]; pointCount: number } | null;
 }
 
 interface Layer {
@@ -89,6 +90,21 @@ interface Layer {
   name: string;
   visible: boolean;
   strokes: Stroke[];
+  // Imported raster (PNG/JPG/GIF — GIF only its first frame, since decoding it is just an <img>
+  // draw, not a real animated-GIF decoder). Stored as a data URL (serializable, survives
+  // undo/redo/JSON history) so re-importing isn't needed after an undo.
+  image?: { url: string } | null;
+  // Transient (never serialized, rebuilt lazily — same pattern as Stroke.bakedCache/fillMaskCache):
+  // the actual decoded <img>, built once per `image.url` seen.
+  imageEl?: HTMLImageElement;
+  // Transient live-preview pixel cache: imageEl drawn "contain"-fit into an offscreen canvas at the
+  // CURRENT live canvas size (imagePixelsW/H record that size so a resize invalidates and rebuilds
+  // it). The live tick loop paints raw bytes (no ctx), so it needs real pixels, not just the <img>;
+  // exports use ctx.drawImage on imageEl directly instead (see renderScene) since that respects the
+  // export's resolution/scale natively instead of upscaling this lower-res cache.
+  imagePixels?: Uint8ClampedArray | null;
+  imagePixelsW?: number;
+  imagePixelsH?: number;
 }
 
 const BRUSHES: { id: BrushKind; label: string }[] = [
@@ -174,10 +190,10 @@ function hueToHex(hue: number): string {
 // of the 0..1 cycle it occupies (higher weight = that color dominates a larger stretch, and the
 // transition into/out of it takes proportionally longer). t travels continuously (not clamped to
 // [0,1]), so feeding it a growing time-based value makes the palette flow endlessly along the stroke.
-// longPath: false (default) takes the shortest hue-wheel arc between two adjacent stops (e.g. blue
-// -> magenta goes straight through violet). true takes the OTHER way around the wheel instead, so
-// the same two stops sweep through every intervening hue (a full rainbow pass) before arriving.
-function sampleGradient(stops: { hue: number; weight: number }[], t: number, longPath = false): number {
+// Always takes the shortest hue-wheel arc between adjacent stops (e.g. blue -> magenta goes
+// straight through violet, never the long way through every intervening hue) — an honest direct
+// transition between the colors actually picked, nothing extra.
+function sampleGradient(stops: { hue: number; weight: number }[], t: number): number {
   const n = stops.length;
   if (n === 0) return 0;
   if (n === 1) return stops[0].hue;
@@ -195,8 +211,7 @@ function sampleGradient(stops: { hue: number; weight: number }[], t: number, lon
   const frac = segEnd > segStart ? (norm - segStart) / (segEnd - segStart) : 0;
   const c0 = stops[idx].hue;
   const c1 = stops[(idx + 1) % n].hue;
-  const shortDiff = ((c1 - c0 + 540) % 360) - 180; // shortest angular path between the two stops
-  const diff = longPath && shortDiff !== 0 ? shortDiff - Math.sign(shortDiff) * 360 : shortDiff;
+  const diff = ((c1 - c0 + 540) % 360) - 180; // shortest angular path between the two stops
   return (c0 + diff * frac + 360) % 360;
 }
 
@@ -280,7 +295,65 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
   }
 }
 
-// ==== Bucket fill: flood-fill against the REAL composited pixel buffer ====
+// ==== Imported layer image (PNG/JPG/GIF-first-frame) ====
+// Lazily (re)creates the decoded <img> for a layer whenever its stored data URL changes, mirroring
+// the lazy-cache pattern used for Stroke.bakedCache/fillMaskCache elsewhere in this file. Decoding
+// an <img> is asynchronous, so right after import (or right after undo/redo hands back a fresh
+// deserialized layer with no cached element yet) this can return null for a frame or two until the
+// image finishes loading — callers just skip painting it for those frames.
+function ensureLayerImageEl(layer: Layer): HTMLImageElement | null {
+  if (!layer.image) return null;
+  if (!layer.imageEl || layer.imageEl.dataset.srcUrl !== layer.image.url) {
+    const img = new Image();
+    img.src = layer.image.url;
+    img.dataset.srcUrl = layer.image.url;
+    layer.imageEl = img;
+    layer.imagePixels = null;
+  }
+  return layer.imageEl.complete && layer.imageEl.naturalWidth > 0 ? layer.imageEl : null;
+}
+// Live-preview-only pixel cache: draws the imported image "contain"-fit (centered, aspect
+// preserved, transparent padding) into an offscreen canvas sized to the CURRENT live canvas, then
+// caches the raw RGBA bytes so the tick loop can blit them directly instead of re-drawing +
+// re-reading every single frame. Invalidated whenever the live canvas is resized.
+function ensureLayerImagePixels(layer: Layer, w: number, h: number): Uint8ClampedArray | null {
+  const el = ensureLayerImageEl(layer);
+  if (!el) return null;
+  if (layer.imagePixels && layer.imagePixelsW === w && layer.imagePixelsH === h) return layer.imagePixels;
+  const off = document.createElement("canvas");
+  off.width = w; off.height = h;
+  const octx = off.getContext("2d")!;
+  const fitScale = Math.min(w / el.naturalWidth, h / el.naturalHeight);
+  const dw = el.naturalWidth * fitScale, dh = el.naturalHeight * fitScale;
+  octx.drawImage(el, (w - dw) / 2, (h - dh) / 2, dw, dh);
+  layer.imagePixels = new Uint8ClampedArray(octx.getImageData(0, 0, w, h).data);
+  layer.imagePixelsW = w; layer.imagePixelsH = h;
+  return layer.imagePixels;
+}
+// Composite imported-image pixels onto the live (always-opaque) frame buffer — real "over"
+// blending using the image's own alpha, same math paint()/compositeBakedStroke use.
+function blitLayerImage(buf: Uint8ClampedArray, img: Uint8ClampedArray) {
+  for (let i = 0; i < img.length; i += 4) {
+    const a = img[i + 3] / 255;
+    if (a <= 0) continue;
+    const ia = 1 - a;
+    buf[i] = img[i] * a + buf[i] * ia;
+    buf[i + 1] = img[i + 1] * a + buf[i + 1] * ia;
+    buf[i + 2] = img[i + 2] * a + buf[i + 2] * ia;
+    buf[i + 3] = 255;
+  }
+}
+// Same, but onto a still-transparent destination (the 3D layer-preview buffers) — needs the real
+// "over" formula against whatever alpha is already there.
+function blitLayerImageIso(buf: Uint8ClampedArray, alphaBuf: Uint8ClampedArray, img: Uint8ClampedArray) {
+  for (let i = 0, ai = 0; i < img.length; i += 4, ai++) {
+    const a = img[i + 3] / 255;
+    if (a <= 0) continue;
+    blendIsoPixel(buf, alphaBuf, i, ai, img[i], img[i + 1], img[i + 2], a);
+  }
+}
+
+
 // Reads whatever is actually on screen at the click point (not brush params) and selects either
 // the connected region of similar color ("Связная") or every matching pixel on the canvas
 // regardless of position ("Всё выделение"), within a tolerance threshold (0..255, max channel diff).
@@ -373,12 +446,13 @@ let layerIdCounter = 0;
 function serializeLayers(layers: Layer[]): string {
   return JSON.stringify(layers.map(l => ({
     id: l.id, name: l.name, visible: l.visible,
+    image: l.image ?? null,
     strokes: l.strokes.map(s => ({
       id: s.id, kind: s.kind, mode: s.mode, size: s.size, hue: s.hue,
       speed: s.speed, density: s.density, noise: s.noise,
       intensity: s.intensity, dynamics: s.dynamics,
-      rainbowFlow: s.rainbowFlow, rainbowFlowSpeed: s.rainbowFlowSpeed, gradientSpeed: s.gradientSpeed,
-      gradientColors: s.gradientColors, gradientAngle: s.gradientAngle, gradientLongPath: s.gradientLongPath,
+      rainbowFlow: s.rainbowFlow, rainbowFlowSpeed: s.rainbowFlowSpeed, gradientSpeed: s.gradientSpeed, gradientScale: s.gradientScale,
+      gradientColors: s.gradientColors, gradientAngle: s.gradientAngle,
       frozen: s.frozen,
       points: s.points, born: s.born,
       fillRuns: s.fillRuns, fillW: s.fillW, fillH: s.fillH,
@@ -524,11 +598,16 @@ function Index() {
   const [rainbowFlow, setRainbowFlow] = useState(true);
   const [rainbowFlowSpeed, setRainbowFlowSpeed] = useState(0.5);
   const [gradientSpeed, setGradientSpeed] = useState(0.3);
+  // How many times the gradient's color cycle repeats across the stroke/canvas along its flow
+  // direction — 1 stretches the picked colors once across the full span (auto-derived from the
+  // stroke's own movement, or the canvas diagonal for a single-click fill), higher values repeat
+  // the same cycle more times (a tighter, more compressed band pattern), lower values stretch a
+  // single cycle out past the visible area.
+  const [gradientScale, setGradientScale] = useState(1);
   const [gradientColors, setGradientColors] = useState<{ hue: number; weight: number }[]>([
     { hue: 200, weight: 1 }, { hue: 320, weight: 1 }, { hue: 60, weight: 1 },
   ]);
   const [gradientAngle, setGradientAngle] = useState(0);
-  const [gradientLongPath, setGradientLongPath] = useState(false);
   // Bucket fill ("Заливка") settings: contiguous selects only the region connected to the click
   // point; global selects every matching pixel on the canvas regardless of position. Tolerance is
   // the max per-channel color difference (0-255) still counted as "the same color".
@@ -541,6 +620,14 @@ function Index() {
   const [exportScale, setExportScale] = useState<number>(2);
   const [exportSec, setExportSec] = useState<number>(4);
   const [exportFps, setExportFps] = useState<number>(24);
+  // Loop-crossfade export: the animation isn't built from mathematically-synced oscillators (each
+  // stroke's speed/noise/phase differs), so there's no single "natural period" to just cut the clip
+  // at for a seamless repeat. Instead of a ping-pong (play forward then backward, which reads as an
+  // obvious back-and-forth rather than a real loop), we render normally then blend the LAST stretch
+  // of frames toward the FIRST stretch of frames (progressively increasing mix), so the tail eases
+  // into matching the head — when the export repeats, the seam is smooth and the motion still reads
+  // as continuous forward playback.
+  const [exportLoop, setExportLoop] = useState(false);
   const [zoom, setZoom] = useState(1);
   // Free camera: pan is a CSS-pixel offset of the canvas from the viewport center. spaceHeld lets
   // a single mouse drag pan (desktop convention); two simultaneous touch pointers pinch-zoom/pan
@@ -572,9 +659,8 @@ function Index() {
     intensity: useRef(intensity), dynamics: useRef(dynamics),
     rainbowFlow: useRef(rainbowFlow),
     rainbowFlowSpeed: useRef(rainbowFlowSpeed),
-    gradientSpeed: useRef(gradientSpeed), gradientColors: useRef(gradientColors),
+    gradientSpeed: useRef(gradientSpeed), gradientScale: useRef(gradientScale), gradientColors: useRef(gradientColors),
     gradientAngle: useRef(gradientAngle),
-    gradientLongPath: useRef(gradientLongPath),
     animEnabled: useRef(animEnabled),
     fillContiguous: useRef(fillContiguous),
     fillTolerance: useRef(fillTolerance),
@@ -591,9 +677,9 @@ function Index() {
   useEffect(() => { refs.rainbowFlow.current = rainbowFlow; });
   useEffect(() => { refs.rainbowFlowSpeed.current = rainbowFlowSpeed; });
   useEffect(() => { refs.gradientSpeed.current = gradientSpeed; });
+  useEffect(() => { refs.gradientScale.current = gradientScale; });
   useEffect(() => { refs.gradientColors.current = gradientColors; });
   useEffect(() => { refs.gradientAngle.current = gradientAngle; });
-  useEffect(() => { refs.gradientLongPath.current = gradientLongPath; });
   useEffect(() => { refs.animEnabled.current = animEnabled; });
   useEffect(() => { refs.fillContiguous.current = fillContiguous; });
   useEffect(() => { refs.fillTolerance.current = fillTolerance; });
@@ -721,6 +807,10 @@ function Index() {
 
       for (const layer of layersRef.current) {
         if (!layer.visible) continue;
+        if (layer.image) {
+          const imgPixels = ensureLayerImagePixels(layer, w, h);
+          if (imgPixels) blitLayerImage(buf, imgPixels);
+        }
         for (const s of layer.strokes) {
           if (s.points.length === 0) continue;
           // Frozen strokes (born while "Анимация" was off) always render as if it's still the
@@ -728,7 +818,7 @@ function Index() {
           // once and stays put instead of flowing/wobbling/pulsing forever. Non-frozen strokes are
           // unaffected, whatever the toggle's CURRENT state is — only stroke creation reads it.
           if (s.frozen) {
-            if (!s.bakedCache) bakeFrozenStroke(s, w, h, s.born / 1000, 0, s.born, liveOpts);
+            if (!s.bakedCache || s.bakedCache.pointCount !== s.points.length) bakeFrozenStroke(s, w, h, s.born / 1000, 0, s.born, liveOpts);
             compositeBakedStroke(buf, s.bakedCache!);
           } else {
             renderStroke(bufferTarget, s, w, h, t, dtRaw, now, liveOpts);
@@ -777,8 +867,8 @@ function Index() {
     const gradExtent = Math.abs(w * gradCos) + Math.abs(h * gradSin) || 1;
     const gradTravel = tt * (0.03 + s.gradientSpeed * 0.5);
     const gradientHueAtXY = (x: number, y: number): number => {
-      const proj = (x * gradCos + y * gradSin) / gradExtent;
-      return sampleGradient(s.gradientColors, proj + gradTravel, s.gradientLongPath);
+      const proj = ((x * gradCos + y * gradSin) / gradExtent) * s.gradientScale;
+      return sampleGradient(s.gradientColors, proj + gradTravel);
     };
     const hueAt = (i: number, f = 0): number => {
       if (s.mode === "gradient") {
@@ -808,7 +898,7 @@ function Index() {
         const RAMP = 96;
         const ramp: [number, number, number][] = new Array(RAMP);
         for (let k = 0; k < RAMP; k++) {
-          const hueK = sampleGradient(s.gradientColors, k / RAMP + gradTravel, s.gradientLongPath);
+          const hueK = sampleGradient(s.gradientColors, k / RAMP + gradTravel);
           ramp[k] = hslToRgb(hueK, 85, 55);
         }
         if (target.mode === "buffer") {
@@ -818,7 +908,7 @@ function Index() {
           for (let yy = 0; yy < bh; yy++) {
             for (let xx = 0; xx < bw; xx++, mi++) {
               if (!mask[mi]) continue;
-              const proj = (xx * gradCos + yy * gradSin) / gradExtent + gradTravel;
+              const proj = ((xx * gradCos + yy * gradSin) / gradExtent) * s.gradientScale + gradTravel;
               const norm = ((proj % 1) + 1) % 1;
               const [r, g, b] = ramp[Math.min(RAMP - 1, Math.floor(norm * RAMP))];
               const idx = mi * 4;
@@ -837,7 +927,7 @@ function Index() {
           for (let yy = 0; yy < bh; yy++) {
             for (let xx = 0; xx < bw; xx++, mi++) {
               if (!mask[mi]) continue;
-              const proj = (xx * gradCos + yy * gradSin) / gradExtent + gradTravel;
+              const proj = ((xx * gradCos + yy * gradSin) / gradExtent) * s.gradientScale + gradTravel;
               const norm = ((proj % 1) + 1) % 1;
               const [r, g, b] = ramp[Math.min(RAMP - 1, Math.floor(norm * RAMP))];
               blendIsoPixel(buf, alphaBuf, mi * 4, mi, r, g, b, alpha);
@@ -1023,7 +1113,11 @@ function Index() {
 
     else if (s.kind === "pixelDither") {
       const grid = Math.max(4, Math.round(s.size / 4));
-      const sweep = (tt * (0.5 + s.speed * 2)) % 1;
+      // Was a sawtooth `(tt*freq) % 1` — it climbs smoothly from 0 to 1 then SNAPS back to 0 every
+      // cycle, which is exactly what read as "not cyclic and too abrupt": a visible jump instead of
+      // a loop. A sine wave has no seam — it comes back to its start value with the same slope it
+      // left with, so the reveal breathes in and out continuously instead of resetting.
+      const sweep = 0.5 + 0.5 * Math.sin(tt * (0.5 + s.speed * 2) * Math.PI * 2);
       const stepPts = Math.max(1, Math.floor(pts.length / 40));
       const radius = s.size * (1 + s.dynamics * 1.5);
       // PERF: offsets used to be recomputed with a nested dx/dy loop + Math.hypot EVERY frame for
@@ -1039,6 +1133,11 @@ function Index() {
       // for the old Math.random() texture too, so a cell's on/off state holds steady frame to frame
       // instead of strobing randomly.
       const coverage = 0.2 + s.density * 0.8;
+      // A cell used to be a hard 0/1 (dist <= threshold ? fully painted : nothing), so as `sweep`
+      // moved, cells popped in/out fully-formed from one frame to the next — the "too sharp" part of
+      // the flicker. Fade each cell in/out over a band about 2-3 grid steps wide instead of an
+      // instant cutoff, so the same motion now reads as a soft breathing edge rather than a strobe.
+      const edgeWidth = Math.max(1e-4, (grid / radius) * 2.5);
       for (let pi = 0; pi < pts.length; pi += stepPts) {
         const p = pts[pi];
         const hueD = hueAt(pi);
@@ -1050,9 +1149,12 @@ function Index() {
           const dist = off.dist;
           const grain = hash(gx + gy * 7);
           const threshold = (sweep + bayer * 0.4 + grain * s.noise * 0.4) * coverage;
-          if (dist > threshold) continue;
+          const edge = threshold - dist;
+          if (edge <= -edgeWidth) continue;
+          const fade = Math.max(0, Math.min(1, (edge + edgeWidth) / (2 * edgeWidth)));
+          if (fade <= 0) continue;
           const lit = 45 + (1 - dist) * 35;
-          paint(target, gx, gy, grid, grid, hueD + (bayer ? 30 : 0), 95, lit, alphaMul * (1 - dist));
+          paint(target, gx, gy, grid, grid, hueD + (bayer ? 30 : 0), 95, lit, alphaMul * (1 - dist) * fade);
         }
       }
     }
@@ -1078,11 +1180,11 @@ function Index() {
             // +120/+240 hue offset — otherwise the channel-split always looks like a generic RGB
             // trio no matter which colors were picked, making the tool feel unresponsive to them.
             const spread = 0.035;
-            const basePos = (p.x * gradCos + p.y * gradSin) / gradExtent + gradTravel;
+            const basePos = ((p.x * gradCos + p.y * gradSin) / gradExtent) * s.gradientScale + gradTravel;
             hues = [
-              sampleGradient(s.gradientColors, basePos - spread, s.gradientLongPath),
-              sampleGradient(s.gradientColors, basePos, s.gradientLongPath),
-              sampleGradient(s.gradientColors, basePos + spread, s.gradientLongPath),
+              sampleGradient(s.gradientColors, basePos - spread),
+              sampleGradient(s.gradientColors, basePos),
+              sampleGradient(s.gradientColors, basePos + spread),
             ];
           } else {
             hues = [hueG % 360, (hueG + 120) % 360, (hueG + 240) % 360];
@@ -1111,7 +1213,7 @@ function Index() {
     renderStroke(isoTarget, s, w, h, effT, effDt, effNow, opts);
     const touched: number[] = [];
     for (let i = 0; i < alphaBuf.length; i++) if (alphaBuf[i] > 0) touched.push(i);
-    s.bakedCache = { data, alpha: alphaBuf, touched };
+    s.bakedCache = { data, alpha: alphaBuf, touched, pointCount: s.points.length };
   }
   // Composite a stroke's baked cache onto the live (always-opaque) frame buffer — only touches the
   // pixels the stroke actually painted, so cost tracks the stroke's footprint, not canvas size.
@@ -1145,10 +1247,14 @@ function Index() {
     const buf = new Uint8ClampedArray(w * h * 4);
     const alphaBuf = new Uint8ClampedArray(w * h);
     const target: PaintTarget = { mode: "iso", buf, alphaBuf, bw: w, bh: h };
+    if (layer.image) {
+      const imgPixels = ensureLayerImagePixels(layer, w, h);
+      if (imgPixels) blitLayerImageIso(buf, alphaBuf, imgPixels);
+    }
     for (const s of layer.strokes) {
       if (s.points.length === 0) continue;
       if (s.frozen) {
-        if (!s.bakedCache) bakeFrozenStroke(s, w, h, s.born / 1000, 0, s.born, opts);
+        if (!s.bakedCache || s.bakedCache.pointCount !== s.points.length) bakeFrozenStroke(s, w, h, s.born / 1000, 0, s.born, opts);
         compositeBakedStrokeIso(buf, alphaBuf, s.bakedCache!);
       } else {
         renderStroke(target, s, w, h, t, dtRaw, now, opts);
@@ -1268,9 +1374,9 @@ function Index() {
         rainbowFlow: refs.rainbowFlow.current,
         rainbowFlowSpeed: refs.rainbowFlowSpeed.current,
         gradientSpeed: refs.gradientSpeed.current,
+        gradientScale: refs.gradientScale.current,
         gradientColors: refs.gradientColors.current.map(c => ({ ...c })),
         gradientAngle: refs.gradientAngle.current,
-        gradientLongPath: refs.gradientLongPath.current,
         frozen: !refs.animEnabled.current,
         // Single point, purely so the generic "empty stroke" skip-checks elsewhere don't drop this
         // fill — its actual painted area comes entirely from fillRuns, never from points/segments.
@@ -1301,9 +1407,9 @@ function Index() {
       rainbowFlow: refs.rainbowFlow.current,
       rainbowFlowSpeed: refs.rainbowFlowSpeed.current,
       gradientSpeed: refs.gradientSpeed.current,
+      gradientScale: refs.gradientScale.current,
       gradientColors: refs.gradientColors.current.map(c => ({ ...c })),
       gradientAngle: refs.gradientAngle.current,
-      gradientLongPath: refs.gradientLongPath.current,
       frozen: !refs.animEnabled.current,
       points: [],
       born: performance.now(),
@@ -1389,6 +1495,35 @@ function Index() {
     pushHistory();
   };
 
+  // Import a PNG/JPG/GIF as a static picture on the active layer (drawn underneath that layer's
+  // brush strokes, "contain"-fit to the canvas). Animated GIFs only show their first frame — this
+  // reads it the same way <img>/ctx.drawImage always do, not a real animated-GIF decoder.
+  const importImage = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const url = reader.result as string;
+      const next = layersRef.current.map(l =>
+        l.id === activeLayerIdRef.current
+          ? { ...l, image: { url }, imageEl: undefined, imagePixels: null }
+          : l
+      );
+      layersRef.current = next;
+      setLayers(next);
+      pushHistory();
+    };
+    reader.readAsDataURL(file);
+  };
+  const removeActiveLayerImage = () => {
+    const next = layersRef.current.map(l =>
+      l.id === activeLayerIdRef.current
+        ? { ...l, image: null, imageEl: undefined, imagePixels: null }
+        : l
+    );
+    layersRef.current = next;
+    setLayers(next);
+    pushHistory();
+  };
+
   // === New canvas ===
   const [newW, setNewW] = useState(1280);
   const [newH, setNewH] = useState(800);
@@ -1417,6 +1552,17 @@ function Index() {
     const target: PaintTarget = { mode: "ctx", ctx: tctx };
     for (const layer of layersRef.current) {
       if (!layer.visible) continue;
+      // Draw the imported image straight via ctx.drawImage (not the pre-rasterized live-preview
+      // pixel cache) so it's resampled natively at the export's actual resolution/scale, using
+      // whatever transform is already active on tctx, instead of upscaling a lower-res copy.
+      if (layer.image) {
+        const el = ensureLayerImageEl(layer);
+        if (el) {
+          const fitScale = Math.min(w / el.naturalWidth, h / el.naturalHeight);
+          const dw = el.naturalWidth * fitScale, dh = el.naturalHeight * fitScale;
+          tctx.drawImage(el, (w - dw) / 2, (h - dh) / 2, dw, dh);
+        }
+      }
       for (const s of layer.strokes) {
         if (s.points.length === 0) continue;
         const effT = s.frozen ? s.born / 1000 : t;
@@ -1426,6 +1572,12 @@ function Index() {
       }
     }
   }, []);
+
+  // How many frames at the tail get crossfaded toward the matching frame at the head, for the loop
+  // export option. ~0.6s worth, but never more than a third of the clip (a short clip shouldn't have
+  // its whole content eaten by the blend) and never less than 2 frames.
+  const loopBlendFrameCount = (fps: number, total: number) =>
+    Math.max(2, Math.min(Math.round(fps * 0.6), Math.floor(total / 3)));
 
   const savePng = () => {
     const scale = Math.max(1, Math.min(4, exportScale));
@@ -1463,9 +1615,33 @@ function Index() {
       const delay = Math.round(1000 / fps);
       const dtRaw = 1000 / fps;
       const startNow = performance.now();
+      // See loopBlendFrameCount / exportLoop comment above: store the first `loopBlend` frames'
+      // pixels as we render them, then during the last `loopBlend` frames blend progressively
+      // toward the matching stored start frame so the clip's end eases into its own beginning.
+      const loopBlend = exportLoop ? loopBlendFrameCount(fps, total) : 0;
+      const startFrames: Uint8ClampedArray[] = [];
       for (let i = 0; i < total; i++) {
         renderScene(tctx, canvasSize.w, canvasSize.h, startNow + i * dtRaw, dtRaw);
-        const data = tctx.getImageData(0, 0, gifW, gifH).data;
+        let data = tctx.getImageData(0, 0, gifW, gifH).data;
+        if (loopBlend > 0) {
+          if (i < loopBlend) {
+            startFrames.push(new Uint8ClampedArray(data));
+          } else if (i >= total - loopBlend) {
+            const k = i - (total - loopBlend);
+            const startData = startFrames[k];
+            if (startData) {
+              const mix = (k + 1) / loopBlend; // ramps up to a full blend at the very last frame
+              const blended = new Uint8ClampedArray(data.length);
+              for (let p = 0; p < data.length; p += 4) {
+                blended[p] = data[p] * (1 - mix) + startData[p] * mix;
+                blended[p + 1] = data[p + 1] * (1 - mix) + startData[p + 1] * mix;
+                blended[p + 2] = data[p + 2] * (1 - mix) + startData[p + 2] * mix;
+                blended[p + 3] = 255;
+              }
+              data = blended;
+            }
+          }
+        }
         const palette = quantize(data, preset.colors);
         const index = applyPalette(data, palette);
         gif.writeFrame(index, gifW, gifH, { palette, delay });
@@ -1518,8 +1694,29 @@ function Index() {
       const startNow = performance.now();
       // prime first frame before start
       renderScene(tctx, canvasSize.w, canvasSize.h, startNow, dtRaw);
+      const loopBlend = exportLoop ? loopBlendFrameCount(fps, total) : 0;
+      const startFrames: Uint8ClampedArray[] = [];
       for (let i = 0; i < total; i++) {
         renderScene(tctx, canvasSize.w, canvasSize.h, startNow + i * dtRaw, dtRaw);
+        if (loopBlend > 0) {
+          if (i < loopBlend) {
+            startFrames.push(new Uint8ClampedArray(tctx.getImageData(0, 0, w, h).data));
+          } else if (i >= total - loopBlend) {
+            const k = i - (total - loopBlend);
+            const startData = startFrames[k];
+            if (startData) {
+              const imgData = tctx.getImageData(0, 0, w, h);
+              const data = imgData.data;
+              const mix = (k + 1) / loopBlend;
+              for (let p = 0; p < data.length; p += 4) {
+                data[p] = data[p] * (1 - mix) + startData[p] * mix;
+                data[p + 1] = data[p + 1] * (1 - mix) + startData[p + 1] * mix;
+                data[p + 2] = data[p + 2] * (1 - mix) + startData[p + 2] * mix;
+              }
+              tctx.putImageData(imgData, 0, 0);
+            }
+          }
+        }
         track.requestFrame?.();
         setRecordProgress((i + 1) / total);
         // yield so the encoder can consume the frame
@@ -1626,6 +1823,27 @@ function Index() {
             <button onClick={clearActive} className="flex-1 rounded border border-white/10 px-1.5 py-1 text-[10px] uppercase tracking-widest text-white/60 hover:bg-white/5">Очистить слой</button>
             <button onClick={clearAll} className="flex-1 rounded border border-white/10 px-1.5 py-1 text-[10px] uppercase tracking-widest text-white/60 hover:bg-white/5">Всё</button>
           </div>
+          <label className="mt-1.5 block cursor-pointer rounded border border-dashed border-white/20 px-1.5 py-1.5 text-center text-[10px] uppercase tracking-widest text-white/50 hover:border-white/50 hover:text-white" title="Вставить PNG/JPG/GIF как картинку на активный слой (под кистями этого слоя)">
+            Импорт изображения (PNG/JPG/GIF)
+            <input
+              type="file"
+              accept="image/png,image/jpeg,image/gif"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) importImage(file);
+                e.target.value = "";
+              }}
+            />
+          </label>
+          {layers.find(l => l.id === activeLayerId)?.image && (
+            <button
+              onClick={removeActiveLayerImage}
+              className="mt-1.5 w-full rounded border border-white/10 px-1.5 py-1 text-[10px] uppercase tracking-widest text-white/60 hover:bg-white/5 hover:text-red-400"
+            >
+              Убрать картинку слоя
+            </button>
+          )}
         </section>
 
         {/* Brushes */}
@@ -1745,14 +1963,6 @@ function Index() {
               )}
             </div>
 
-            <button
-              onClick={() => setGradientLongPath(v => !v)}
-              className="w-full rounded border border-white/10 bg-white/[0.02] px-1.5 py-1 text-[9px] uppercase tracking-widest text-white/60 transition hover:bg-white/5"
-              title="Как цвет переходит между соседними стопами"
-            >
-              {gradientLongPath ? "Переход: длинный путь (через все оттенки)" : "Переход: короткий путь (напрямую)"}
-            </button>
-
             <label className="block text-[10px] uppercase tracking-widest text-white/50">
               <span className="mb-1 flex justify-between">
                 <span>Поворот направления</span>
@@ -1768,6 +1978,25 @@ function Index() {
               />
               <span className="mt-1 block text-[8px] normal-case tracking-normal text-white/30">
                 0° — вдоль мазка (для заливки — угол вручную)
+              </span>
+            </label>
+
+            <label className="block text-[10px] uppercase tracking-widest text-white/50">
+              <span className="mb-1 flex justify-between">
+                <span>Масштаб</span>
+                <span className="text-white/80">×{gradientScale.toFixed(1)}</span>
+              </span>
+              <input
+                type="range"
+                min={0.2}
+                max={4}
+                step={0.1}
+                value={gradientScale}
+                onChange={(e) => setGradientScale(+e.target.value)}
+                className="w-full accent-white"
+              />
+              <span className="mt-1 block text-[8px] normal-case tracking-normal text-white/30">
+                Сколько раз цикл цветов повторяется вдоль направления мазка
               </span>
             </label>
 
@@ -1823,6 +2052,17 @@ function Index() {
           <label className="block text-[10px] uppercase tracking-widest text-white/50">
             <span className="mb-1 flex justify-between"><span>FPS</span><span className="text-white/80">{exportFps} fps</span></span>
             <input type="range" min={5} max={60} step={1} value={exportFps} onChange={(e) => setExportFps(+e.target.value)} className="w-full accent-white" />
+          </label>
+
+          <label className="flex cursor-pointer items-center gap-2 rounded border border-white/10 bg-white/[0.02] px-2 py-1.5 text-[10px] text-white/70 select-none" title="Плавно подмешивает конец ролика к его началу, чтобы GIF/MP4 зацикливался без рывка и без реверса (не пинг-понг)">
+            <input
+              type="checkbox"
+              checked={exportLoop}
+              onChange={(e) => setExportLoop(e.target.checked)}
+              className="h-3.5 w-3.5 accent-white"
+            />
+            <span>Логичный луп</span>
+            <span className="ml-auto text-[9px] uppercase tracking-widest text-white/35">без пинг-понга</span>
           </label>
 
           <button onClick={savePng} disabled={!!recording} className="w-full rounded border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-widest hover:bg-white/10 disabled:opacity-40">PNG · {exportScale}x</button>
