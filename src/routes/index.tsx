@@ -1,7 +1,9 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { GIFEncoder, quantize, applyPalette } from "gifenc";
-import * as THREE from "three";
+// PIXI v7 specifically (npm i pixi.js@^7) — v8 dropped/destabilized BaseTexture.fromBuffer, which is
+// the exact primitive the main canvas blit below relies on to push the CPU pixel buffer to the GPU.
+import * as PIXI from "pixi.js";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -438,23 +440,20 @@ function getSegCache(s: Stroke, pts: StrokePoint[], grid: number): { nx: number;
 function Index() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // PERF: one persistent RGBA buffer, reused every frame (reallocated only when canvas size changes)
-  // instead of letting the canvas API do per-pixel work thousands of times a frame.
+  // instead of letting the canvas API do per-pixel work thousands of times a frame. Every brush still
+  // paints into `data` exactly as before — the only thing that changed is how this buffer reaches the
+  // screen (see pixiRef below): a GPU-uploaded PIXI.Sprite instead of ctx.putImageData.
   const pixelBufRef = useRef<{
-    imgData: ImageData; data: Uint8ClampedArray; w: number; h: number;
+    data: Uint8ClampedArray; w: number; h: number;
     buf32: Uint32Array; rainBudget: { left: number }; bufferTarget: PaintTarget;
   } | null>(null);
-  const wrapRef = useRef<HTMLDivElement>(null);
-  const canvas3DRef = useRef<HTMLCanvasElement>(null);
-  const three3DRef = useRef<{
-    renderer: THREE.WebGLRenderer;
-    scene: THREE.Scene;
-    camera: THREE.PerspectiveCamera;
-    group: THREE.Group;
-    layers: { layerId: number; mesh: THREE.Mesh; tex: THREE.CanvasTexture; canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; imgData: ImageData }[];
-    raf: number;
-    rotX: number; rotY: number;
-    dragging: boolean; lastX: number; lastY: number;
+  // Owns the WebGL side of the main canvas: one Application bound to canvasRef's <canvas>, one
+  // BufferResource-backed texture that wraps pixelBufRef's `data` array directly (no per-frame copy),
+  // and one full-canvas Sprite showing it. Recreated whenever canvasSize changes (see the effect below).
+  const pixiRef = useRef<{
+    app: PIXI.Application; baseTexture: PIXI.BaseTexture; sprite: PIXI.Sprite; w: number; h: number;
   } | null>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
 
   // canvas size config
   const [canvasSize, setCanvasSize] = useState<{ w: number; h: number }>({ w: 1280, h: 800 });
@@ -506,21 +505,6 @@ function Index() {
   const canRedo = historyIdxRef.current < historyRef.current.length - 1;
   void historyVer;
 
-  // "Сплющить" — freezes every currently-still-animating stroke at exactly how it looks right now.
-  // Unlike the "Анимация" toggle (which only decides how NEW strokes are born), this reaches back
-  // and stops existing strokes too — the direct fix for old animated gradient fills that are still
-  // costing a full recompute every frame just to keep looking the same as last frame.
-  const flattenAll = useCallback(() => {
-    const nowMs = performance.now();
-    let changed = false;
-    for (const layer of layersRef.current) {
-      for (const s of layer.strokes) {
-        if (!s.frozen) { s.frozen = true; s.born = nowMs; s.bakedCache = null; changed = true; }
-      }
-    }
-    if (changed) pushHistory();
-  }, [pushHistory]);
-
   const currentStrokeRef = useRef<Stroke | null>(null);
   const pointerRef = useRef({ x: 0, y: 0, down: false, px: 0, py: 0 });
 
@@ -551,8 +535,6 @@ function Index() {
   const [fillContiguous, setFillContiguous] = useState(true);
   const [fillTolerance, setFillTolerance] = useState(32);
   const [recording, setRecording] = useState<null | "gif" | "mp4">(null);
-  // "Layers in depth" 3D preview — off by default, doesn't affect the normal 2D editor at all.
-  const [view3D, setView3D] = useState(false);
   const [recordProgress, setRecordProgress] = useState(0);
   const [gifQ, setGifQ] = useState<GifQ>("medium");
   const [mp4Q, setMp4Q] = useState<Mp4Q>("medium");
@@ -616,19 +598,59 @@ function Index() {
   useEffect(() => { refs.fillContiguous.current = fillContiguous; });
   useEffect(() => { refs.fillTolerance.current = fillTolerance; });
 
-  // resize canvas backing store to logical canvasSize
+  // (Re)build the Pixi side of the main canvas whenever its logical size changes, and the CPU pixel
+  // buffer it wraps. Both live together here so the texture always wraps the CURRENT buffer array —
+  // recreating one without the other would leave the GPU showing stale/wrong-size pixels.
   useEffect(() => {
     const c = canvasRef.current;
     if (!c) return;
-    // NOTE: the render loop below paints via putImageData/getImageData at (canvasSize.w, canvasSize.h).
-    // Those APIs write/read raw device pixels and ignore any ctx transform, so the backing store must
-    // stay exactly canvasSize.w x canvasSize.h — scaling it by devicePixelRatio (as before) left
-    // putImageData only covering the top-left 1/dpr fraction of the canvas, which is invisible on any
-    // high-DPI screen (all phones, dpr 2-3) since strokes drawn in the rest of the logical canvas
-    // never reached a painted pixel. CSS width/height (set via `style`) still stretch this to the
-    // desired on-screen size, so zoom/export quality is unaffected.
-    c.width = canvasSize.w;
-    c.height = canvasSize.h;
+    const w = canvasSize.w, h = canvasSize.h;
+
+    // Tear down whatever Pixi app/texture was here before (previous size, or none yet). Destroying
+    // the texture/baseTexture too is what actually frees the old GPU-side allocation instead of
+    // leaking a WebGL texture object on every resize.
+    if (pixiRef.current) {
+      pixiRef.current.app.destroy(false, { children: true, texture: true, baseTexture: true });
+      pixiRef.current = null;
+    }
+
+    // Same raw RGBA buffer every brush already painted into via `bufferTarget`/`buf` — untouched by
+    // this swap. Only its destination changed (GPU sprite instead of ctx.putImageData).
+    const data = new Uint8ClampedArray(w * h * 4);
+    const bufObj = {
+      data, w, h,
+      buf32: new Uint32Array(data.buffer),
+      rainBudget: { left: 0 },
+      bufferTarget: { mode: "buffer" as const, buf: data, bw: w, bh: h },
+    };
+    pixelBufRef.current = bufObj;
+
+    // NOTE: PIXI's WebGL renderer owns the canvas from here on — it sets the backing-store width/
+    // height itself (no more manual c.width/c.height, and no more devicePixelRatio scaling, for the
+    // same reason as before: the buffer above is authored pixel-for-pixel at exactly w x h). CSS
+    // width/height (set via `style`) still stretch this to the desired on-screen zoom level.
+    const app = new PIXI.Application({
+      view: c, width: w, height: h,
+      antialias: false, backgroundAlpha: 0,
+      // The sprite below fully covers every pixel of the canvas every frame (same w x h as the
+      // buffer), so there's nothing underneath that ever needs clearing first.
+      clearBeforeRender: false,
+    });
+    // `data` (Uint8ClampedArray) and PIXI's BufferResource typings want Uint8Array — same underlying
+    // byte layout, safe to hand across; this is still literally the array every brush writes into.
+    const baseTexture = PIXI.BaseTexture.fromBuffer(data as unknown as Uint8Array, w, h, {
+      scaleMode: PIXI.SCALE_MODES.NEAREST,
+    });
+    const sprite = new PIXI.Sprite(new PIXI.Texture(baseTexture));
+    app.stage.addChild(sprite);
+    pixiRef.current = { app, baseTexture, sprite, w, h };
+
+    return () => {
+      if (pixiRef.current && pixiRef.current.app === app) {
+        app.destroy(false, { children: true, texture: true, baseTexture: true });
+        pixiRef.current = null;
+      }
+    };
   }, [canvasSize]);
 
   const eraseAt = useCallback((x: number, y: number, r: number) => {
@@ -660,25 +682,16 @@ function Index() {
       last = now;
       const c = canvasRef.current;
       if (!c) { raf = requestAnimationFrame(tick); return; }
-      const ctx = c.getContext("2d")!;
       const w = canvasSize.w, h = canvasSize.h;
 
-      // Reuse one persistent buffer across frames — only reallocate on an actual canvas resize.
-      // PERF: the Uint32Array view, the mutable rainBudget object, and the PaintTarget wrapper used
-      // to belong to this scope and got reallocated 60 times a second regardless of what's on the
-      // canvas — pure GC churn with zero effect on a single output pixel. All three now live on the
-      // buffer object itself and are only rebuilt when the buffer itself is (re)allocated.
-      let bufObj = pixelBufRef.current;
-      if (!bufObj || bufObj.w !== w || bufObj.h !== h) {
-        const imgData = ctx.createImageData(w, h);
-        const data = imgData.data;
-        bufObj = {
-          imgData, data, w, h,
-          buf32: new Uint32Array(data.buffer),
-          rainBudget: { left: 0 },
-          bufferTarget: { mode: "buffer", buf: data, bw: w, bh: h },
-        };
-        pixelBufRef.current = bufObj;
+      // Both the CPU buffer and the Pixi app/texture wrapping it are (re)built together by the effect
+      // above whenever canvasSize changes, so by the time this loop is running they already match the
+      // current size — just bail for one frame on the rare tick that lands between resize and rebuild.
+      const bufObj = pixelBufRef.current;
+      const px = pixiRef.current;
+      if (!bufObj || bufObj.w !== w || bufObj.h !== h || !px || px.w !== w || px.h !== h) {
+        raf = requestAnimationFrame(tick);
+        return;
       }
       const buf = bufObj.data;
       // Seed the opaque background fast via a 32-bit view instead of a per-byte loop — .fill() on a
@@ -723,137 +736,17 @@ function Index() {
         }
       }
 
-      // Final flush: whatever was last painted into the buffer (buffer-mode strokes after the last
-      // fill, or the whole frame if there was no fill at all) reaches the screen with one call.
-      ctx.putImageData(bufObj.imgData, 0, 0);
+      // Final flush: push the CPU buffer to the GPU texture (baseTexture.update() re-uploads the
+      // exact same `buf` array the loop above just painted into — no copy) and let Pixi composite it,
+      // instead of the CPU-bound ctx.putImageData call this replaced.
+      px.baseTexture.update();
+      px.app.renderer.render(px.app.stage);
 
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
   }, [canvasSize]);
-
-  // === 3D "layers in depth" preview ===
-  // Builds one textured plane per visible layer, stacked along Z, and keeps every plane's texture
-  // live-updated every frame so animated brushes keep flowing/pulsing in 3D too — genuinely more
-  // expensive than the flat 2D editor (each layer needs its OWN full render pass now, instead of all
-  // layers sharing one combined pass), which is why this only runs while the 3D view is open.
-  useEffect(() => {
-    if (!view3D) return;
-    const canvasEl = canvas3DRef.current;
-    const parent = canvasEl?.parentElement;
-    if (!canvasEl || !parent) return;
-
-    const w = canvasSize.w, h = canvasSize.h;
-    const renderer = new THREE.WebGLRenderer({ canvas: canvasEl, antialias: true, alpha: true });
-    const setSize = () => renderer.setSize(parent.clientWidth, parent.clientHeight, false);
-    setSize();
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-
-    const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(45, parent.clientWidth / Math.max(1, parent.clientHeight), 0.1, 100);
-    camera.position.set(0, 0, 6);
-
-    const group = new THREE.Group();
-    scene.add(group);
-
-    const aspect = w / h;
-    const planeW = 3.4, planeH = planeW / aspect;
-    const visibleLayers = layersRef.current.filter(l => l.visible);
-    const spacing = 0.22;
-    const layerMeshes: NonNullable<typeof three3DRef.current>["layers"] = [];
-
-    visibleLayers.forEach((layer, i) => {
-      const c = document.createElement("canvas");
-      c.width = w; c.height = h;
-      const cctx = c.getContext("2d")!;
-      const imgData = cctx.createImageData(w, h);
-      const tex = new THREE.CanvasTexture(c);
-      const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, depthWrite: false });
-      const geo = new THREE.PlaneGeometry(planeW, planeH);
-      const mesh = new THREE.Mesh(geo, mat);
-      // Front-to-back stacking order matches the layer list (later layers drawn on top in 2D →
-      // placed closer to the camera here), centered on the group's own origin.
-      mesh.position.z = (visibleLayers.length - 1 - i) * spacing - ((visibleLayers.length - 1) * spacing) / 2;
-      group.add(mesh);
-      layerMeshes.push({ layerId: layer.id, mesh, tex, canvas: c, ctx: cctx, imgData });
-    });
-
-    three3DRef.current = { renderer, scene, camera, group, layers: layerMeshes, raf: 0, rotX: -0.2, rotY: 0.5, dragging: false, lastX: 0, lastY: 0 };
-    group.rotation.x = -0.2;
-    group.rotation.y = 0.5;
-
-    let last = performance.now();
-    const opts: RenderOpts = { step: 1, rainBudget: { left: GLOBAL_RAIN_CAP } };
-    const tick3D = (now: number) => {
-      const state = three3DRef.current;
-      if (!state) return;
-      const dtRaw = Math.min(50, now - last);
-      last = now;
-      const t = now / 1000;
-      // Rain gets a fresh full budget per layer here rather than sharing one global counter across
-      // layers like the 2D loop does — layers are rendered fully independently for 3D, so there's no
-      // single shared buffer to protect from over-spawning across all of them at once.
-      for (const lm of state.layers) {
-        const layer = layersRef.current.find(l => l.id === lm.layerId);
-        if (!layer) continue;
-        opts.rainBudget.left = GLOBAL_RAIN_CAP;
-        const { buf } = renderLayerIso(layer, w, h, t, dtRaw, now, opts);
-        lm.imgData.data.set(buf);
-        lm.ctx.putImageData(lm.imgData, 0, 0);
-        lm.tex.needsUpdate = true;
-      }
-      group.rotation.x = state.rotX;
-      group.rotation.y = state.rotY;
-      renderer.render(scene, camera);
-      state.raf = requestAnimationFrame(tick3D);
-    };
-    three3DRef.current.raf = requestAnimationFrame(tick3D);
-
-    const onResize = () => {
-      setSize();
-      camera.aspect = parent.clientWidth / Math.max(1, parent.clientHeight);
-      camera.updateProjectionMatrix();
-    };
-    window.addEventListener("resize", onResize);
-
-    return () => {
-      window.removeEventListener("resize", onResize);
-      const state = three3DRef.current;
-      if (state) {
-        cancelAnimationFrame(state.raf);
-        for (const lm of state.layers) {
-          lm.tex.dispose();
-          (lm.mesh.material as THREE.Material).dispose();
-          lm.mesh.geometry.dispose();
-        }
-        state.renderer.dispose();
-      }
-      three3DRef.current = null;
-    };
-  }, [view3D, canvasSize]);
-
-  const on3DPointerDown = (e: React.PointerEvent) => {
-    const st = three3DRef.current;
-    if (!st) return;
-    st.dragging = true;
-    st.lastX = e.clientX;
-    st.lastY = e.clientY;
-    (e.currentTarget as Element).setPointerCapture(e.pointerId);
-  };
-  const on3DPointerMove = (e: React.PointerEvent) => {
-    const st = three3DRef.current;
-    if (!st || !st.dragging) return;
-    const dx = e.clientX - st.lastX, dy = e.clientY - st.lastY;
-    st.lastX = e.clientX;
-    st.lastY = e.clientY;
-    st.rotY += dx * 0.008;
-    st.rotX = Math.max(-1.2, Math.min(1.2, st.rotX + dy * 0.008));
-  };
-  const on3DPointerUp = () => {
-    const st = three3DRef.current;
-    if (st) st.dragging = false;
-  };
 
   // === Stroke renderer ===
   function renderStroke(target: PaintTarget, s: Stroke, w: number, h: number, t: number, dtRaw: number, now: number, opts: RenderOpts) {
@@ -1137,6 +1030,15 @@ function Index() {
       // EVERY sampled point. They only depend on (grid, radius) which are constant for this stroke,
       // so fetch the cached list once per stroke per frame instead.
       const offsets = getDitherOffsets(grid, radius);
+      // Balanced density: one knob, one effect. `coverage` now directly widens/narrows how much of
+      // the dither pattern fills in (density=0 → sparse, density=1 → fully solid), instead of density
+      // being applied TWICE — once via the sweep/threshold reveal below, AND again via an unrelated
+      // Math.random() cut re-rolled every single frame. That double gate is what made the brush look
+      // sparse and flickery even at max density (structurally capped around ~45% coverage no matter
+      // what) and barely visible at low density. The existing per-cell hash (`grain`) now stands in
+      // for the old Math.random() texture too, so a cell's on/off state holds steady frame to frame
+      // instead of strobing randomly.
+      const coverage = 0.2 + s.density * 0.8;
       for (let pi = 0; pi < pts.length; pi += stepPts) {
         const p = pts[pi];
         const hueD = hueAt(pi);
@@ -1146,10 +1048,10 @@ function Index() {
           const gx = cx + off.dx, gy = cy + off.dy;
           const bayer = (((gx / grid) & 1) ^ ((gy / grid) & 1));
           const dist = off.dist;
-          const threshold = sweep + bayer * 0.4 + hash(gx + gy * 7) * s.noise * 0.4;
+          const grain = hash(gx + gy * 7);
+          const threshold = (sweep + bayer * 0.4 + grain * s.noise * 0.4) * coverage;
           if (dist > threshold) continue;
-          if (Math.random() > 0.05 + s.density * 0.4) continue;
-          const lit = 50 + (1 - dist) * 30;
+          const lit = 45 + (1 - dist) * 35;
           paint(target, gx, gy, grid, grid, hueD + (bayer ? 30 : 0), 95, lit, alphaMul * (1 - dist));
         }
       }
@@ -1692,24 +1594,6 @@ function Index() {
           </span>
         </label>
 
-        <button
-          onClick={flattenAll}
-          disabled={!!recording}
-          className="w-full rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/10 disabled:opacity-30"
-          title="Замораживает все ещё анимирующиеся мазки в их текущем виде — дальше они ничего не стоят каждый кадр"
-        >
-          ❄ Сплющить (заморозить всё как есть)
-        </button>
-
-        <button
-          onClick={() => setView3D(true)}
-          disabled={!!recording}
-          className="w-full rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/10 disabled:opacity-30"
-          title="Показывает слои как стопку карточек в 3D-пространстве, которую можно покрутить"
-        >
-          🧊 3D вид (слои в глубину)
-        </button>
-
         {/* New canvas */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Холст</div>
@@ -2018,27 +1902,6 @@ function Index() {
           Пробел+перетаскивание или два пальца — панорама
         </div>
 
-        {view3D && (
-          <div className="absolute inset-0 z-10 bg-[#0a0b12]">
-            <canvas
-              ref={canvas3DRef}
-              className="h-full w-full touch-none"
-              onPointerDown={on3DPointerDown}
-              onPointerMove={on3DPointerMove}
-              onPointerUp={on3DPointerUp}
-              onPointerCancel={on3DPointerUp}
-            />
-            <button
-              onClick={() => setView3D(false)}
-              className="absolute right-3 top-3 rounded-md border border-white/10 bg-black/60 px-3 py-1.5 text-[11px] tracking-wider backdrop-blur transition hover:bg-white/10"
-            >
-              ✕ Закрыть 3D
-            </button>
-            <div className="pointer-events-none absolute bottom-3 left-3 rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[9px] uppercase tracking-widest text-white/40 backdrop-blur">
-              Перетаскивание — вращение
-            </div>
-          </div>
-        )}
       </div>
     </main>
   );
