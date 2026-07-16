@@ -42,6 +42,7 @@ interface Stroke {
   dynamics: number;
   rainbowFlow: boolean;
   rainbowFlowSpeed: number;
+  rainbowBlinkSpeed: number;
   gradientSpeed: number;
   gradientScale: number;
   gradientColors: { hue: number; weight: number }[];
@@ -154,6 +155,19 @@ function hash(n: number) {
   n = (n << 13) ^ n;
   return 1.0 - (((n * (n * n * 15731 + 789221) + 1376312589) & 0x7fffffff) / 1073741823.5);
 }
+// PERF: precomputed noise table. hash() itself is cheap, but it's called once per grid-cell for
+// dither grain, and that argument (gx + gy*7) is an INTEGER grid coordinate that never changes
+// frame to frame for a given cell — the exact same result gets recomputed every single frame for
+// every on-screen cell. Build the same values once into a lookup table and index into it instead.
+// (Only used where the hash's input is this kind of frame-invariant integer — the other hash()
+// call sites feed it a continuously-changing phase/time value, where a static table would visibly
+// quantize what's supposed to be smooth motion, so those keep calling hash() live.)
+const NOISE_TABLE_SIZE = 4096;
+const noiseTable = new Float32Array(NOISE_TABLE_SIZE);
+for (let i = 0; i < NOISE_TABLE_SIZE; i++) noiseTable[i] = hash(i);
+function noiseAt(n: number): number {
+  return noiseTable[((n % NOISE_TABLE_SIZE) + NOISE_TABLE_SIZE) % NOISE_TABLE_SIZE];
+}
 
 // ==== Custom gradient tool: color <-> hue conversion + multi-stop interpolation ====
 function hexToHue(hex: string): number {
@@ -226,6 +240,11 @@ function sampleGradient(stops: { hue: number; weight: number }[], t: number): nu
 interface PaintTarget {
   mode: "buffer" | "ctx" | "iso";
   buf?: Uint8ClampedArray;
+  // PERF: a Uint32Array view over the same ArrayBuffer as `buf`, "buffer" mode only. Lets paint()
+  // write a fully-opaque pixel as ONE 32-bit store instead of four separate byte stores — only
+  // valid when there's no real blending to do (alpha >= 1), since it overwrites all 4 channels at
+  // once with no mixing against what's underneath.
+  buf32?: Uint32Array;
   bw?: number;
   bh?: number;
   ctx?: CanvasRenderingContext2D;
@@ -244,6 +263,27 @@ function hslToRgb(h: number, s: number, l: number): [number, number, number] {
   const a = s * Math.min(l, 1 - l);
   const f = (n: number) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
   return [Math.round(255 * f(0)), Math.round(255 * f(8)), Math.round(255 * f(4))];
+}
+// PERF: memoized HSL->RGB. The math above is cheap per call in isolation, but paint() calls it
+// once per grid-cell, and a busy frame across several live strokes can add up to thousands of
+// calls. Real (h, s, l) triples repeat constantly — same hue sampled a moment later, same
+// lightness edge-falloff value reused across many cells of the same stroke — so most calls are
+// pure repeat work. Round to whole-degree hue / whole-percent s & l (finer than the input ever
+// meaningfully varies, and far finer than an 8-bit RGB channel can visibly distinguish) and cache
+// the result: same visual output, but a repeat lookup is an array read instead of the full formula.
+// Grows to at most 360*101*101 entries (~3.7M) in the most degenerate case, bounded and harmless.
+const hslRgbCache = new Map<number, [number, number, number]>();
+function getHslRgb(h: number, s: number, l: number): [number, number, number] {
+  const hi = Math.round(((h % 360) + 360) % 360) % 360;
+  const si = Math.max(0, Math.min(100, Math.round(s)));
+  const li = Math.max(0, Math.min(100, Math.round(l)));
+  const key = (hi * 101 + si) * 101 + li;
+  let v = hslRgbCache.get(key);
+  if (v === undefined) {
+    v = hslToRgb(hi, si, li);
+    hslRgbCache.set(key, v);
+  }
+  return v;
 }
 // Real Porter-Duff "over" for one pixel of an isolated (non-opaque) buffer — used only while baking
 // a frozen stroke, which happens once per stroke rather than every frame, so the extra per-pixel
@@ -268,7 +308,7 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
     return;
   }
   const buf = target.buf!, bw = target.bw!, bh = target.bh!;
-  const [r, g, b] = hslToRgb(h, s, l);
+  const [r, g, b] = getHslRgb(h, s, l);
   const x0 = Math.max(0, Math.floor(x));
   const y0 = Math.max(0, Math.floor(y));
   const x1 = Math.min(bw, Math.floor(x) + Math.max(1, Math.round(sizeW)));
@@ -284,6 +324,20 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
     return;
   }
   const ia = 1 - alpha;
+  // PERF: alpha >= 1 means "just overwrite, no blending with what's underneath" — the exact case a
+  // packed 32-bit write handles in one store per pixel (R|G<<8|B<<16|A<<24 in little-endian byte
+  // order) instead of four separate byte stores with a multiply-add each. Many brushes paint fully
+  // opaque blocks (grid cells at alphaMul effectively 1, or edge=1 falloff center pixels), so this
+  // path is hit constantly. Falls back to the per-byte blend below whenever real blending is needed.
+  if (ia <= 0 && target.buf32) {
+    const packed = (255 << 24) | (b << 16) | (g << 8) | r;
+    const buf32 = target.buf32;
+    for (let yy = y0; yy < y1; yy++) {
+      let p = yy * bw + x0;
+      for (let xx = x0; xx < x1; xx++, p++) buf32[p] = packed;
+    }
+    return;
+  }
   for (let yy = y0; yy < y1; yy++) {
     let idx = (yy * bw + x0) * 4;
     for (let xx = x0; xx < x1; xx++, idx += 4) {
@@ -451,7 +505,7 @@ function serializeLayers(layers: Layer[]): string {
       id: s.id, kind: s.kind, mode: s.mode, size: s.size, hue: s.hue,
       speed: s.speed, density: s.density, noise: s.noise,
       intensity: s.intensity, dynamics: s.dynamics,
-      rainbowFlow: s.rainbowFlow, rainbowFlowSpeed: s.rainbowFlowSpeed, gradientSpeed: s.gradientSpeed, gradientScale: s.gradientScale,
+      rainbowFlow: s.rainbowFlow, rainbowFlowSpeed: s.rainbowFlowSpeed, rainbowBlinkSpeed: s.rainbowBlinkSpeed, gradientSpeed: s.gradientSpeed, gradientScale: s.gradientScale,
       gradientColors: s.gradientColors, gradientAngle: s.gradientAngle,
       frozen: s.frozen,
       points: s.points, born: s.born,
@@ -597,6 +651,7 @@ function Index() {
   const [dynamics, setDynamics] = useState(0.5);
   const [rainbowFlow, setRainbowFlow] = useState(true);
   const [rainbowFlowSpeed, setRainbowFlowSpeed] = useState(0.5);
+  const [rainbowBlinkSpeed, setRainbowBlinkSpeed] = useState(0.5);
   const [gradientSpeed, setGradientSpeed] = useState(0.3);
   // How many times the gradient's color cycle repeats across the stroke/canvas along its flow
   // direction — 1 stretches the picked colors once across the full span (auto-derived from the
@@ -659,6 +714,7 @@ function Index() {
     intensity: useRef(intensity), dynamics: useRef(dynamics),
     rainbowFlow: useRef(rainbowFlow),
     rainbowFlowSpeed: useRef(rainbowFlowSpeed),
+    rainbowBlinkSpeed: useRef(rainbowBlinkSpeed),
     gradientSpeed: useRef(gradientSpeed), gradientScale: useRef(gradientScale), gradientColors: useRef(gradientColors),
     gradientAngle: useRef(gradientAngle),
     animEnabled: useRef(animEnabled),
@@ -676,6 +732,7 @@ function Index() {
   useEffect(() => { refs.dynamics.current = dynamics; });
   useEffect(() => { refs.rainbowFlow.current = rainbowFlow; });
   useEffect(() => { refs.rainbowFlowSpeed.current = rainbowFlowSpeed; });
+  useEffect(() => { refs.rainbowBlinkSpeed.current = rainbowBlinkSpeed; });
   useEffect(() => { refs.gradientSpeed.current = gradientSpeed; });
   useEffect(() => { refs.gradientScale.current = gradientScale; });
   useEffect(() => { refs.gradientColors.current = gradientColors; });
@@ -707,7 +764,7 @@ function Index() {
       data, w, h,
       buf32: new Uint32Array(data.buffer),
       rainBudget: { left: 0 },
-      bufferTarget: { mode: "buffer" as const, buf: data, bw: w, bh: h },
+      bufferTarget: { mode: "buffer" as const, buf: data, buf32: new Uint32Array(data.buffer), bw: w, bh: h },
     };
     pixelBufRef.current = bufObj;
 
@@ -844,7 +901,11 @@ function Index() {
     const dt = dtRaw * (0.3 + s.speed * 2.4);
     const tt = t * (0.3 + s.speed * 2.4);
     const lifeMs = now - s.born;
-    const modeHueShift = s.mode === "rainbow" ? (lifeMs * 0.05) % 360 : 0;
+    // Was a hardcoded 0.05 rate with no way to adjust it. "Поток" mode keeps that exact same 0.05
+    // (unchanged, since it already has its own separate speed slider via legacyFlow below) — only
+    // "Мигание целиком" gets the new adjustable rate, defaulting to 0.5*0.1=0.05 so nothing changes
+    // until the slider is actually moved.
+    const modeHueShift = s.mode === "rainbow" ? (lifeMs * (s.rainbowFlow ? 0.05 : s.rainbowBlinkSpeed * 0.1)) % 360 : 0;
     const modePulse = s.mode === "pulse" ? 0.6 + 0.5 * Math.sin(tt * 2) : 1;
     const modeSpray = s.mode === "spray" ? 2.2 : 1;
     const alphaMul = (0.25 + s.intensity * 0.9) * modePulse;
@@ -866,9 +927,25 @@ function Index() {
     // Normalize the projection so the picked colors span roughly the visible canvas regardless of angle.
     const gradExtent = Math.abs(w * gradCos) + Math.abs(h * gradSin) || 1;
     const gradTravel = tt * (0.03 + s.gradientSpeed * 0.5);
+    // PERF: precompute the gradient's color cycle ONCE per stroke per frame instead of calling
+    // sampleGradient() (a loop over the stops) at every point/pixel that needs a gradient hue.
+    // Deliberately built WITHOUT gradTravel baked in — travel is a pure phase shift, so it's added
+    // at lookup time (see gradHueRampAt) by rotating which ramp index gets read, meaning this ramp
+    // stays valid (and doesn't need rebuilding) for the whole frame regardless of animation speed.
+    const GRAD_RAMP_N = 256;
+    let gradHueRamp: Float32Array | null = null;
+    const gradHueRampAt = (proj: number): number => {
+      if (s.mode !== "gradient") return sampleGradient(s.gradientColors, proj);
+      if (!gradHueRamp) {
+        gradHueRamp = new Float32Array(GRAD_RAMP_N);
+        for (let k = 0; k < GRAD_RAMP_N; k++) gradHueRamp[k] = sampleGradient(s.gradientColors, k / GRAD_RAMP_N);
+      }
+      const norm = ((proj % 1) + 1) % 1;
+      return gradHueRamp[Math.min(GRAD_RAMP_N - 1, Math.floor(norm * GRAD_RAMP_N))];
+    };
     const gradientHueAtXY = (x: number, y: number): number => {
       const proj = ((x * gradCos + y * gradSin) / gradExtent) * s.gradientScale;
-      return sampleGradient(s.gradientColors, proj + gradTravel);
+      return gradHueRampAt(proj + gradTravel);
     };
     const hueAt = (i: number, f = 0): number => {
       if (s.mode === "gradient") {
@@ -899,7 +976,7 @@ function Index() {
         const ramp: [number, number, number][] = new Array(RAMP);
         for (let k = 0; k < RAMP; k++) {
           const hueK = sampleGradient(s.gradientColors, k / RAMP + gradTravel);
-          ramp[k] = hslToRgb(hueK, 85, 55);
+          ramp[k] = getHslRgb(hueK, 85, 55);
         }
         if (target.mode === "buffer") {
           const buf = target.buf!;
@@ -948,7 +1025,7 @@ function Index() {
         // same "wash" behavior these modes always had for Заливка, just restricted to the mask.
         const hueF = hueAt(0, 0);
         if (target.mode === "buffer") {
-          const [r, g, b] = hslToRgb(hueF, 85, 55);
+          const [r, g, b] = getHslRgb(hueF, 85, 55);
           const buf = target.buf!;
           const ia = 1 - alpha;
           for (let mi = 0; mi < mask.length; mi++) {
@@ -960,7 +1037,7 @@ function Index() {
             buf[idx + 3] = 255;
           }
         } else if (target.mode === "iso") {
-          const [r, g, b] = hslToRgb(hueF, 85, 55);
+          const [r, g, b] = getHslRgb(hueF, 85, 55);
           const buf = target.buf!, alphaBuf = target.alphaBuf!;
           for (let mi = 0; mi < mask.length; mi++) {
             if (!mask[mi]) continue;
@@ -1113,11 +1190,13 @@ function Index() {
 
     else if (s.kind === "pixelDither") {
       const grid = Math.max(4, Math.round(s.size / 4));
-      // Was a sawtooth `(tt*freq) % 1` — it climbs smoothly from 0 to 1 then SNAPS back to 0 every
-      // cycle, which is exactly what read as "not cyclic and too abrupt": a visible jump instead of
-      // a loop. A sine wave has no seam — it comes back to its start value with the same slope it
-      // left with, so the reveal breathes in and out continuously instead of resetting.
-      const sweep = 0.5 + 0.5 * Math.sin(tt * (0.5 + s.speed * 2) * Math.PI * 2);
+      // Amplitude was a full 0..1 swing, meaning at the extremes of every cycle a large fraction of
+      // cells simultaneously turned on/off together — that's what read as "glowing/straining the
+      // eyes" on top of the abruptness already fixed above. Narrowing the swing (still centered so
+      // coverage/density keep their same average meaning) means far fewer cells change state at
+      // once per cycle, and slowing the base rate a bit gives the eye more time to settle between
+      // breaths instead of a fast pulse.
+      const sweep = 0.5 + 0.22 * Math.sin(tt * (0.35 + s.speed * 1.2) * Math.PI * 2);
       const stepPts = Math.max(1, Math.floor(pts.length / 40));
       const radius = s.size * (1 + s.dynamics * 1.5);
       // PERF: offsets used to be recomputed with a nested dx/dy loop + Math.hypot EVERY frame for
@@ -1147,13 +1226,13 @@ function Index() {
           const gx = cx + off.dx, gy = cy + off.dy;
           const bayer = (((gx / grid) & 1) ^ ((gy / grid) & 1));
           const dist = off.dist;
-          const grain = hash(gx + gy * 7);
+          const grain = noiseAt(gx + gy * 7);
           const threshold = (sweep + bayer * 0.4 + grain * s.noise * 0.4) * coverage;
           const edge = threshold - dist;
           if (edge <= -edgeWidth) continue;
           const fade = Math.max(0, Math.min(1, (edge + edgeWidth) / (2 * edgeWidth)));
           if (fade <= 0) continue;
-          const lit = 45 + (1 - dist) * 35;
+          const lit = 45 + (1 - dist) * 28;
           paint(target, gx, gy, grid, grid, hueD + (bayer ? 30 : 0), 95, lit, alphaMul * (1 - dist) * fade);
         }
       }
@@ -1182,9 +1261,9 @@ function Index() {
             const spread = 0.035;
             const basePos = ((p.x * gradCos + p.y * gradSin) / gradExtent) * s.gradientScale + gradTravel;
             hues = [
-              sampleGradient(s.gradientColors, basePos - spread),
-              sampleGradient(s.gradientColors, basePos),
-              sampleGradient(s.gradientColors, basePos + spread),
+              gradHueRampAt(basePos - spread),
+              gradHueRampAt(basePos),
+              gradHueRampAt(basePos + spread),
             ];
           } else {
             hues = [hueG % 360, (hueG + 120) % 360, (hueG + 240) % 360];
@@ -1373,6 +1452,7 @@ function Index() {
         dynamics: refs.dynamics.current,
         rainbowFlow: refs.rainbowFlow.current,
         rainbowFlowSpeed: refs.rainbowFlowSpeed.current,
+        rainbowBlinkSpeed: refs.rainbowBlinkSpeed.current,
         gradientSpeed: refs.gradientSpeed.current,
         gradientScale: refs.gradientScale.current,
         gradientColors: refs.gradientColors.current.map(c => ({ ...c })),
@@ -1406,6 +1486,7 @@ function Index() {
       dynamics: refs.dynamics.current,
       rainbowFlow: refs.rainbowFlow.current,
       rainbowFlowSpeed: refs.rainbowFlowSpeed.current,
+      rainbowBlinkSpeed: refs.rainbowBlinkSpeed.current,
       gradientSpeed: refs.gradientSpeed.current,
       gradientScale: refs.gradientScale.current,
       gradientColors: refs.gradientColors.current.map(c => ({ ...c })),
@@ -1903,6 +1984,11 @@ function Index() {
           {mode === "rainbow" && rainbowFlow && (
             <div className="mt-2 border-t border-white/10 pt-2">
               <ParamSlider label="Скорость потока" value={rainbowFlowSpeed} set={setRainbowFlowSpeed} />
+            </div>
+          )}
+          {mode === "rainbow" && !rainbowFlow && (
+            <div className="mt-2 border-t border-white/10 pt-2">
+              <ParamSlider label="Скорость мигания" value={rainbowBlinkSpeed} set={setRainbowBlinkSpeed} />
             </div>
           )}
         </section>
