@@ -27,7 +27,7 @@ type BrushKind =
   | "fill"
   | "eraser";
 
-type ModeKind = "normal" | "rainbow" | "gradient" | "pulse" | "spray" | "mirror";
+type ModeKind = "normal" | "rainbow" | "gradient" | "pulse" | "spray" | "mirror" | "glitch";
 
 interface StrokePoint { x: number; y: number; t: number }
 
@@ -136,6 +136,7 @@ const MODES: { id: ModeKind; label: string }[] = [
   { id: "pulse", label: "Пульс" },
   { id: "spray", label: "Распыление" },
   { id: "mirror", label: "Зеркало" },
+  { id: "glitch", label: "Глитч" },
 ];
 
 const GIF_PRESETS = {
@@ -1003,6 +1004,18 @@ function Index() {
       const proj = ((x * gradCos + y * gradSin) / gradExtent) * s.gradientScale;
       return gradHueRampAt(proj + gradTravel);
     };
+    // "Глитч" mode — the old color-shift palette, restored as its own selectable mode instead of
+    // being baked into the "Глитч" BRUSH (which now does something different: real r/g/b channel
+    // isolation of the one picked color, a deliberate accuracy fix, not a palette anyone asked to
+    // lose). This is a chaotic 3-way hue split (+0/+120/+240°) that re-rolls fast over time and
+    // varies per point/particle — echoing misaligned RGB channels — which is exactly what any brush
+    // painted with when "glitch" used to just be a color mode.
+    const glitchOn = s.mode === "glitch";
+    const glitchCell = glitchOn ? Math.floor(tt * 9) : 0;
+    const glitchShift = (seed: number): number => {
+      if (!glitchOn) return 0;
+      return Math.floor(((hash(glitchCell * 131 + seed) + 1) / 2) * 3) * 120;
+    };
     const hueAt = (i: number, f = 0): number => {
       if (s.mode === "gradient") {
         const p0 = pts[Math.min(i, pts.length - 1)];
@@ -1012,7 +1025,7 @@ function Index() {
         return gradientHueAtXY(px, py);
       }
       const posT = (i + f) / nSeg;
-      return (s.hue + modeHueShift + legacyFlow + legacySpread * posT) % 360;
+      return (s.hue + modeHueShift + legacyFlow + legacySpread * posT + glitchShift(i)) % 360;
     };
 
     if (s.kind === "fill") {
@@ -1284,7 +1297,7 @@ function Index() {
           s.rain.pop();
           continue;
         }
-        const hueP = (r.hue + modeHueShift) % 360;
+        const hueP = (r.hue + modeHueShift + glitchShift(r.seed)) % 360;
         for (let k = 0; k < r.len; k++) {
           const a = alphaMul * (1 - k / r.len);
           paint(target, Math.round((r.x) / grid) * grid, Math.round((r.y - k * grid) / grid) * grid, grid, grid, hueP, 95, 55 + k * 3, a);
@@ -1322,7 +1335,13 @@ function Index() {
       // point in the sweep cycle, a large fraction of the whole painted area sits simultaneously
       // in mid-transition (partially transparent) all at once, which is what read as sitewide
       // "blur" during playback. Narrower band = far fewer cells in transition at any one instant.
-      const edgeWidth = Math.max(1e-4, (grid / radius) * 1.4);
+      // FIX: this had grown to 1.4x, which for a typical brush size makes edgeWidth (0.3-0.4) cover
+      // most of dist's whole 0..1 range — almost every painted cell then sits somewhere in the soft
+      // fade band and never reaches fade=1 (full opacity). Composited over the near-black canvas
+      // background, that reads as "draws solid black" — the color is technically there, just at
+      // alpha low enough to be invisible. Back to a narrow band: enough to still avoid the old hard
+      // pop-in/out flicker, but small enough that most of the covered area is a real solid core.
+      const edgeWidth = Math.max(1e-4, (grid / radius) * 0.3);
       for (let pi = 0; pi < pts.length; pi += stepPts) {
         const p = pts[pi];
         const hueD = hueAt(pi);
@@ -1456,69 +1475,48 @@ function Index() {
             // pops in/out together across a wide area, reading as a sitewide haze.
             const threshold = (sweepP + grain * (0.15 + s.noise * 0.4)) * coverage;
             if (dist > threshold) continue;
-            const lit = 42 + (1 - dist) * 26;
-            paint(target, wx, wy, grid, grid, hueM, 90, lit, alphaMul * (1 - dist));
+            // FIX: lit/alpha used to both scale by (1-dist) from the sample point — every cluster of
+            // tiles faded out radially toward its edge, which is exactly what read as "circles of
+            // blurred pixels" instead of a flat mosaic. Tiles are flat now: brightness only varies by
+            // the tile's own fixed per-cell grain (real mosaic texture), never by distance, so there's
+            // no soft circular falloff anywhere — just solid squares of different sizes, on or off.
+            const lit = 48 + grain * 14;
+            paint(target, wx, wy, grid, grid, hueM, 90, lit, alphaMul);
           }
         }
       }
     }
 
     else if (s.kind === "embers") {
-      // Roughly stationary glowing patches (unlike Пикс. дождь, which falls and despawns) — each
-      // one holds its position and just breathes brightness on its own independent slow cycle, so
-      // the patches flare and dim out of sync with each other like real smoldering embers instead
-      // of pulsing together.
-      //
-      // FIX: embers used to never expire, only capped by a fixed target count derived from
-      // density. Once that count was reached, the spawn loop below stopped adding anything no
-      // matter how much further you dragged — the brush felt like it "just makes one static
-      // batch and that's it" instead of something you paint with continuously. Each ember now
-      // gets a finite lifespan (like a real coal cooling down and crumbling to ash) and is culled
-      // once its time is up, which frees budget for fresh embers to keep appearing as you keep
-      // moving the brush — the pool is alive and responsive instead of a one-shot spawn.
+      // FIX: continuous ember TRAIL, not a small persistent pool. The previous version kept a
+      // particle pool hard-capped at 8-68 embers total (by density) that spawned biased toward the
+      // most recently drawn points and only refilled as old particles individually expired — drag
+      // across a wide area and the older parts of the stroke would have no embers left at all, since
+      // the pool never grew past its cap and particles weren't tied to any fixed position on the
+      // path. That read as "an effect happening near the brush tip", not something you paint a trail
+      // with. Every sampled point along the WHOLE path now always has its own coal(s), the same way
+      // ink/ribbon/dither/mosaic cover their whole path every frame — density controls how many
+      // coals cluster around each point (a scatter, not just one dot) instead of a global count cap.
+      // Each coal still flares/dims on its own out-of-sync cycle (a per-seed phase offset, exactly
+      // like before) so it still reads as smoldering, not static — it just no longer disappears.
       const grid = Math.max(3, Math.round(s.size / 4));
-      const currentCount = s.embers?.length ?? 0;
-      const wantCount = Math.floor(8 + s.density * 60);
-      const targetCount = Math.min(wantCount, currentCount + Math.max(0, opts.rainBudget.left));
-      if (!s.embers) s.embers = [];
-      while (s.embers.length < targetCount && opts.rainBudget.left > 0) {
-        // Bias toward the MOST RECENTLY drawn part of the path (Math.random()*Math.random() skews
-        // toward 0, i.e. toward the newest points) instead of sampling uniformly across the whole
-        // stroke's history — so fresh embers actually cluster near where you're currently drawing,
-        // making the brush feel like it's tracking the tip rather than randomly re-seeding old areas.
-        const recentWindow = Math.min(pts.length, 40);
-        const idx = pts.length - 1 - Math.floor(Math.random() * Math.random() * recentWindow);
-        const p = pts[Math.max(0, idx)];
-        s.embers.push({
-          x: Math.round(p.x / grid) * grid + (Math.random() - 0.5) * s.size,
-          y: Math.round(p.y / grid) * grid + (Math.random() - 0.5) * s.size,
-          hue: s.mode === "gradient" ? gradientHueAtXY(p.x, p.y) : s.hue + (Math.random() - 0.5) * 30,
-          seed: Math.random() * 1000,
-          period: 1.2 + Math.random() * 2.5,
-          bornAt: now,
-          life: 2200 + Math.random() * 3000,
-        });
-        opts.rainBudget.left--;
-      }
-      for (let i = s.embers.length - 1; i >= 0; i--) {
-        const e = s.embers[i];
-        const age = now - e.bornAt;
-        if (age > e.life) {
-          // Swap-pop instead of splice — same O(1) removal trick used for Пикс. дождь, since
-          // order doesn't matter for particles.
-          const last = s.embers.length - 1;
-          if (i !== last) s.embers[i] = s.embers[last];
-          s.embers.pop();
-          continue;
+      const stepPts = Math.max(1, Math.floor(pts.length / 60));
+      const perPoint = Math.max(1, Math.round(1 + s.density * 5));
+      for (let pi = 0; pi < pts.length; pi += stepPts) {
+        const p = pts[pi];
+        for (let k = 0; k < perPoint; k++) {
+          const seed = pi * 97 + k * 13;
+          const ex = p.x + noiseAt(seed) * s.size * 0.6;
+          const ey = p.y + noiseAt(seed + 5000) * s.size * 0.6;
+          const period = 1.2 + ((noiseAt(seed + 1) + 1) / 2) * 2.5;
+          const phase = ((noiseAt(seed + 2) + 1) / 2) * Math.PI * 2;
+          const glow = 0.5 + 0.5 * Math.sin((tt * 2 * Math.PI) / period + phase);
+          const lit = 20 + glow * (30 + s.intensity * 20);
+          const hueE = s.mode === "gradient"
+            ? gradientHueAtXY(ex, ey)
+            : (s.hue + noiseAt(seed + 3) * 30 + modeHueShift + glitchShift(seed)) % 360;
+          paint(target, Math.round(ex / grid) * grid, Math.round(ey / grid) * grid, grid, grid, hueE, 85, lit, alphaMul * (0.3 + glow * 0.7));
         }
-        // Fade out smoothly over the last ~25% of its life instead of popping out abruptly once
-        // culled, so an ember visibly cools down and dims rather than vanishing mid-glow.
-        const lifeFrac = age / e.life;
-        const dying = lifeFrac > 0.75 ? 1 - (lifeFrac - 0.75) / 0.25 : 1;
-        const glow = 0.5 + 0.5 * Math.sin((tt * 2 * Math.PI) / e.period + e.seed);
-        const lit = 20 + glow * (30 + s.intensity * 20);
-        const hueE = s.mode === "gradient" ? gradientHueAtXY(e.x, e.y) : (e.hue + modeHueShift) % 360;
-        paint(target, Math.round(e.x / grid) * grid, Math.round(e.y / grid) * grid, grid, grid, hueE, 85, lit, alphaMul * (0.3 + glow * 0.7) * Math.max(0, dying));
       }
     }
   }
