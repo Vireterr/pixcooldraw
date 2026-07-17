@@ -22,7 +22,6 @@ type BrushKind =
   | "pixelRain"
   | "pixelDither"
   | "pixelGlitch"
-  | "web"
   | "mosaic"
   | "embers"
   | "fill"
@@ -67,7 +66,7 @@ interface Stroke {
   // transient per-brush buckets (not serialized in history)
   ink?: { phase: number };
   rain?: { x: number; y: number; vy: number; hue: number; len: number; seed: number }[];
-  embers?: { x: number; y: number; hue: number; seed: number; period: number }[];
+  embers?: { x: number; y: number; hue: number; seed: number; period: number; bornAt: number; life: number }[];
   // Lazily decoded from fillRuns the first time this stroke is rendered (same lazy/cached pattern
   // as segCache below) — decoding a run-length list into a full pixel mask every single animation
   // frame would be wasted work since fillRuns never changes after the fill is made.
@@ -124,7 +123,6 @@ const BRUSHES: { id: BrushKind; label: string }[] = [
   { id: "pixelRain", label: "Пикс. дождь" },
   { id: "pixelDither", label: "Дизеринг" },
   { id: "pixelGlitch", label: "Глитч" },
-  { id: "web", label: "Паутина" },
   { id: "mosaic", label: "Мозаика" },
   { id: "embers", label: "Угли" },
   { id: "fill", label: "Заливка" },
@@ -312,6 +310,45 @@ function blendIsoPixel(buf: Uint8ClampedArray, alphaBuf: Uint8ClampedArray, idx:
 }
 // Plot a solid sizeW×sizeH block at (x,y) in hue/sat%/light%/alpha — the ONE call brush code makes
 // instead of touching ctx.fillStyle/fillRect directly. Same call works for either painting mode.
+// Paint a solid block from RAW r/g/b (0-255) instead of h/s/l — used for effects that need to
+// isolate one real color channel of an actual picked color (chromatic-aberration-style channel
+// split), where converting through hue rotation would substitute an unrelated color instead of a
+// true single-channel tint of the color that's actually there.
+function paintRGB(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: number, r: number, g: number, b: number, a: number) {
+  if (a <= 0) return;
+  if (target.mode === "ctx") {
+    target.ctx!.fillStyle = `rgba(${r},${g},${b},${a})`;
+    target.ctx!.fillRect(x, y, sizeW, sizeH);
+    return;
+  }
+  const buf = target.buf!, bw = target.bw!, bh = target.bh!;
+  const x0 = Math.max(0, Math.floor(x));
+  const y0 = Math.max(0, Math.floor(y));
+  const x1 = Math.min(bw, Math.floor(x) + Math.max(1, Math.round(sizeW)));
+  const y1 = Math.min(bh, Math.floor(y) + Math.max(1, Math.round(sizeH)));
+  if (x1 <= x0 || y1 <= y0) return;
+  const alpha = Math.min(1, a);
+  if (target.mode === "iso") {
+    const alphaBuf = target.alphaBuf!;
+    for (let yy = y0; yy < y1; yy++) {
+      for (let xx = x0; xx < x1; xx++) {
+        const idx = (yy * bw + xx) * 4;
+        blendIsoPixel(buf, alphaBuf, idx, yy * bw + xx, r, g, b, alpha);
+      }
+    }
+    return;
+  }
+  const ia = 1 - alpha;
+  for (let yy = y0; yy < y1; yy++) {
+    let idx = (yy * bw + x0) * 4;
+    for (let xx = x0; xx < x1; xx++, idx += 4) {
+      buf[idx] = r * alpha + buf[idx] * ia;
+      buf[idx + 1] = g * alpha + buf[idx + 1] * ia;
+      buf[idx + 2] = b * alpha + buf[idx + 2] * ia;
+      buf[idx + 3] = 255;
+    }
+  }
+}
 function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: number, h: number, s: number, l: number, a: number) {
   if (a <= 0) return;
   if (target.mode === "ctx") {
@@ -911,7 +948,15 @@ function Index() {
   function renderStroke(target: PaintTarget, s: Stroke, w: number, h: number, t: number, dtRaw: number, now: number, opts: RenderOpts) {
     const step = Math.max(1, opts.step);
     const dt = dtRaw * (0.3 + s.speed * 2.4);
-    const tt = t * (0.3 + s.speed * 2.4);
+    // Every "breathing"/pulsing effect below (dither/mosaic sweep, pulse-mode brightness, ribbon
+    // phase, rainbow flow) was driven purely by the shared GLOBAL clock `t`, with no per-stroke
+    // offset — so two strokes drawn minutes apart still breathed in exact lockstep, since at any
+    // given instant they both read the same `t`. Adding a phase offset derived from each stroke's
+    // own birth time (stable forever after creation, since s.born never changes) staggers every
+    // stroke onto its own point in the cycle — strokes drawn at different times now visibly
+    // breathe/pulse out of sync with each other instead of all flashing on the same beat.
+    const phaseOffset = (s.born % 6283) / 1000; // ~0..2π spread, so it covers a full cycle
+    const tt = t * (0.3 + s.speed * 2.4) + phaseOffset;
     const lifeMs = now - s.born;
     // Was a hardcoded 0.05 rate with no way to adjust it. "Поток" mode keeps that exact same 0.05
     // (unchanged, since it already has its own separate speed slider via legacyFlow below) — only
@@ -919,7 +964,6 @@ function Index() {
     // until the slider is actually moved.
     const modeHueShift = s.mode === "rainbow" ? (lifeMs * (s.rainbowFlow ? 0.05 : s.rainbowBlinkSpeed * 0.1)) % 360 : 0;
     const modePulse = s.mode === "pulse" ? 0.6 + 0.5 * Math.sin(tt * 2) : 1;
-    const modeSpray = s.mode === "spray" ? 2.2 : 1;
     const alphaMul = (0.25 + s.intensity * 0.9) * modePulse;
     const pts = s.points;
     // "Радуга: Поток" keeps its original simple full-spectrum sweep, unchanged.
@@ -1093,7 +1137,13 @@ function Index() {
       if (!s.ink) s.ink = { phase: Math.random() * 100 };
       s.ink.phase += dt * 0.002;
       const grid = Math.max(2, Math.round(s.size / 8));
-      const thickness = Math.max(grid, s.size * (0.45 + s.intensity * 0.55) * modePulse * modeSpray);
+      // "Распыление" used to just multiply thickness by a flat 2.2x — a wider solid line, not an
+      // actual spray. Real spray scatter is now handled below (isSpray branch): random speckled
+      // dots with a soft falloff toward the edges, like paint from an airbrush, instead of a
+      // uniform evenly-stepped fill. Base thickness no longer gets the flat multiplier since the
+      // scatter radius below handles reach on its own.
+      const isSpray = s.mode === "spray";
+      const thickness = Math.max(grid, s.size * (0.45 + s.intensity * 0.55) * modePulse);
       const half = thickness / 2;
       const phaseI = s.ink.phase;
       // PERF: segment geometry (unit normal + step count) is cached per stroke — it's the same
@@ -1110,12 +1160,32 @@ function Index() {
           const cx = p.x + dx * f, cy = p.y + dy * f;
           const wob = Math.sin((i + f) * 0.3 + phaseI * 6) * s.size * 0.12 * s.dynamics
                     + hash(i + f + phaseI * 10) * s.noise * grid * 2;
-          for (let t2 = -half; t2 <= half; t2 += grid) {
-            const gx = Math.round((cx + nx * (t2 + wob)) / grid) * grid;
-            const gy = Math.round((cy + ny * (t2 + wob)) / grid) * grid;
-            const edge = 1 - Math.abs(t2) / (half + 1);
-            const l = 55 + edge * 25;
-            paint(target, gx, gy, grid, grid, hueAt(i, f), 85, l, alphaMul * edge);
+          if (isSpray) {
+            // Real airbrush-style scatter: a variable number of randomly placed dots (not an even
+            // grid march), biased toward the centerline (two summed uniforms ≈ a soft triangular
+            // falloff, cheaper than a true gaussian) and randomly dropped near the edges — the
+            // grainy, uneven texture that actually reads as "spray" rather than a solid stripe.
+            const sprayHalf = half * 1.6;
+            const dotCount = Math.max(5, Math.floor(6 + s.density * 16));
+            for (let d = 0; d < dotCount; d++) {
+              const rnd = Math.random() + Math.random() - 1; // -1..1, peaked at 0
+              const t2 = rnd * sprayHalf + wob;
+              const distN = Math.abs(t2 - wob) / (sprayHalf + 1);
+              if (Math.random() > 0.85 - distN * 0.5) continue; // sparser out toward the edges
+              const gx = Math.round((cx + nx * t2) / grid) * grid;
+              const gy = Math.round((cy + ny * t2) / grid) * grid;
+              const edge = 1 - distN;
+              const l = 50 + edge * 25;
+              paint(target, gx, gy, grid, grid, hueAt(i, f), 85, l, alphaMul * edge * (0.5 + Math.random() * 0.5));
+            }
+          } else {
+            for (let t2 = -half; t2 <= half; t2 += grid) {
+              const gx = Math.round((cx + nx * (t2 + wob)) / grid) * grid;
+              const gy = Math.round((cy + ny * (t2 + wob)) / grid) * grid;
+              const edge = 1 - Math.abs(t2) / (half + 1);
+              const l = 55 + edge * 25;
+              paint(target, gx, gy, grid, grid, hueAt(i, f), 85, l, alphaMul * edge);
+            }
           }
         }
       }
@@ -1226,11 +1296,10 @@ function Index() {
       const grid = Math.max(4, Math.round(s.size / 4));
       // Amplitude was a full 0..1 swing, meaning at the extremes of every cycle a large fraction of
       // cells simultaneously turned on/off together — that's what read as "glowing/straining the
-      // eyes" on top of the abruptness already fixed above. Narrowing the swing (still centered so
-      // coverage/density keep their same average meaning) means far fewer cells change state at
-      // once per cycle, and slowing the base rate a bit gives the eye more time to settle between
-      // breaths instead of a fast pulse.
-      const sweep = 0.5 + 0.22 * Math.sin(tt * (0.35 + s.speed * 1.2) * Math.PI * 2);
+      // eyes" on top of the abruptness already fixed above. Narrowing the swing further (still
+      // centered so coverage/density keep their same average meaning) means fewer cells change
+      // state at once per cycle.
+      const sweep = 0.5 + 0.14 * Math.sin(tt * (0.35 + s.speed * 1.2) * Math.PI * 2);
       const stepPts = Math.max(1, Math.floor(pts.length / 40));
       const radius = s.size * (1 + s.dynamics * 1.5);
       // PERF: offsets used to be recomputed with a nested dx/dy loop + Math.hypot EVERY frame for
@@ -1247,21 +1316,38 @@ function Index() {
       // instead of strobing randomly.
       const coverage = 0.2 + s.density * 0.8;
       // A cell used to be a hard 0/1 (dist <= threshold ? fully painted : nothing), so as `sweep`
-      // moved, cells popped in/out fully-formed from one frame to the next — the "too sharp" part of
-      // the flicker. Fade each cell in/out over a band about 2-3 grid steps wide instead of an
-      // instant cutoff, so the same motion now reads as a soft breathing edge rather than a strobe.
-      const edgeWidth = Math.max(1e-4, (grid / radius) * 2.5);
+      // moved, cells popped in/out fully-formed from one frame to the next — the "too sharp" part
+      // of the flicker. Fade each cell in/out over a narrow band instead of an instant cutoff, so
+      // the same motion reads as a soft edge — but kept NARROW: a wide fade band means, at some
+      // point in the sweep cycle, a large fraction of the whole painted area sits simultaneously
+      // in mid-transition (partially transparent) all at once, which is what read as sitewide
+      // "blur" during playback. Narrower band = far fewer cells in transition at any one instant.
+      const edgeWidth = Math.max(1e-4, (grid / radius) * 1.4);
       for (let pi = 0; pi < pts.length; pi += stepPts) {
         const p = pts[pi];
         const hueD = hueAt(pi);
         const cx = Math.round(p.x / grid) * grid;
         const cy = Math.round(p.y / grid) * grid;
+        // Every sampled point used the exact same `sweep` value, so each point's "fade ring" (the
+        // cells currently mid-transition, at dist ~= threshold) sat at the identical relative
+        // distance from its own center. When points are close together (dense/solid coverage),
+        // those rings line up across neighboring points into one continuous seam of dimmer cells
+        // cutting through an otherwise solid area — the "band of dark circles" artifact. A small
+        // per-point phase offset (stable across frames, since it's derived from the point's own
+        // index rather than time) staggers each point's ring to a slightly different radius, so
+        // adjacent points' rings no longer align into a straight seam.
+        const pointJitter = (noiseAt(pi * 17 + 3) - 0.5) * 0.16;
+        const sweepP = sweep + pointJitter;
         for (const off of offsets) {
           const gx = cx + off.dx, gy = cy + off.dy;
           const bayer = (((gx / grid) & 1) ^ ((gy / grid) & 1));
           const dist = off.dist;
           const grain = noiseAt(gx + gy * 7);
-          const threshold = (sweep + bayer * 0.4 + grain * s.noise * 0.4) * coverage;
+          // grain's weight no longer depends ENTIRELY on the noise slider — a small fixed baseline
+          // (0.15) is always present, so even at noise=0 cells don't all sit at the identical
+          // threshold and flip in lockstep across the whole area; noise still adds MORE per-cell
+          // variation on top of that baseline.
+          const threshold = (sweepP + bayer * 0.4 + grain * (0.15 + s.noise * 0.4)) * coverage;
           const edge = threshold - dist;
           if (edge <= -edgeWidth) continue;
           const fade = Math.max(0, Math.min(1, (edge + edgeWidth) / (2 * edgeWidth)));
@@ -1273,14 +1359,19 @@ function Index() {
     }
 
     else if (s.kind === "pixelGlitch") {
+      // With just one point (right after pointer-down, before any movement), the full slice
+      // pattern was still drawn stacked around that single spot — there's no real direction yet,
+      // and this is exactly what read as a stray dot sitting at the very start of every stroke,
+      // separate from the actual glitch that appears once you start dragging. Wait for at least
+      // one real segment before drawing anything.
+      if (pts.length < 2) return;
       const grid = Math.max(2, Math.round(s.size / 6));
       const stepPts = Math.max(1, Math.floor(pts.length / 30));
-      // Was always laid out as horizontal bars (slices stacked in Y, each extending along X) no
-      // matter which way the stroke was drawn — a single fixed "pose". Slices now stack along the
-      // LOCAL NORMAL of the path (perpendicular to the direction you're moving) and each slice
-      // extends along the LOCAL TANGENT (parallel to that direction), using the same per-segment
-      // direction data ink/ribbon already cache. For a stroke drawn left-to-right this reduces to
-      // exactly the old horizontal layout — it's the same shape, just rotated to follow the mazok.
+      // dynamics now doubles as "how much this brush follows the stroke's own direction": 0 keeps
+      // the slices in the original fixed horizontal pose (nx=0,ny=1 — same as before direction
+      // tracking existed), and increasing values blend smoothly toward fully following the local
+      // path direction. So dynamics no longer only controls radius — it's the one knob for both
+      // reach and how "aware" the glitch is of the stroke's own movement.
       const segs = getSegCache(s, pts, grid);
       for (let pi = 0; pi < pts.length; pi += stepPts) {
         const p = pts[pi];
@@ -1288,7 +1379,13 @@ function Index() {
         const radius = s.size * (0.8 + s.dynamics * 1.5);
         const slices = 3 + Math.floor(s.density * 8);
         const seg = segs[Math.min(pi, segs.length - 1)];
-        const nx = seg ? seg.nx : 0, ny = seg ? seg.ny : 1;
+        const followT = Math.max(0, Math.min(1, s.dynamics));
+        const nx0 = 0, ny0 = 1; // static pose: bars stack vertically, extend horizontally
+        const nx1 = seg ? seg.nx : nx0, ny1 = seg ? seg.ny : ny0;
+        let nx = nx0 * (1 - followT) + nx1 * followT;
+        let ny = ny0 * (1 - followT) + ny1 * followT;
+        const nlen = Math.hypot(nx, ny) || 1;
+        nx /= nlen; ny /= nlen;
         const tx = ny, ty = -nx; // tangent = normal rotated 90°
         for (let i = 0; i < slices; i++) {
           const yOff = (i / slices - 0.5) * radius * 2;
@@ -1298,59 +1395,33 @@ function Index() {
           const startX = baseX - tx * (widthLine / 2) + tx * shift;
           const startY = baseY - ty * (widthLine / 2) + ty * shift;
           const offs = [-grid, 0, grid];
-          let hues: number[];
-          if (s.mode === "gradient") {
-            // Sample the actual chosen palette at three nearby positions instead of a synthetic
-            // +120/+240 hue offset — otherwise the channel-split always looks like a generic RGB
-            // trio no matter which colors were picked, making the tool feel unresponsive to them.
-            const spread = 0.035;
-            const basePos = ((p.x * gradCos + p.y * gradSin) / gradExtent) * s.gradientScale + gradTravel;
-            hues = [
-              gradHueRampAt(basePos - spread),
-              gradHueRampAt(basePos),
-              gradHueRampAt(basePos + spread),
-            ];
-          } else {
-            hues = [hueG % 360, (hueG + 120) % 360, (hueG + 240) % 360];
-          }
+          // Real per-channel isolation of the ACTUAL picked color, instead of a synthetic +120°/
+          // +240° hue rotation — that rotation could land on a hue totally unrelated to what was
+          // picked (e.g. a magenta base could rotate to land exactly on yellow), which is what
+          // produced the stray off-color dot next to the stroke. Splitting the true r/g/b channels
+          // of one real color can never introduce a hue that wasn't already there.
+          const baseRgb = s.mode === "gradient"
+            ? getHslRgb(gradHueRampAt(((p.x * gradCos + p.y * gradSin) / gradExtent) * s.gradientScale + gradTravel), 100, 55)
+            : getHslRgb(hueG, 100, 55);
+          const channels: [number, number, number][] = [
+            [baseRgb[0], 0, 0],
+            [0, baseRgb[1], 0],
+            [0, 0, baseRgb[2]],
+          ];
           for (let c2 = 0; c2 < 3; c2++) {
+            const [cr, cg, cb] = channels[c2];
             for (let xb = 0; xb < widthLine; xb += grid) {
               if (Math.random() > 0.4 + s.intensity * 0.5) continue;
               const off = xb + offs[c2];
               const px = startX + tx * off, py = startY + ty * off;
-              paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hues[c2], 100, 55, alphaMul * 0.55);
+              paintRGB(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, cr, cg, cb, alphaMul * 0.55);
             }
           }
         }
       }
     }
 
-    else if (s.kind === "web") {
-      // Connects sampled points to their nearby OTHER points (not just the next one along the
-      // path) — a network of thin fading lines instead of one continuous stroke. Only checked
-      // against a coarse sample of the path (not every raw point) to keep the pairwise check cheap.
-      const stepPts = Math.max(1, Math.floor(pts.length / 26));
-      const grid = Math.max(2, Math.round(s.size / 10));
-      const radius = s.size * (2 + s.dynamics * 4);
-      // Slow shared "breathing" brightness so the whole web glimmers gently instead of sitting flat.
-      const pulse = 0.6 + 0.4 * Math.sin(tt * (1 + s.speed * 3));
-      const sample: { x: number; y: number; i: number }[] = [];
-      for (let pi = 0; pi < pts.length; pi += stepPts) sample.push({ x: pts[pi].x, y: pts[pi].y, i: pi });
-      for (let a = 0; a < sample.length; a++) {
-        for (let b = a + 1; b < sample.length; b++) {
-          const dx = sample[b].x - sample[a].x, dy = sample[b].y - sample[a].y;
-          const dist = Math.hypot(dx, dy);
-          if (dist > radius || dist < 1) continue;
-          const steps = Math.max(1, Math.floor(dist / grid));
-          const hueW = s.mode === "gradient" ? gradHueRampAt(((sample[a].x * gradCos + sample[a].y * gradSin) / gradExtent) * s.gradientScale + gradTravel) : hueAt(sample[a].i);
-          const fade = (1 - dist / radius) * pulse * (0.3 + s.intensity * 0.7);
-          for (let k = 0; k <= steps; k++) {
-            const fx = sample[a].x + dx * (k / steps), fy = sample[a].y + dy * (k / steps);
-            paint(target, Math.round(fx / grid) * grid, Math.round(fy / grid) * grid, grid, grid, hueW, 80, 60, alphaMul * fade * 0.5);
-          }
-        }
-      }
-    }
+
 
     else if (s.kind === "mosaic") {
       // Same "reveal by threshold" idea as Дизеринг, but the block size varies per sampled point
@@ -1361,10 +1432,15 @@ function Index() {
       const stepPts = Math.max(1, Math.floor(pts.length / 40));
       const radius = s.size * (1 + s.dynamics * 1.5);
       const coverage = 0.2 + s.density * 0.8;
-      const sweep = 0.5 + 0.22 * Math.sin(tt * (0.35 + s.speed * 1.2) * Math.PI * 2);
+      // Same fix as Дизеринг: narrower swing (was 0.22, synchronized across the whole area) so
+      // fewer tiles flip at once, and a per-point phase jitter below so neighboring points' reveal
+      // fronts don't line up into one big synchronized wash across the painted area.
+      const sweep = 0.5 + 0.14 * Math.sin(tt * (0.35 + s.speed * 1.2) * Math.PI * 2);
       for (let pi = 0; pi < pts.length; pi += stepPts) {
         const p = pts[pi];
         const hueM = hueAt(pi);
+        const pointJitter = (noiseAt(pi * 17 + 3) - 0.5) * 0.16;
+        const sweepP = sweep + pointJitter;
         const sizeClass = noiseAt(pi * 131 + Math.floor(p.x) * 7 + Math.floor(p.y) * 13);
         const grid = baseGrid * (sizeClass > 0.5 ? 3 : sizeClass > 0 ? 2 : 1);
         const cx = Math.round(p.x / grid) * grid, cy = Math.round(p.y / grid) * grid;
@@ -1375,7 +1451,10 @@ function Index() {
             const dist = Math.hypot(wx - p.x, wy - p.y) / radius;
             if (dist > 1) continue;
             const grain = noiseAt(Math.round(wx / grid) * 7 + Math.round(wy / grid) * 13);
-            const threshold = (sweep + grain * s.noise * 0.4) * coverage;
+            // Baseline grain weight (0.15) independent of the noise slider — same reasoning as
+            // Дизеринг: without it, at noise=0 every tile shares nearly the same threshold and
+            // pops in/out together across a wide area, reading as a sitewide haze.
+            const threshold = (sweepP + grain * (0.15 + s.noise * 0.4)) * coverage;
             if (dist > threshold) continue;
             const lit = 42 + (1 - dist) * 26;
             paint(target, wx, wy, grid, grid, hueM, 90, lit, alphaMul * (1 - dist));
@@ -1388,30 +1467,58 @@ function Index() {
       // Roughly stationary glowing patches (unlike Пикс. дождь, which falls and despawns) — each
       // one holds its position and just breathes brightness on its own independent slow cycle, so
       // the patches flare and dim out of sync with each other like real smoldering embers instead
-      // of pulsing together. Shares the same global rain budget so a scene with lots of live rain
-      // AND embers still can't spawn unbounded particles between them.
+      // of pulsing together.
+      //
+      // FIX: embers used to never expire, only capped by a fixed target count derived from
+      // density. Once that count was reached, the spawn loop below stopped adding anything no
+      // matter how much further you dragged — the brush felt like it "just makes one static
+      // batch and that's it" instead of something you paint with continuously. Each ember now
+      // gets a finite lifespan (like a real coal cooling down and crumbling to ash) and is culled
+      // once its time is up, which frees budget for fresh embers to keep appearing as you keep
+      // moving the brush — the pool is alive and responsive instead of a one-shot spawn.
       const grid = Math.max(3, Math.round(s.size / 4));
       const currentCount = s.embers?.length ?? 0;
       const wantCount = Math.floor(8 + s.density * 60);
       const targetCount = Math.min(wantCount, currentCount + Math.max(0, opts.rainBudget.left));
       if (!s.embers) s.embers = [];
       while (s.embers.length < targetCount && opts.rainBudget.left > 0) {
-        const idx = Math.floor(Math.random() * pts.length);
-        const p = pts[idx];
+        // Bias toward the MOST RECENTLY drawn part of the path (Math.random()*Math.random() skews
+        // toward 0, i.e. toward the newest points) instead of sampling uniformly across the whole
+        // stroke's history — so fresh embers actually cluster near where you're currently drawing,
+        // making the brush feel like it's tracking the tip rather than randomly re-seeding old areas.
+        const recentWindow = Math.min(pts.length, 40);
+        const idx = pts.length - 1 - Math.floor(Math.random() * Math.random() * recentWindow);
+        const p = pts[Math.max(0, idx)];
         s.embers.push({
           x: Math.round(p.x / grid) * grid + (Math.random() - 0.5) * s.size,
           y: Math.round(p.y / grid) * grid + (Math.random() - 0.5) * s.size,
           hue: s.mode === "gradient" ? gradientHueAtXY(p.x, p.y) : s.hue + (Math.random() - 0.5) * 30,
           seed: Math.random() * 1000,
           period: 1.2 + Math.random() * 2.5,
+          bornAt: now,
+          life: 2200 + Math.random() * 3000,
         });
         opts.rainBudget.left--;
       }
-      for (const e of s.embers) {
+      for (let i = s.embers.length - 1; i >= 0; i--) {
+        const e = s.embers[i];
+        const age = now - e.bornAt;
+        if (age > e.life) {
+          // Swap-pop instead of splice — same O(1) removal trick used for Пикс. дождь, since
+          // order doesn't matter for particles.
+          const last = s.embers.length - 1;
+          if (i !== last) s.embers[i] = s.embers[last];
+          s.embers.pop();
+          continue;
+        }
+        // Fade out smoothly over the last ~25% of its life instead of popping out abruptly once
+        // culled, so an ember visibly cools down and dims rather than vanishing mid-glow.
+        const lifeFrac = age / e.life;
+        const dying = lifeFrac > 0.75 ? 1 - (lifeFrac - 0.75) / 0.25 : 1;
         const glow = 0.5 + 0.5 * Math.sin((tt * 2 * Math.PI) / e.period + e.seed);
         const lit = 20 + glow * (30 + s.intensity * 20);
         const hueE = s.mode === "gradient" ? gradientHueAtXY(e.x, e.y) : (e.hue + modeHueShift) % 360;
-        paint(target, Math.round(e.x / grid) * grid, Math.round(e.y / grid) * grid, grid, grid, hueE, 85, lit, alphaMul * (0.3 + glow * 0.7));
+        paint(target, Math.round(e.x / grid) * grid, Math.round(e.y / grid) * grid, grid, grid, hueE, 85, lit, alphaMul * (0.3 + glow * 0.7) * Math.max(0, dying));
       }
     }
   }
