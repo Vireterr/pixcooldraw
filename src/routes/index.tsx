@@ -1414,26 +1414,18 @@ function Index() {
           const startX = baseX - tx * (widthLine / 2) + tx * shift;
           const startY = baseY - ty * (widthLine / 2) + ty * shift;
           const offs = [-grid, 0, grid];
-          // Real per-channel isolation of the ACTUAL picked color, instead of a synthetic +120°/
-          // +240° hue rotation — that rotation could land on a hue totally unrelated to what was
-          // picked (e.g. a magenta base could rotate to land exactly on yellow), which is what
-          // produced the stray off-color dot next to the stroke. Splitting the true r/g/b channels
-          // of one real color can never introduce a hue that wasn't already there.
-          const baseRgb = s.mode === "gradient"
-            ? getHslRgb(gradHueRampAt(((p.x * gradCos + p.y * gradSin) / gradExtent) * s.gradientScale + gradTravel), 100, 55)
-            : getHslRgb(hueG, 100, 55);
-          const channels: [number, number, number][] = [
-            [baseRgb[0], 0, 0],
-            [0, baseRgb[1], 0],
-            [0, 0, baseRgb[2]],
-          ];
+          // Back to the original synthetic +120°/+240° hue rotation per slice-channel — this is the
+          // color palette that was here before the "real r/g/b channel isolation" change, and the
+          // one that was actually liked. The "Глитч" MODE (added separately) reuses this same idea
+          // for other brushes; this brush's own coloring is independent of that mode.
+          const hues: number[] = [hueG, hueG + 120, hueG + 240];
           for (let c2 = 0; c2 < 3; c2++) {
-            const [cr, cg, cb] = channels[c2];
+            const hueC = hues[c2];
             for (let xb = 0; xb < widthLine; xb += grid) {
               if (Math.random() > 0.4 + s.intensity * 0.5) continue;
               const off = xb + offs[c2];
               const px = startX + tx * off, py = startY + ty * off;
-              paintRGB(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, cr, cg, cb, alphaMul * 0.55);
+              paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hueC, 100, 55, alphaMul * 0.55);
             }
           }
         }
