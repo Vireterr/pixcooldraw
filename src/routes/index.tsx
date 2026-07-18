@@ -1450,7 +1450,19 @@ function Index() {
       // eyes" on top of the abruptness already fixed above. Narrowing the swing further (still
       // centered so coverage/density keep their same average meaning) means fewer cells change
       // state at once per cycle.
-      const sweep = 0.5 + 0.14 * Math.sin(tt * (0.35 + s.speed * 1.2) * Math.PI * 2);
+      // FIX (this is the real cause of the brush intermittently going near-invisible/"black"
+      // regardless of any mode/brush setting elsewhere): the WHOLE canvas buffer is cleared to the
+      // background color every single frame and every stroke is fully repainted from scratch each
+      // time (see the buf32.fill(BG_PACKED) at the top of the render loop) — so this sweep isn't
+      // just a subtle texture wobble, it's the ONLY thing standing between "solid dithered fill"
+      // and "background shows through almost everywhere" on any given frame. At the bottom of the
+      // old ±0.14 swing, combined with a low/mid "Плотность", `threshold` could fall low enough
+      // that nearly every cell failed the distance check that frame — the whole stroke would go
+      // dark for that slice of the cycle, then "come back" as the sweep rose again. Narrower swing
+      // + a real coverage floor (never below 0.4) means there's always a solid core no matter where
+      // in the breathing cycle or density setting you are — it can still visibly pulse, just never
+      // collapse to nothing.
+      const sweep = 0.5 + 0.08 * Math.sin(tt * (0.35 + s.speed * 1.2) * Math.PI * 2);
       const stepPts = Math.max(1, Math.floor(pts.length / 40));
       const radius = s.size * (1 + s.dynamics * 1.5);
       // PERF: offsets used to be recomputed with a nested dx/dy loop + Math.hypot EVERY frame for
@@ -1465,7 +1477,7 @@ function Index() {
       // what) and barely visible at low density. The existing per-cell hash (`grain`) now stands in
       // for the old Math.random() texture too, so a cell's on/off state holds steady frame to frame
       // instead of strobing randomly.
-      const coverage = 0.2 + s.density * 0.8;
+      const coverage = 0.4 + s.density * 0.6;
       // A cell used to be a hard 0/1 (dist <= threshold ? fully painted : nothing), so as `sweep`
       // moved, cells popped in/out fully-formed from one frame to the next — the "too sharp" part
       // of the flicker. Fade each cell in/out over a narrow band instead of an instant cutoff, so
@@ -1517,7 +1529,7 @@ function Index() {
           // was already fixed. Flat now: brightness varies only by the tile's own fixed grain, alpha
           // only by the actual edge transition — a real solid dithered fill, not a radial smudge.
           const lit = 48 + grain * 14;
-          paint(target, gx, gy, grid, grid, hueD + (bayer ? 30 : 0), 95, lit, alphaMul * fade);
+          paint(target, gx, gy, grid, grid, hueD + (bayer ? 30 : 0), 85, lit, alphaMul * fade);
         }
       }
     }
@@ -1600,11 +1612,15 @@ function Index() {
       const baseGrid = Math.max(3, Math.round(s.size / 4));
       const stepPts = Math.max(1, Math.floor(pts.length / 40));
       const radius = s.size * (1 + s.dynamics * 1.5);
-      const coverage = 0.2 + s.density * 0.8;
+      const coverage = 0.4 + s.density * 0.6;
       // Same fix as Дизеринг: narrower swing (was 0.22, synchronized across the whole area) so
       // fewer tiles flip at once, and a per-point phase jitter below so neighboring points' reveal
-      // fronts don't line up into one big synchronized wash across the painted area.
-      const sweep = 0.5 + 0.14 * Math.sin(tt * (0.35 + s.speed * 1.2) * Math.PI * 2);
+      // fronts don't line up into one big synchronized wash across the painted area. Also raised
+      // the coverage floor above (was 0.2) for the same reason as Дизеринг — the whole canvas is
+      // cleared and every stroke fully repainted every frame, so a threshold that can sweep down
+      // near zero means the stroke itself intermittently vanishes to background for part of every
+      // cycle, not just "looks dimmer."
+      const sweep = 0.5 + 0.08 * Math.sin(tt * (0.35 + s.speed * 1.2) * Math.PI * 2);
       for (let pi = 0; pi < pts.length; pi += stepPts) {
         const p = pts[pi];
         const hueM = hueAt(pi);
@@ -2008,8 +2024,20 @@ function Index() {
   // === New canvas ===
   const [newW, setNewW] = useState(1280);
   const [newH, setNewH] = useState(800);
+  // FIX: this is what was actually crashing the whole page on "new canvas". The inputs' min/max
+  // attributes only affect the spinner arrows and :invalid styling — they do NOT stop the user
+  // from typing 0, a negative number, leaving the field blank (→ NaN → 0 via the `|| 0` fallback),
+  // or a huge value like 99999. Any of those went straight into setCanvasSize unclamped, then into
+  // `new Uint8ClampedArray(w*h*4)` and `new PIXI.Application({ width: w, height: h })` — a
+  // zero-size or absurdly large WebGL context throws there, and that throw was uncaught, taking
+  // down the whole render effect (and with it the page). Clamping the actual values used here to
+  // the same 64-4096 range the inputs only pretend to enforce is what actually prevents that.
+  const clampCanvasDim = (v: number): number => {
+    if (!Number.isFinite(v)) return 64;
+    return Math.max(64, Math.min(4096, Math.round(v)));
+  };
   const newCanvas = () => {
-    setCanvasSize({ w: newW, h: newH });
+    setCanvasSize({ w: clampCanvasDim(newW), h: clampCanvasDim(newH) });
     setZoom(1);
     setPan({ x: 0, y: 0 });
     const layer: Layer = { id: ++layerIdCounter, name: "Слой 1", visible: true, strokes: [] };
