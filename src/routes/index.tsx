@@ -1080,17 +1080,24 @@ function Index() {
       const proj = ((x * gradCos + y * gradSin) / gradExtent) * s.gradientScale;
       return gradHueRampAt(proj + gradTravel);
     };
-    // "Глитч" mode — the old color-shift palette, restored as its own selectable mode instead of
-    // being baked into the "Глитч" BRUSH (which now does something different: real r/g/b channel
-    // isolation of the one picked color, a deliberate accuracy fix, not a palette anyone asked to
-    // lose). This is a chaotic 3-way hue split (+0/+120/+240°) that re-rolls fast over time and
-    // varies per point/particle — echoing misaligned RGB channels — which is exactly what any brush
-    // painted with when "glitch" used to just be a color mode.
+    // "Глитч" mode — a spatial-desync color corruption. Two things were making this read as "just
+    // another rainbow": (1) `glitchCell` was ONE shared time-bucket for the whole canvas, so every
+    // point/particle everywhere re-rolled its color on the exact same beat — different colors at
+    // any instant, sure, but the whole picture flipped in lockstep, which looks like a synced
+    // palette sweep rather than points glitching independently; (2) the result was always exactly
+    // +0°/+120°/+240° — a clean 3-color rotation, i.e. literally a rainbow with fewer steps. Fixed
+    // both: each seed now re-rolls on its OWN offset tick (own phase folded into the bucket calc),
+    // so different points/particles corrupt at different, independent moments — and most of the
+    // time nothing happens at all (stays the real color), with an occasional jump to a chaotic,
+    // non-uniform offset when it does glitch — brief corruption, not a constant color cycle.
     const glitchOn = s.mode === "glitch";
-    const glitchCell = glitchOn ? Math.floor(mt * (3 + ms * 15)) : 0;
+    const glitchRate = 3 + ms * 15;
     const glitchShift = (seed: number): number => {
       if (!glitchOn) return 0;
-      return Math.floor(((hash(glitchCell * 131 + seed) + 1) / 2) * 3) * 120;
+      const cell = Math.floor(mt * glitchRate + hash(seed * 131) * glitchRate);
+      const roll = hash(cell * 131 + seed);
+      if (roll < 0.4) return 0; // stays true color most of the time — a glitch, not a cycle
+      return 30 + ((roll + 1) / 2) * 300; // chaotic jump, not a clean 120°-step palette
     };
     const hueAt = (i: number, f = 0): number => {
       if (s.mode === "gradient") {
