@@ -42,6 +42,13 @@ interface Stroke {
   noise: number;
   intensity: number;
   dynamics: number;
+  // Decouples mode animation (pulse's breathing rate, glitch's flicker rate) from the brush's own
+  // `speed` (which drives the BRUSH's physical drawing dynamics — ink wobble, rain fall, dt scaling).
+  // Before this, every mode's color animation was forced to run at whatever rate the brush's speed
+  // slider happened to be at, with no independent control — this is that independent control.
+  // Rainbow and gradient modes keep their own separate speed sliders (rainbowFlowSpeed/gradientSpeed)
+  // unchanged; this only applies to modes that had no speed control of their own at all.
+  modeSpeed: number;
   rainbowFlow: boolean;
   rainbowFlowSpeed: number;
   rainbowBlinkSpeed: number;
@@ -162,9 +169,22 @@ const MAX_POINTS_PER_STROKE = 600;
 // Global cap on live pixelRain particles across the ENTIRE scene (was 200 PER STROKE before).
 const GLOBAL_RAIN_CAP = 2000;
 
+// FIX: the previous version multiplied n*n*15731 in ordinary floating-point arithmetic before
+// masking to 32 bits. That product exceeds 2^53 (float64's exact-integer limit) for almost any
+// realistic seed — pixel coordinates, a growing animation-time counter — at which point the bits
+// the final "&" needs have already been silently rounded away, and hash() collapses to a CONSTANT
+// 1.0 for every call past roughly n > ~1000 (verified: was returning exactly 1.0 for 99%+ of a
+// 100,000-sample sweep). That flattened dither/mosaic's per-cell "grain" texture to near-uniform
+// once its inputs got big, froze pixelGlitch's per-frame slice jitter after the first couple
+// seconds of runtime, and heavily biased the new "Глитч" mode's 3-way hue pick toward one branch
+// almost all the time. Math.imul does real 32-bit integer multiplication with exact wraparound —
+// no float precision loss, however large n gets.
 function hash(n: number) {
-  n = (n << 13) ^ n;
-  return 1.0 - (((n * (n * n * 15731 + 789221) + 1376312589) & 0x7fffffff) / 1073741823.5);
+  n = n | 0;
+  n = Math.imul(n ^ (n >>> 16), 0x45d9f3b) | 0;
+  n = Math.imul(n ^ (n >>> 16), 0x45d9f3b) | 0;
+  n = (n ^ (n >>> 16)) | 0;
+  return 1 - ((n & 0x7fffffff) / 1073741823.5);
 }
 // PERF: precomputed noise table. hash() itself is cheap, but it's called once per grid-cell for
 // dither grain, and that argument (gx + gy*7) is an INTEGER grid coordinate that never changes
@@ -265,6 +285,16 @@ interface PaintTarget {
   // stroke in isolation starts from full transparency, so touches need real "over" compositing to
   // combine correctly no matter how many times the same stroke paints over itself.
   alphaBuf?: Uint8ClampedArray;
+  // Set for the duration of one stroke's render pass when its mode is "Распыление" (spray) AND its
+  // brush isn't "ink" (which already has its own bespoke airbrush scatter, done differently, inside
+  // its own point loop). Every paint()/paintRGB() call then randomly skips or jitters — the generic
+  // mechanism that makes spray actually do something for EVERY other brush (ribbon, dither, mosaic,
+  // lightning, embers, the glitch brush...), instead of silently having no effect on all of them.
+  spray?: number;
+  // Probability a given spray-scattered paint() call actually lands, instead of being randomly
+  // skipped — set alongside `spray` above. Without this every brush's spray looked identical
+  // regardless of the "Плотность" (density) slider, since the skip chance was a hardcoded constant.
+  sprayKeep?: number;
 }
 function hslToRgb(h: number, s: number, l: number): [number, number, number] {
   h = ((h % 360) + 360) % 360;
@@ -317,6 +347,11 @@ function blendIsoPixel(buf: Uint8ClampedArray, alphaBuf: Uint8ClampedArray, idx:
 // true single-channel tint of the color that's actually there.
 function paintRGB(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: number, r: number, g: number, b: number, a: number) {
   if (a <= 0) return;
+  if (target.spray) {
+    if (Math.random() > (target.sprayKeep ?? 0.55)) return;
+    x += (Math.random() - 0.5) * target.spray;
+    y += (Math.random() - 0.5) * target.spray;
+  }
   if (target.mode === "ctx") {
     target.ctx!.fillStyle = `rgba(${r},${g},${b},${a})`;
     target.ctx!.fillRect(x, y, sizeW, sizeH);
@@ -352,6 +387,14 @@ function paintRGB(target: PaintTarget, x: number, y: number, sizeW: number, size
 }
 function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: number, h: number, s: number, l: number, a: number) {
   if (a <= 0) return;
+  // Generic "Распыление" scatter: random sparse skip + small positional jitter, applied at the one
+  // place every brush's coloring funnels through — so spray mode does something for whichever brush
+  // is active, without needing brush-specific spray code everywhere.
+  if (target.spray) {
+    if (Math.random() > (target.sprayKeep ?? 0.55)) return;
+    x += (Math.random() - 0.5) * target.spray;
+    y += (Math.random() - 0.5) * target.spray;
+  }
   if (target.mode === "ctx") {
     target.ctx!.fillStyle = `hsla(${h}, ${s}%, ${l}%, ${a})`;
     target.ctx!.fillRect(x, y, sizeW, sizeH);
@@ -554,7 +597,7 @@ function serializeLayers(layers: Layer[]): string {
     strokes: l.strokes.map(s => ({
       id: s.id, kind: s.kind, mode: s.mode, size: s.size, hue: s.hue,
       speed: s.speed, density: s.density, noise: s.noise,
-      intensity: s.intensity, dynamics: s.dynamics,
+      intensity: s.intensity, dynamics: s.dynamics, modeSpeed: s.modeSpeed,
       rainbowFlow: s.rainbowFlow, rainbowFlowSpeed: s.rainbowFlowSpeed, rainbowBlinkSpeed: s.rainbowBlinkSpeed, gradientSpeed: s.gradientSpeed, gradientScale: s.gradientScale,
       gradientColors: s.gradientColors, gradientAngle: s.gradientAngle,
       frozen: s.frozen,
@@ -699,6 +742,7 @@ function Index() {
   const [noise, setNoise] = useState(0.4);
   const [intensity, setIntensity] = useState(0.7);
   const [dynamics, setDynamics] = useState(0.5);
+  const [modeSpeed, setModeSpeed] = useState(0.5);
   const [rainbowFlow, setRainbowFlow] = useState(true);
   const [rainbowFlowSpeed, setRainbowFlowSpeed] = useState(0.5);
   const [rainbowBlinkSpeed, setRainbowBlinkSpeed] = useState(0.5);
@@ -762,6 +806,7 @@ function Index() {
     brush: useRef(brush), mode: useRef(mode), hue: useRef(hue), size: useRef(size),
     speed: useRef(speed), density: useRef(density), noise: useRef(noise),
     intensity: useRef(intensity), dynamics: useRef(dynamics),
+    modeSpeed: useRef(modeSpeed),
     rainbowFlow: useRef(rainbowFlow),
     rainbowFlowSpeed: useRef(rainbowFlowSpeed),
     rainbowBlinkSpeed: useRef(rainbowBlinkSpeed),
@@ -780,6 +825,7 @@ function Index() {
   useEffect(() => { refs.noise.current = noise; });
   useEffect(() => { refs.intensity.current = intensity; });
   useEffect(() => { refs.dynamics.current = dynamics; });
+  useEffect(() => { refs.modeSpeed.current = modeSpeed; });
   useEffect(() => { refs.rainbowFlow.current = rainbowFlow; });
   useEffect(() => { refs.rainbowFlowSpeed.current = rainbowFlowSpeed; });
   useEffect(() => { refs.rainbowBlinkSpeed.current = rainbowBlinkSpeed; });
@@ -958,13 +1004,23 @@ function Index() {
     // breathe/pulse out of sync with each other instead of all flashing on the same beat.
     const phaseOffset = (s.born % 6283) / 1000; // ~0..2π spread, so it covers a full cycle
     const tt = t * (0.3 + s.speed * 2.4) + phaseOffset;
+    // FIX: every mode's color animation (pulse brightness, "Поток" hue flow, gradient travel,
+    // glitch re-roll rate) used to run off `tt` above — which bakes in the BRUSH's own "Скорость"
+    // slider (s.speed). That's what made mode speed and brush speed the same knob: dragging faster
+    // sped up the glitch flicker too, dragging slower stalled the gradient flow, etc., with no way
+    // to set them independently. `mt` is the same phase-staggered clock but WITHOUT s.speed mixed
+    // in — modes read this instead, each scaled only by their own dedicated speed slider (gradient/
+    // rainbow already had one each; pulse and glitch now share the new "Скорость режима" slider,
+    // s.modeSpeed, defaulting to 0.5 so nothing jumps until it's actually moved).
+    const mt = t + phaseOffset;
+    const ms = s.modeSpeed ?? 0.5;
     const lifeMs = now - s.born;
     // Was a hardcoded 0.05 rate with no way to adjust it. "Поток" mode keeps that exact same 0.05
     // (unchanged, since it already has its own separate speed slider via legacyFlow below) — only
     // "Мигание целиком" gets the new adjustable rate, defaulting to 0.5*0.1=0.05 so nothing changes
     // until the slider is actually moved.
     const modeHueShift = s.mode === "rainbow" ? (lifeMs * (s.rainbowFlow ? 0.05 : s.rainbowBlinkSpeed * 0.1)) % 360 : 0;
-    const modePulse = s.mode === "pulse" ? 0.6 + 0.5 * Math.sin(tt * 2) : 1;
+    const modePulse = s.mode === "pulse" ? 0.6 + 0.5 * Math.sin(mt * (0.5 + ms * 3)) : 1;
     const alphaMul = (0.25 + s.intensity * 0.9) * modePulse;
     const pts = s.points;
     // "Радуга: Поток" keeps its original simple full-spectrum sweep, unchanged.
@@ -976,14 +1032,14 @@ function Index() {
     // the auto direction is 0, so the slider becomes the sole, absolute angle control there.
     const rainbowFlowActive = s.mode === "rainbow" && s.rainbowFlow;
     const legacySpread = rainbowFlowActive ? 360 : 0;
-    const legacyFlow = rainbowFlowActive ? (tt * (10 + s.rainbowFlowSpeed * 150)) % 360 : 0;
+    const legacyFlow = rainbowFlowActive ? (mt * (10 + s.rainbowFlowSpeed * 150)) % 360 : 0;
     const nSeg = Math.max(1, pts.length - 1);
     const gradAutoAngle = s.mode === "gradient" ? strokeAutoAngleDeg(pts) : 0;
     const gradAngleRad = ((gradAutoAngle + s.gradientAngle) * Math.PI) / 180;
     const gradCos = Math.cos(gradAngleRad), gradSin = Math.sin(gradAngleRad);
     // Normalize the projection so the picked colors span roughly the visible canvas regardless of angle.
     const gradExtent = Math.abs(w * gradCos) + Math.abs(h * gradSin) || 1;
-    const gradTravel = tt * (0.03 + s.gradientSpeed * 0.5);
+    const gradTravel = mt * (0.03 + s.gradientSpeed * 0.5);
     // PERF: precompute the gradient's color cycle ONCE per stroke per frame instead of calling
     // sampleGradient() (a loop over the stops) at every point/pixel that needs a gradient hue.
     // Deliberately built WITHOUT gradTravel baked in — travel is a pure phase shift, so it's added
@@ -1011,7 +1067,7 @@ function Index() {
     // varies per point/particle — echoing misaligned RGB channels — which is exactly what any brush
     // painted with when "glitch" used to just be a color mode.
     const glitchOn = s.mode === "glitch";
-    const glitchCell = glitchOn ? Math.floor(tt * 9) : 0;
+    const glitchCell = glitchOn ? Math.floor(mt * (3 + ms * 15)) : 0;
     const glitchShift = (seed: number): number => {
       if (!glitchOn) return 0;
       return Math.floor(((hash(glitchCell * 131 + seed) + 1) / 2) * 3) * 120;
@@ -1143,6 +1199,18 @@ function Index() {
         }
       }
       return;
+    }
+
+    // "Распыление" used to only ever do anything for the "ink" brush — every other brush kind just
+    // silently ignored the mode entirely, which is what read as "spray doesn't work". Ink keeps its
+    // own dedicated airbrush scatter (see isSpray below); every OTHER brush now gets the generic
+    // paint()-level scatter turned on for its whole render pass instead.
+    const spraySet = s.mode === "spray" && s.kind !== "ink";
+    if (spraySet) {
+      target.spray = Math.max(2, s.size * (0.3 + s.density * 0.6));
+      // Was a hardcoded 0.55 no matter what — "Плотность" had zero effect on how sparse/dense the
+      // scatter looked for every brush except ink. Now density genuinely thins it out or fills it in.
+      target.sprayKeep = 0.25 + s.density * 0.6;
     }
 
     if (s.kind === "ink") {
@@ -1371,8 +1439,15 @@ function Index() {
           if (edge <= -edgeWidth) continue;
           const fade = Math.max(0, Math.min(1, (edge + edgeWidth) / (2 * edgeWidth)));
           if (fade <= 0) continue;
-          const lit = 45 + (1 - dist) * 28;
-          paint(target, gx, gy, grid, grid, hueD + (bayer ? 30 : 0), 95, lit, alphaMul * (1 - dist) * fade);
+          // FIX: lit AND alpha both used to also scale by (1-dist) on top of `fade` — the same
+          // "radial blur" bug already found and fixed in Мозаика, just missed here. Nearly every
+          // covered cell sits at some real distance from its sample point, so almost the whole
+          // shape was getting darkened twice (once by the edge fade, once by raw distance) — on the
+          // near-black canvas background that reads as "draws solid black" even though `fade` alone
+          // was already fixed. Flat now: brightness varies only by the tile's own fixed grain, alpha
+          // only by the actual edge transition — a real solid dithered fill, not a radial smudge.
+          const lit = 48 + grain * 14;
+          paint(target, gx, gy, grid, grid, hueD + (bayer ? 30 : 0), 95, lit, alphaMul * fade);
         }
       }
     }
@@ -1511,6 +1586,8 @@ function Index() {
         }
       }
     }
+
+    if (spraySet) { target.spray = undefined; target.sprayKeep = undefined; }
   }
 
   // PERF: build a frozen stroke's render ONCE and cache it, instead of re-running its full
@@ -1684,6 +1761,7 @@ function Index() {
         noise: refs.noise.current,
         intensity: refs.intensity.current,
         dynamics: refs.dynamics.current,
+        modeSpeed: refs.modeSpeed.current,
         rainbowFlow: refs.rainbowFlow.current,
         rainbowFlowSpeed: refs.rainbowFlowSpeed.current,
         rainbowBlinkSpeed: refs.rainbowBlinkSpeed.current,
@@ -1718,6 +1796,7 @@ function Index() {
       noise: refs.noise.current,
       intensity: refs.intensity.current,
       dynamics: refs.dynamics.current,
+      modeSpeed: refs.modeSpeed.current,
       rainbowFlow: refs.rainbowFlow.current,
       rainbowFlowSpeed: refs.rainbowFlowSpeed.current,
       rainbowBlinkSpeed: refs.rainbowBlinkSpeed.current,
@@ -2223,6 +2302,11 @@ function Index() {
           {mode === "rainbow" && !rainbowFlow && (
             <div className="mt-2 border-t border-white/10 pt-2">
               <ParamSlider label="Скорость мигания" value={rainbowBlinkSpeed} set={setRainbowBlinkSpeed} />
+            </div>
+          )}
+          {(mode === "pulse" || mode === "glitch") && (
+            <div className="mt-2 border-t border-white/10 pt-2">
+              <ParamSlider label="Скорость режима" value={modeSpeed} set={setModeSpeed} />
             </div>
           )}
         </section>
