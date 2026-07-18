@@ -302,6 +302,13 @@ interface PaintTarget {
   // color into its real r/g/b channels and blits each channel at a slightly different position
   // (true chromatic-aberration-style misregistration), instead of tinting everything one flat hue.
   rgbShift?: number;
+  // Set for the duration of one stroke's render pass when its MODE is "Глитч" — same generic
+  // pattern as spray/rgbShift above. Holds the pixel offset magnitude; paint() then draws the
+  // SAME call three times, tinted 0°/+120°/+240° off the real hue, each copy at a slightly
+  // different x/y — a spatial misalignment (like a badly registered color print), which is what
+  // actually reads as glitch. This used to be baked into just the pixelGlitch brush; now every
+  // brush that calls paint() gets it automatically when this mode is selected.
+  glitchSplit?: number;
 }
 function hslToRgb(h: number, s: number, l: number): [number, number, number] {
   h = ((h % 360) + 360) % 360;
@@ -403,6 +410,19 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
     y += (Math.random() - 0.5) * target.spray;
   }
   const [r, g, b] = getHslRgb(h, s, l);
+  // Generic "Глитч" mode: paint the SAME call three times, tinted 0°/+120°/+240° off the real
+  // hue, each copy offset a few pixels apart along x — a spatial misalignment (like a badly
+  // registered color print), not a color that cycles over time. This is exactly what the
+  // pixelGlitch brush used to do only for itself; living here means every brush gets it.
+  if (target.glitchSplit) {
+    const off = target.glitchSplit;
+    const [r1, g1, b1] = getHslRgb((h + 120) % 360, s, l);
+    const [r2, g2, b2] = getHslRgb((h + 240) % 360, s, l);
+    paintRGB(target, x - off, y, sizeW, sizeH, r, g, b, a);
+    paintRGB(target, x, y, sizeW, sizeH, r1, g1, b1, a);
+    paintRGB(target, x + off, y, sizeW, sizeH, r2, g2, b2, a);
+    return;
+  }
   // Generic "RGB сдвиг" mode: instead of one flat-colored blit, split the real color into its r/g/b
   // channels and paint each one offset a few pixels apart — a genuine channel misregistration
   // (magenta/cyan fringing) rather than a hue-rotation trick, and because it lives here inside the
@@ -1080,25 +1100,15 @@ function Index() {
       const proj = ((x * gradCos + y * gradSin) / gradExtent) * s.gradientScale;
       return gradHueRampAt(proj + gradTravel);
     };
-    // "Глитч" mode — a spatial-desync color corruption. Two things were making this read as "just
-    // another rainbow": (1) `glitchCell` was ONE shared time-bucket for the whole canvas, so every
-    // point/particle everywhere re-rolled its color on the exact same beat — different colors at
-    // any instant, sure, but the whole picture flipped in lockstep, which looks like a synced
-    // palette sweep rather than points glitching independently; (2) the result was always exactly
-    // +0°/+120°/+240° — a clean 3-color rotation, i.e. literally a rainbow with fewer steps. Fixed
-    // both: each seed now re-rolls on its OWN offset tick (own phase folded into the bucket calc),
-    // so different points/particles corrupt at different, independent moments — and most of the
-    // time nothing happens at all (stays the real color), with an occasional jump to a chaotic,
-    // non-uniform offset when it does glitch — brief corruption, not a constant color cycle.
+    // "Глитч" mode: moved here from the brush per feedback — this used to be baked into the
+    // pixelGlitch BRUSH's own coloring (three offset copies of the same paint() call, tinted
+    // 0°/+120°/+240°, drawn a few pixels apart). That's exactly why it read as a real misaligned
+    // print rather than a rainbow: the three colors sit at three different POSITIONS at the same
+    // instant, not three colors cycling through time at the same spot (which is what the earlier
+    // per-point time-based version did, and why it read as a flickering rainbow). See paint()
+    // below and the `glitchSplitSet` block further down for where this now actually happens,
+    // generically, for every brush — hueAt() itself no longer touches color for this mode at all.
     const glitchOn = s.mode === "glitch";
-    const glitchRate = 3 + ms * 15;
-    const glitchShift = (seed: number): number => {
-      if (!glitchOn) return 0;
-      const cell = Math.floor(mt * glitchRate + hash(seed * 131) * glitchRate);
-      const roll = hash(cell * 131 + seed);
-      if (roll < 0.4) return 0; // stays true color most of the time — a glitch, not a cycle
-      return 30 + ((roll + 1) / 2) * 300; // chaotic jump, not a clean 120°-step palette
-    };
     const hueAt = (i: number, f = 0): number => {
       if (s.mode === "gradient") {
         const p0 = pts[Math.min(i, pts.length - 1)];
@@ -1108,7 +1118,7 @@ function Index() {
         return gradientHueAtXY(px, py);
       }
       const posT = (i + f) / nSeg;
-      return (s.hue + modeHueShift + legacyFlow + legacySpread * posT + glitchShift(i)) % 360;
+      return (s.hue + modeHueShift + legacyFlow + legacySpread * posT) % 360;
     };
 
     if (s.kind === "fill") {
@@ -1247,6 +1257,15 @@ function Index() {
     if (rgbShiftSet) {
       const breathe = 0.5 + 0.5 * Math.sin(mt * (0.5 + ms * 3));
       target.rgbShift = Math.max(1, s.size * (0.05 + s.dynamics * 0.35) * (0.4 + breathe * 0.6));
+    }
+    // "Глитч" mode — generic spatial tri-hue split, works with ANY brush the same way it used to
+    // work only for the pixelGlitch brush. Offset reach follows "Динамика" like the other
+    // position-based mode effects above, with a per-stroke jitter tied to "Скорость режима" so the
+    // spacing itself flickers a little frame to frame instead of sitting at one static distance.
+    const glitchSplitSet = glitchOn;
+    if (glitchSplitSet) {
+      const jitter = 0.6 + 0.4 * Math.sin(mt * (2 + ms * 10) + phaseOffset);
+      target.glitchSplit = Math.max(1, s.size * (0.08 + s.dynamics * 0.3) * jitter);
     }
 
     if (s.kind === "ink") {
@@ -1401,7 +1420,7 @@ function Index() {
           s.rain.pop();
           continue;
         }
-        const hueP = (r.hue + modeHueShift + glitchShift(r.seed)) % 360;
+        const hueP = (r.hue + modeHueShift) % 360;
         for (let k = 0; k < r.len; k++) {
           const a = alphaMul * (1 - k / r.len);
           paint(target, Math.round((r.x) / grid) * grid, Math.round((r.y - k * grid) / grid) * grid, grid, grid, hueP, 95, 55 + k * 3, a);
@@ -1524,16 +1543,15 @@ function Index() {
           const baseX = p.x + nx * yOff, baseY = p.y + ny * yOff;
           const startX = baseX - tx * (widthLine / 2) + tx * shift;
           const startY = baseY - ty * (widthLine / 2) + ty * shift;
-          // Color is no exception here vs any other brush: this brush only shapes the slices
-          // (position/width/count/density below) and paints them through the same shared paint()
-          // every other brush uses — so it picks up hueAt()'s color/mode handling identically
-          // (plain hue in "Обычный", rotating hue in "Глитч", gradient sampling in "Градиент", a
-          // real r/g/b channel split in "RGB сдвиг" via target.rgbShift, all for free). No
-          // brush-specific color special-casing left; the brush's own character is entirely in
-          // its shape. The triple pass at [-grid,0,grid] below is exactly that shape — three
-          // interleaved offset copies per slice, which is what gives it its original rough,
-          // scattered density (dropping this made it read as too smooth/even, since it cut the
-          // painted-cell count per slice to a third).
+          // Per feedback: color moved OUT of this brush entirely and into the "Глитч" MODE (see
+          // target.glitchSplit in paint()/renderStroke) — this brush only shapes the slices now
+          // (position/width/count/density), exactly like every other brush. The triple pass at
+          // [-grid,0,grid] below is shape, not color: three interleaved offset copies per slice is
+          // what gives this brush its own rough, scattered density regardless of which mode is
+          // active — dropping it read as too smooth (see earlier fix). Color for all three copies
+          // comes from the one shared hueAt() call, same as any other brush; whatever the active
+          // mode does with hue/paint() (gradient sampling, glitch's tri-hue spatial split, rgbShift's
+          // real channel split, etc.) applies here automatically.
           const offs = [-grid, 0, grid];
           for (let c2 = 0; c2 < 3; c2++) {
             for (let xb = 0; xb < widthLine; xb += grid) {
@@ -1621,7 +1639,7 @@ function Index() {
           const lit = 20 + glow * (30 + s.intensity * 20);
           const hueE = s.mode === "gradient"
             ? gradientHueAtXY(ex, ey)
-            : (s.hue + noiseAt(seed + 3) * 30 + modeHueShift + glitchShift(seed)) % 360;
+            : (s.hue + noiseAt(seed + 3) * 30 + modeHueShift) % 360;
           paint(target, Math.round(ex / grid) * grid, Math.round(ey / grid) * grid, grid, grid, hueE, 85, lit, alphaMul * (0.3 + glow * 0.7));
         }
       }
@@ -1629,6 +1647,7 @@ function Index() {
 
     if (spraySet) { target.spray = undefined; target.sprayKeep = undefined; }
     if (rgbShiftSet) { target.rgbShift = undefined; }
+    if (glitchSplitSet) { target.glitchSplit = undefined; }
   }
 
   // PERF: build a frozen stroke's render ONCE and cache it, instead of re-running its full
