@@ -776,7 +776,9 @@ function IndexInner() {
   } | null>(null);
   // Owns the WebGL side of the main canvas: one Application bound to canvasRef's <canvas>, one
   // BufferResource-backed texture that wraps pixelBufRef's `data` array directly (no per-frame copy),
-  // and one full-canvas Sprite showing it. Recreated whenever canvasSize changes (see the effect below).
+  // and one full-canvas Sprite showing it. The APPLICATION (and its one WebGL context) is created
+  // ONCE — see pixiAppRef and the effects below — only the texture is rebuilt when canvasSize changes.
+  const pixiAppRef = useRef<PIXI.Application | null>(null);
   const pixiRef = useRef<{
     app: PIXI.Application; baseTexture: PIXI.BaseTexture; sprite: PIXI.Sprite; w: number; h: number;
   } | null>(null);
@@ -1068,21 +1070,44 @@ function IndexInner() {
   useEffect(() => { refs.fillContiguous.current = fillContiguous; });
   useEffect(() => { refs.fillTolerance.current = fillTolerance; });
 
-  // (Re)build the Pixi side of the main canvas whenever its logical size changes, and the CPU pixel
-  // buffer it wraps. Both live together here so the texture always wraps the CURRENT buffer array —
-  // recreating one without the other would leave the GPU showing stale/wrong-size pixels.
+  // Create the Pixi Application — and with it, the ONE WebGL context it owns — exactly once for
+  // this component's lifetime, NOT per canvasSize change. Recreating the whole Application (a brand
+  // new WebGL context every time) on every resize/"Новый холст" click was quietly leaking contexts:
+  // browsers cap how many live WebGL contexts a page may hold at once (commonly 8-16), destroy()
+  // losing a context isn't guaranteed synchronous, and a rapid destroy-then-immediately-create in
+  // the same tick could hand PIXI a context the browser hadn't actually finished tearing down yet.
+  // PIXI's own capability probing then read garbage/zeroed GPU limits off that half-dead context and
+  // threw deep inside its shader setup ("Invalid value of 0 passed to checkMaxIfStatementsInShader")
+  // — which, with no error boundary in place at the time, took the whole page down to a blank
+  // screen. One Application, one context, for the whole session now; only the much cheaper TEXTURE
+  // gets rebuilt below when the canvas size actually changes.
   useEffect(() => {
     const c = canvasRef.current;
     if (!c) return;
-    const w = canvasSize.w, h = canvasSize.h;
-
-    // Tear down whatever Pixi app/texture was here before (previous size, or none yet). Destroying
-    // the texture/baseTexture too is what actually frees the old GPU-side allocation instead of
-    // leaking a WebGL texture object on every resize.
-    if (pixiRef.current) {
-      pixiRef.current.app.destroy(false, { children: true, texture: true, baseTexture: true });
+    const app = new PIXI.Application({
+      view: c, width: canvasSize.w, height: canvasSize.h,
+      antialias: false, backgroundAlpha: 0, clearBeforeRender: false,
+    });
+    pixiAppRef.current = app;
+    return () => {
+      app.destroy(false, { children: true, texture: true, baseTexture: true });
+      pixiAppRef.current = null;
       pixiRef.current = null;
-    }
+    };
+    // Deliberately empty deps — this must run exactly once. Resizing is handled by the effect below
+    // via app.renderer.resize(), not by recreating the Application.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Rebuild just the CPU pixel buffer and its GPU texture whenever the logical canvas size changes
+  // — resizing the EXISTING renderer/context (app.renderer.resize) instead of tearing down and
+  // recreating the whole Application (see the effect above for why that distinction is the actual
+  // fix, not just a tidy-up).
+  useEffect(() => {
+    const app = pixiAppRef.current;
+    if (!app) return;
+    const w = canvasSize.w, h = canvasSize.h;
+    app.renderer.resize(w, h);
 
     // Same raw RGBA buffer every brush already painted into via `bufferTarget`/`buf` — untouched by
     // this swap. Only its destination changed (GPU sprite instead of ctx.putImageData).
@@ -1095,32 +1120,26 @@ function IndexInner() {
     };
     pixelBufRef.current = bufObj;
 
-    // NOTE: PIXI's WebGL renderer owns the canvas from here on — it sets the backing-store width/
-    // height itself (no more manual c.width/c.height, and no more devicePixelRatio scaling, for the
-    // same reason as before: the buffer above is authored pixel-for-pixel at exactly w x h). CSS
-    // width/height (set via `style`) still stretch this to the desired on-screen zoom level.
-    const app = new PIXI.Application({
-      view: c, width: w, height: h,
-      antialias: false, backgroundAlpha: 0,
-      // The sprite below fully covers every pixel of the canvas every frame (same w x h as the
-      // buffer), so there's nothing underneath that ever needs clearing first.
-      clearBeforeRender: false,
-    });
     // `data` (Uint8ClampedArray) and PIXI's BufferResource typings want Uint8Array — same underlying
     // byte layout, safe to hand across; this is still literally the array every brush writes into.
     const baseTexture = PIXI.BaseTexture.fromBuffer(data as unknown as Uint8Array, w, h, {
       scaleMode: PIXI.SCALE_MODES.NEAREST,
     });
-    const sprite = new PIXI.Sprite(new PIXI.Texture(baseTexture));
-    app.stage.addChild(sprite);
-    pixiRef.current = { app, baseTexture, sprite, w, h };
+    const texture = new PIXI.Texture(baseTexture);
 
-    return () => {
-      if (pixiRef.current && pixiRef.current.app === app) {
-        app.destroy(false, { children: true, texture: true, baseTexture: true });
-        pixiRef.current = null;
-      }
-    };
+    const prev = pixiRef.current;
+    if (prev) {
+      // Reuse the same Sprite (and, more importantly, the same Application/context) — only swap
+      // which texture it's showing, then free the OLD texture's GPU memory. This is a routine,
+      // cheap GPU allocation/free, unlike destroying and recreating a whole WebGL context.
+      prev.sprite.texture = texture;
+      prev.baseTexture.destroy(true);
+      pixiRef.current = { app, baseTexture, sprite: prev.sprite, w, h };
+    } else {
+      const sprite = new PIXI.Sprite(texture);
+      app.stage.addChild(sprite);
+      pixiRef.current = { app, baseTexture, sprite, w, h };
+    }
   }, [canvasSize]);
 
   const eraseAt = useCallback((x: number, y: number, r: number) => {
