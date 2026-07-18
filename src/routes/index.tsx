@@ -25,11 +25,12 @@ type BrushKind =
   | "mosaic"
   | "embers"
   | "fill"
-  | "eraser";
+  | "eraser"
+  | "eyedropper";
 
 type ModeKind = "normal" | "rainbow" | "gradient" | "pulse" | "spray" | "mirror" | "glitch" | "rgbShift";
 
-interface StrokePoint { x: number; y: number; t: number }
+interface StrokePoint { x: number; y: number; t: number; pressure?: number }
 
 interface Stroke {
   id: number;
@@ -134,6 +135,7 @@ const BRUSHES: { id: BrushKind; label: string }[] = [
   { id: "embers", label: "Угли" },
   { id: "fill", label: "Заливка" },
   { id: "eraser", label: "Ластик" },
+  { id: "eyedropper", label: "Пипетка" },
 ];
 
 const MODES: { id: ModeKind; label: string }[] = [
@@ -339,6 +341,22 @@ function getHslRgb(h: number, s: number, l: number): [number, number, number] {
     hslRgbCache.set(key, v);
   }
   return v;
+}
+// Inverse of the above — used only by the eyedropper (sample a pixel off the actual canvas, hand
+// back the hue this app's single-hue color model can use). Saturation/lightness of the sampled
+// pixel are intentionally dropped: every brush already picks its own s/l per effect, all that's
+// shared app-wide is one hue value from the palette slider.
+function rgbToHue(r: number, g: number, b: number): number {
+  const rf = r / 255, gf = g / 255, bf = b / 255;
+  const max = Math.max(rf, gf, bf), min = Math.min(rf, gf, bf);
+  const d = max - min;
+  if (d === 0) return 0; // grayscale pixel — no meaningful hue, keep whatever's currently selected
+  let h: number;
+  if (max === rf) h = ((gf - bf) / d) % 6;
+  else if (max === gf) h = (bf - rf) / d + 2;
+  else h = (rf - gf) / d + 4;
+  h *= 60;
+  return h < 0 ? h + 360 : h;
 }
 // Real Porter-Duff "over" for one pixel of an isolated (non-opaque) buffer — used only while baking
 // a frozen stroke, which happens once per stroke rather than every frame, so the extra per-pixel
@@ -827,6 +845,42 @@ function Index() {
   const pinchStateRef = useRef<{ initialDist: number; initialZoom: number; initialMid: { x: number; y: number }; initialPan: { x: number; y: number } } | null>(null);
   const panDragRef = useRef<{ startX: number; startY: number; startPan: { x: number; y: number } } | null>(null);
 
+  // === Selection / move tool (#8) ===
+  // Scoped deliberately to MOVE only (drag selected strokes' points around) — a real, working
+  // slice of "selection + transform" rather than a half-built rotate/scale gizmo. Selection is a
+  // simple bounding-box marquee against the active layer's strokes (matches how fill/erase/etc.
+  // already only ever touch the active layer), not a full spatial index — fine at the stroke counts
+  // this app deals with; only worth a real R/quad-tree if selection itself gets slow, which nothing
+  // here suggests yet.
+  const [selectTool, setSelectTool] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const selectedIdsRef = useRef<Set<number>>(new Set());
+  useEffect(() => { selectedIdsRef.current = selectedIds; }, [selectedIds]);
+  const [marquee, setMarquee] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+  const marqueeStartRef = useRef<{ x: number; y: number } | null>(null);
+  const moveDragRef = useRef<{ lastX: number; lastY: number } | null>(null);
+  // Recomputed from live stroke data every render (cheap — only over the already-selected strokes'
+  // points) rather than stored/cached, so it always matches wherever the strokes currently are,
+  // including mid-drag.
+  const getSelectionBBox = (): { x0: number; y0: number; x1: number; y1: number } | null => {
+    if (selectedIds.size === 0) return null;
+    const layer = layersRef.current.find(l => l.id === activeLayerId);
+    if (!layer) return null;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    let any = false;
+    for (const s of layer.strokes) {
+      if (!selectedIds.has(s.id)) continue;
+      for (const p of s.points) {
+        any = true;
+        if (p.x < x0) x0 = p.x; if (p.x > x1) x1 = p.x;
+        if (p.y < y0) y0 = p.y; if (p.y > y1) y1 = p.y;
+      }
+    }
+    if (!any) return null;
+    const pad = 12;
+    return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+  };
+
   useEffect(() => {
     const kd = (e: KeyboardEvent) => { if (e.code === "Space" && !e.repeat) setSpaceHeld(true); };
     const ku = (e: KeyboardEvent) => { if (e.code === "Space") setSpaceHeld(false); };
@@ -1306,6 +1360,12 @@ function Index() {
         const seg = segsInk[Math.min(i, segsInk.length - 1)];
         const dx = nxt.x - p.x, dy = nxt.y - p.y;
         const { nx, ny, num } = seg;
+        // Pressure sensitivity: 0.5 (fallback/mouse) → unscaled; a light touch (low pressure) thins
+        // and softens the line, a hard press (high pressure) widens and darkens it — the same knob
+        // a real pen/tablet gives you, instead of every point along a stroke being the same weight.
+        const pr = p.pressure ?? 0.5;
+        const halfP = half * (0.5 + pr);
+        const alphaPr = 0.6 + pr * 0.7;
         for (let k = 0; k <= num; k++) {
           const f = k / num;
           const cx = p.x + dx * f, cy = p.y + dy * f;
@@ -1316,7 +1376,7 @@ function Index() {
             // grid march), biased toward the centerline (two summed uniforms ≈ a soft triangular
             // falloff, cheaper than a true gaussian) and randomly dropped near the edges — the
             // grainy, uneven texture that actually reads as "spray" rather than a solid stripe.
-            const sprayHalf = half * 1.6;
+            const sprayHalf = halfP * 1.6;
             const dotCount = Math.max(5, Math.floor(6 + s.density * 16));
             for (let d = 0; d < dotCount; d++) {
               const rnd = Math.random() + Math.random() - 1; // -1..1, peaked at 0
@@ -1327,15 +1387,15 @@ function Index() {
               const gy = Math.round((cy + ny * t2) / grid) * grid;
               const edge = 1 - distN;
               const l = 50 + edge * 25;
-              paint(target, gx, gy, grid, grid, hueAt(i, f), 85, l, alphaMul * edge * (0.5 + Math.random() * 0.5));
+              paint(target, gx, gy, grid, grid, hueAt(i, f), 85, l, alphaMul * edge * (0.5 + Math.random() * 0.5) * alphaPr);
             }
           } else {
-            for (let t2 = -half; t2 <= half; t2 += grid) {
+            for (let t2 = -halfP; t2 <= halfP; t2 += grid) {
               const gx = Math.round((cx + nx * (t2 + wob)) / grid) * grid;
               const gy = Math.round((cy + ny * (t2 + wob)) / grid) * grid;
-              const edge = 1 - Math.abs(t2) / (half + 1);
+              const edge = 1 - Math.abs(t2) / (halfP + 1);
               const l = 55 + edge * 25;
-              paint(target, gx, gy, grid, grid, hueAt(i, f), 85, l, alphaMul * edge);
+              paint(target, gx, gy, grid, grid, hueAt(i, f), 85, l, alphaMul * edge * alphaPr);
             }
           }
         }
@@ -1361,7 +1421,8 @@ function Index() {
                        + hash(i + f + tt) * s.noise * s.size * 0.5;
             const gx = Math.round((p.x + dx * f + nx * wave) / grid) * grid;
             const gy = Math.round((p.y + dy * f + ny * wave) / grid) * grid;
-            paint(target, gx, gy, grid, grid, (hueAt(i, f) + pass * 20) % 360, 100, 65, alphaMul * 0.75);
+            const pr = p.pressure ?? 0.5;
+            paint(target, gx, gy, grid, grid, (hueAt(i, f) + pass * 20) % 360, 100, 65, alphaMul * 0.75 * (0.6 + pr * 0.7));
           }
         }
       }
@@ -1793,16 +1854,20 @@ function Index() {
     const r = c.getBoundingClientRect();
     const sx = canvasSize.w / r.width;
     const sy = canvasSize.h / r.height;
-    return { x: (e.clientX - r.left) * sx, y: (e.clientY - r.top) * sy };
+    // Pointer Events report 0.5 for mouse/generic pointers while a button is held (and 0 for touch
+    // on some browsers that don't report real pressure) — 0.5 is the sane "no real pressure data"
+    // fallback so those devices draw at a normal, constant weight instead of at zero/invisible.
+    const pressure = e.pressure > 0 ? e.pressure : 0.5;
+    return { x: (e.clientX - r.left) * sx, y: (e.clientY - r.top) * sy, pressure };
   };
 
-  const addPoint = (x: number, y: number) => {
+  const addPoint = (x: number, y: number, pressure = 0.5) => {
     const s = currentStrokeRef.current;
     if (!s) return;
     const now = performance.now();
-    s.points.push({ x, y, t: (now - s.born) / 1000 });
+    s.points.push({ x, y, t: (now - s.born) / 1000, pressure });
     if (s.mode === "mirror") {
-      s.points.push({ x: canvasSize.w - x, y, t: (now - s.born) / 1000 });
+      s.points.push({ x: canvasSize.w - x, y, t: (now - s.born) / 1000, pressure });
     }
     if (s.points.length > MAX_POINTS_PER_STROKE) {
       // decimate: keep every other point from the older half
@@ -1837,9 +1902,37 @@ function Index() {
       return;
     }
 
-    const { x, y } = getPoint(e);
+    const { x, y, pressure } = getPoint(e);
     pointerRef.current = { x, y, px: x, py: y, down: true };
+
+    if (selectTool) {
+      const bbox = getSelectionBBox();
+      if (bbox && x >= bbox.x0 && x <= bbox.x1 && y >= bbox.y0 && y <= bbox.y1) {
+        moveDragRef.current = { lastX: x, lastY: y };
+      } else {
+        marqueeStartRef.current = { x, y };
+        setMarquee({ x0: x, y0: y, x1: x, y1: y });
+        setSelectedIds(new Set());
+      }
+      return;
+    }
+
     if (refs.brush.current === "eraser") { eraseAt(x, y, refs.size.current); return; }
+
+    if (refs.brush.current === "eyedropper") {
+      // One-shot sample, not a draggable stroke — reads whatever is actually composited on screen
+      // right now (same buffer the fill tool already reads from), same as eraser/fill above.
+      pointerRef.current.down = false;
+      const bufObj = pixelBufRef.current;
+      if (!bufObj) return;
+      const w = canvasSize.w, h = canvasSize.h;
+      const sx = Math.min(w - 1, Math.max(0, Math.round(x)));
+      const sy = Math.min(h - 1, Math.max(0, Math.round(y)));
+      const idx = (sy * w + sx) * 4;
+      const r = bufObj.data[idx], g = bufObj.data[idx + 1], b = bufObj.data[idx + 2];
+      setHue(Math.round(rgbToHue(r, g, b)));
+      return;
+    }
 
     if (refs.brush.current === "fill") {
       // Bucket fill is a single click, not a draggable stroke — it reads whatever is actually
@@ -1913,7 +2006,7 @@ function Index() {
     };
     currentStrokeRef.current = stroke;
     layer.strokes.push(stroke);
-    addPoint(x, y);
+    addPoint(x, y, pressure);
   };
   const onMove = (e: React.PointerEvent) => {
     if (activePointersRef.current.has(e.pointerId)) activePointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -1936,15 +2029,35 @@ function Index() {
       return;
     }
 
-    const { x, y } = getPoint(e);
+    const { x, y, pressure } = getPoint(e);
     pointerRef.current.x = x; pointerRef.current.y = y;
     if (!pointerRef.current.down) return;
+
+    if (selectTool) {
+      if (moveDragRef.current) {
+        const dx = x - moveDragRef.current.lastX, dy = y - moveDragRef.current.lastY;
+        const layer = layersRef.current.find(l => l.id === activeLayerId);
+        if (layer) {
+          for (const s of layer.strokes) {
+            if (!selectedIdsRef.current.has(s.id)) continue;
+            for (const p of s.points) { p.x += dx; p.y += dy; }
+            // Geometry moved — cached per-segment offsets/baked pixels no longer line up.
+            s.segCache = undefined; s.bakedCache = null;
+          }
+        }
+        moveDragRef.current = { lastX: x, lastY: y };
+      } else if (marqueeStartRef.current) {
+        setMarquee({ x0: marqueeStartRef.current.x, y0: marqueeStartRef.current.y, x1: x, y1: y });
+      }
+      return;
+    }
+
     if (refs.brush.current === "eraser") { eraseAt(x, y, refs.size.current); pointerRef.current.px = x; pointerRef.current.py = y; return; }
     const px = pointerRef.current.px, py = pointerRef.current.py;
     const dx = x - px, dy = y - py;
     const dist = Math.hypot(dx, dy);
     const steps = Math.max(1, Math.floor(dist / 5));
-    for (let i = 1; i <= steps; i++) addPoint(px + dx * (i / steps), py + dy * (i / steps));
+    for (let i = 1; i <= steps; i++) addPoint(px + dx * (i / steps), py + dy * (i / steps), pressure);
     pointerRef.current.px = x; pointerRef.current.py = y;
   };
   const onUp = (e: React.PointerEvent) => {
@@ -1953,6 +2066,35 @@ function Index() {
     panDragRef.current = null;
     if (!pointerRef.current.down) return;
     pointerRef.current.down = false;
+
+    if (selectTool) {
+      if (moveDragRef.current) {
+        moveDragRef.current = null;
+        pushHistory();
+        return;
+      }
+      if (marqueeStartRef.current) {
+        const m = marquee;
+        marqueeStartRef.current = null;
+        setMarquee(null);
+        if (m) {
+          const x0 = Math.min(m.x0, m.x1), x1 = Math.max(m.x0, m.x1);
+          const y0 = Math.min(m.y0, m.y1), y1 = Math.max(m.y0, m.y1);
+          const layer = layersRef.current.find(l => l.id === activeLayerId);
+          const ids = new Set<number>();
+          if (layer) {
+            for (const s of layer.strokes) {
+              for (const p of s.points) {
+                if (p.x >= x0 && p.x <= x1 && p.y >= y0 && p.y <= y1) { ids.add(s.id); break; }
+              }
+            }
+          }
+          setSelectedIds(ids);
+        }
+      }
+      return;
+    }
+
     currentStrokeRef.current = null;
     pushHistory();
   };
@@ -2116,9 +2258,16 @@ function Index() {
       const scale = Math.max(1, Math.min(4, exportScale));
       const gifW = Math.round(canvasSize.w * scale);
       const gifH = Math.round(canvasSize.h * scale);
-      const tmp = document.createElement("canvas");
-      tmp.width = gifW; tmp.height = gifH;
-      const tctx = tmp.getContext("2d", { willReadFrequently: true })!;
+      // OffscreenCanvas when the browser supports it: never touches the DOM/layout at all (a
+      // detached <canvas> element still exists in the same document/compositor bookkeeping an
+      // attached one does), and it's what a future Worker-based export would need anyway since a
+      // regular HTMLCanvasElement can't be transferred to a worker. Falls back to a normal canvas
+      // on anything older. renderScene itself only uses drawing calls both context types share
+      // (fillRect/drawImage/etc.), so no other change is needed to use it here.
+      const tmp: HTMLCanvasElement | OffscreenCanvas =
+        typeof OffscreenCanvas !== "undefined" ? new OffscreenCanvas(gifW, gifH) : document.createElement("canvas");
+      if (tmp instanceof HTMLCanvasElement) { tmp.width = gifW; tmp.height = gifH; }
+      const tctx = tmp.getContext("2d", { willReadFrequently: true }) as unknown as CanvasRenderingContext2D;
       tctx.setTransform(scale, 0, 0, scale, 0, 0);
       const gif = GIFEncoder();
       const delay = Math.round(1000 / fps);
@@ -2129,6 +2278,13 @@ function Index() {
       // toward the matching stored start frame so the clip's end eases into its own beginning.
       const loopBlend = exportLoop ? loopBlendFrameCount(fps, total) : 0;
       const startFrames: Uint8ClampedArray[] = [];
+      // Pooled scratch buffer for the loop-blend mix, reused across every blend frame in this
+      // export instead of `new Uint8ClampedArray(data.length)` allocated fresh each time — on a 4K
+      // export that's an ~33MB allocation per frame during the blend tail, right when GC pressure
+      // is least welcome. `getImageData` itself still allocates (no way around that through the
+      // standard Canvas2D API without dropping ctx-mode rendering entirely), but this removes the
+      // other big one.
+      let blendScratch: Uint8ClampedArray | null = null;
       for (let i = 0; i < total; i++) {
         renderScene(tctx, canvasSize.w, canvasSize.h, startNow + i * dtRaw, dtRaw);
         let data = tctx.getImageData(0, 0, gifW, gifH).data;
@@ -2140,7 +2296,8 @@ function Index() {
             const startData = startFrames[k];
             if (startData) {
               const mix = (k + 1) / loopBlend; // ramps up to a full blend at the very last frame
-              const blended = new Uint8ClampedArray(data.length);
+              if (!blendScratch || blendScratch.length !== data.length) blendScratch = new Uint8ClampedArray(data.length);
+              const blended = blendScratch;
               for (let p = 0; p < data.length; p += 4) {
                 blended[p] = data[p] * (1 - mix) + startData[p] * mix;
                 blended[p + 1] = data[p + 1] * (1 - mix) + startData[p + 1] * mix;
@@ -2155,7 +2312,12 @@ function Index() {
         const index = applyPalette(data, palette);
         gif.writeFrame(index, gifW, gifH, { palette, delay });
         setRecordProgress((i + 1) / total);
-        if ((i & 3) === 0) await new Promise(r => setTimeout(r, 0));
+        // FIX: was only yielding every 4th frame — meant up to 4 full 4K frames' worth of render +
+        // getImageData + quantize + palette work ran back-to-back with no chance for the browser to
+        // paint/respond in between, which is exactly what read as "the whole page freezes" during a
+        // big export. Yielding every frame costs a little wall-clock time but keeps the tab alive
+        // and responsive (progress bar actually animates, tab doesn't look hung) throughout.
+        await new Promise(r => setTimeout(r, 0));
       }
       gif.finish();
       const bytes = gif.bytesView();
@@ -2352,6 +2514,32 @@ function Index() {
             >
               Убрать картинку слоя
             </button>
+          )}
+        </section>
+
+        {/* Selection / move tool — a real, separate mode from painting so drags move strokes
+            instead of drawing them. Only strokes on the active layer are selectable, same as fill
+            and eraser already only ever touch it. */}
+        <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
+          <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Инструмент</div>
+          <div className="grid grid-cols-2 gap-1">
+            <button
+              onClick={() => { setSelectTool(false); setSelectedIds(new Set()); setMarquee(null); }}
+              className={`rounded border px-2 py-1 text-[10px] tracking-wider transition ${!selectTool ? "border-white/60 bg-white/15" : "border-white/10 bg-white/[0.02] text-white/60 hover:bg-white/[0.06]"}`}
+            >
+              Рисование
+            </button>
+            <button
+              onClick={() => setSelectTool(true)}
+              className={`rounded border px-2 py-1 text-[10px] tracking-wider transition ${selectTool ? "border-white/60 bg-white/15" : "border-white/10 bg-white/[0.02] text-white/60 hover:bg-white/[0.06]"}`}
+            >
+              Выделение
+            </button>
+          </div>
+          {selectTool && (
+            <div className="mt-1.5 text-[9px] text-white/40">
+              {selectedIds.size > 0 ? `Выбрано мазков: ${selectedIds.size} — тяните внутри рамки` : "Обведите рамкой мазки на активном слое"}
+            </div>
           )}
         </section>
 
@@ -2635,7 +2823,7 @@ function Index() {
           background: "#0a0b12",
           backgroundImage: "radial-gradient(circle, rgba(255,255,255,0.05) 1px, transparent 1px)",
           backgroundSize: "24px 24px",
-          cursor: spaceHeld ? (panDragRef.current ? "grabbing" : "grab") : "crosshair",
+          cursor: spaceHeld ? (panDragRef.current ? "grabbing" : "grab") : (selectTool ? "default" : "crosshair"),
         }}
       >
         <div
@@ -2651,6 +2839,36 @@ function Index() {
             style={{ width: canvasSize.w * zoom, height: canvasSize.h * zoom, imageRendering: "pixelated" }}
             className="block rounded-lg border border-white/10 bg-[#080a12] shadow-2xl"
           />
+          {/* Selection overlay: live marquee while dragging a new box, or the bounding box of the
+              current selection (draggable from inside via onDown's hit-test above) — same
+              canvas-unit → screen-pixel scale (`* zoom`) the canvas element itself uses, positioned
+              inside the same pan/zoom-transformed wrapper so it always lines up with the strokes. */}
+          {selectTool && marquee && (
+            <div
+              className="pointer-events-none absolute border border-dashed border-cyan-300/80 bg-cyan-300/10"
+              style={{
+                left: Math.min(marquee.x0, marquee.x1) * zoom,
+                top: Math.min(marquee.y0, marquee.y1) * zoom,
+                width: Math.abs(marquee.x1 - marquee.x0) * zoom,
+                height: Math.abs(marquee.y1 - marquee.y0) * zoom,
+              }}
+            />
+          )}
+          {selectTool && !marquee && selectedIds.size > 0 && (() => {
+            const bbox = getSelectionBBox();
+            if (!bbox) return null;
+            return (
+              <div
+                className="pointer-events-none absolute border border-dashed border-cyan-300/80"
+                style={{
+                  left: bbox.x0 * zoom,
+                  top: bbox.y0 * zoom,
+                  width: (bbox.x1 - bbox.x0) * zoom,
+                  height: (bbox.y1 - bbox.y0) * zoom,
+                }}
+              />
+            );
+          })()}
         </div>
         <div className="pointer-events-none absolute bottom-3 right-3 flex items-center gap-1 rounded-md border border-white/10 bg-black/60 p-1 text-[11px] backdrop-blur">
           <button onClick={() => setZoom((z) => Math.max(0.1, z / 1.2))} className="pointer-events-auto rounded px-2 py-0.5 hover:bg-white/10">−</button>
