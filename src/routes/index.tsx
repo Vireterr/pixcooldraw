@@ -1546,19 +1546,29 @@ function Index() {
           // Per feedback: color moved OUT of this brush entirely and into the "Глитч" MODE (see
           // target.glitchSplit in paint()/renderStroke) — this brush only shapes the slices now
           // (position/width/count/density), exactly like every other brush. The triple pass at
-          // [-grid,0,grid] below is shape, not color: three interleaved offset copies per slice is
-          // what gives this brush its own rough, scattered density regardless of which mode is
-          // active — dropping it read as too smooth (see earlier fix). Color for all three copies
-          // comes from the one shared hueAt() call, same as any other brush; whatever the active
-          // mode does with hue/paint() (gradient sampling, glitch's tri-hue spatial split, rgbShift's
-          // real channel split, etc.) applies here automatically.
-          const offs = [-grid, 0, grid];
-          for (let c2 = 0; c2 < 3; c2++) {
+          // [-grid,0,grid] is shape/density (three interleaved offset copies per slice — dropping
+          // it read as too smooth, see earlier fix), NOT color. BUT: in "Глитч" mode specifically,
+          // paint() ALREADY triples every single call into three offset+tinted copies on its own
+          // (target.glitchSplit) — stacking that on top of this brush's own triple pass compounded
+          // into 9 small scattered blocks per step instead of 3, which is exactly what read as
+          // faded/washed out (same total ink spread over 3x the positions). So: skip this brush's
+          // own tripling specifically when "Глитч" is active (paint()'s tripling already covers
+          // it) and keep it for every other mode, where paint() does nothing extra on its own.
+          if (glitchOn) {
             for (let xb = 0; xb < widthLine; xb += grid) {
               if (Math.random() > 0.4 + s.intensity * 0.5) continue;
-              const off = xb + offs[c2];
-              const px = startX + tx * off, py = startY + ty * off;
+              const px = startX + tx * xb, py = startY + ty * xb;
               paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
+            }
+          } else {
+            const offs = [-grid, 0, grid];
+            for (let c2 = 0; c2 < 3; c2++) {
+              for (let xb = 0; xb < widthLine; xb += grid) {
+                if (Math.random() > 0.4 + s.intensity * 0.5) continue;
+                const off = xb + offs[c2];
+                const px = startX + tx * off, py = startY + ty * off;
+                paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
+              }
             }
           }
         }
