@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, Component, type ReactNode } from "react";
 import { GIFEncoder, quantize, applyPalette } from "gifenc";
 // PIXI v7 specifically (npm i pixi.js@^7) — v8 dropped/destabilized BaseTexture.fromBuffer, which is
 // the exact primitive the main canvas blit below relies on to push the CPU pixel buffer to the GPU.
@@ -716,7 +716,55 @@ function getSegCache(s: Stroke, pts: StrokePoint[], grid: number): { nx: number;
   return cache;
 }
 
+// Without this, ANY uncaught error ANYWHERE in the app (a WebGL context that failed to allocate,
+// a stray undefined access, anything) unmounts the entire React tree and leaves a blank page — no
+// message, no way to tell what happened, "просто падает веб" with nothing to go on. This catches
+// that, shows the actual error text (so it can actually be reported/fixed) and offers a recovery
+// path that does NOT reload the tab — undo history lives only in memory (historyRef), so a hard
+// reload would silently lose every stroke since the last export. "Продолжить" instead just clears
+// the error and re-mounts the canvas editor fresh; strokes drawn before the crash are still gone
+// (the crash could have happened mid-mutation, so there's no safe partial state to resume from) but
+// at least a page reload isn't forced on top of that.
+class AppErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="flex h-screen w-screen flex-col items-center justify-center gap-4 bg-[#05060c] p-6 text-center text-white">
+          <div className="text-sm tracking-widest text-white/70">ЧТО-ТО СЛОМАЛОСЬ</div>
+          <pre className="max-w-2xl overflow-auto rounded-md border border-white/10 bg-black/40 p-3 text-left text-[11px] text-red-300">
+            {this.state.error.message}
+            {this.state.error.stack ? "\n\n" + this.state.error.stack : ""}
+          </pre>
+          <div className="text-[11px] text-white/40">Скопируй текст выше — это и есть причина краша.</div>
+          <button
+            onClick={() => this.setState({ error: null })}
+            className="rounded-md border border-white/15 bg-white/10 px-4 py-2 text-[11px] tracking-wider hover:bg-white/15"
+          >
+            Продолжить
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 function Index() {
+  return (
+    <AppErrorBoundary>
+      <IndexInner />
+    </AppErrorBoundary>
+  );
+}
+
+function IndexInner() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // PERF: one persistent RGBA buffer, reused every frame (reallocated only when canvas size changes)
   // instead of letting the canvas API do per-pixel work thousands of times a frame. Every brush still
@@ -845,13 +893,12 @@ function Index() {
   const pinchStateRef = useRef<{ initialDist: number; initialZoom: number; initialMid: { x: number; y: number }; initialPan: { x: number; y: number } } | null>(null);
   const panDragRef = useRef<{ startX: number; startY: number; startPan: { x: number; y: number } } | null>(null);
 
-  // === Selection / move tool (#8) ===
-  // Scoped deliberately to MOVE only (drag selected strokes' points around) — a real, working
-  // slice of "selection + transform" rather than a half-built rotate/scale gizmo. Selection is a
-  // simple bounding-box marquee against the active layer's strokes (matches how fill/erase/etc.
-  // already only ever touch the active layer), not a full spatial index — fine at the stroke counts
-  // this app deals with; only worth a real R/quad-tree if selection itself gets slow, which nothing
-  // here suggests yet.
+  // === Selection / transform tool (#8) ===
+  // Move (drag inside the box), scale (drag a corner handle), and rotate (drag the handle above the
+  // box) — all against the active layer's selected strokes. Selection itself is a simple bounding-
+  // box marquee (matches how fill/erase/etc. already only ever touch the active layer), not a full
+  // spatial index — fine at the stroke counts this app deals with; only worth a real R/quad-tree if
+  // selection itself gets slow, which nothing here suggests yet.
   const [selectTool, setSelectTool] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const selectedIdsRef = useRef<Set<number>>(new Set());
@@ -859,6 +906,26 @@ function Index() {
   const [marquee, setMarquee] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
   const marqueeStartRef = useRef<{ x: number; y: number } | null>(null);
   const moveDragRef = useRef<{ lastX: number; lastY: number } | null>(null);
+  // Scale (corner handles) and rotate (handle above the box) — both apply against a SNAPSHOT of
+  // each selected stroke's point positions taken at drag start, not against the live points frame
+  // to frame. Scaling/rotating the already-scaled/rotated result every pointermove would compound
+  // floating-point error and, worse, make the transform's origin drift away from the actual pivot
+  // as the shape deforms — snapshotting once means every frame is "start position transformed by
+  // the CURRENT total drag", which is exact regardless of how long the drag runs.
+  const transformRef = useRef<{
+    kind: "scale" | "rotate";
+    cx: number; cy: number; // pivot: opposite corner for scale, bbox center for rotate
+    startCorner: { x: number; y: number }; // scale only
+    startAngle: number; // rotate only
+    snapshot: { s: Stroke; pts: { x: number; y: number }[] }[];
+  } | null>(null);
+  // Mutating stroke points directly (same trick the existing move-drag above already uses) never
+  // triggers a React re-render on its own — the CANVAS still updates every frame regardless since
+  // the paint loop reads layersRef directly, but the bbox/handle overlay divs are plain React JSX
+  // and would otherwise sit frozen at their drag-start position while the shape moves underneath
+  // them. This tiny counter, bumped on every pointermove while any selection drag is active, is
+  // just enough to make React recompute getSelectionBBox() and reposition the overlay each frame.
+  const [, bumpOverlay] = useState(0);
   // Recomputed from live stroke data every render (cheap — only over the already-selected strokes'
   // points) rather than stored/cached, so it always matches wherever the strokes currently are,
   // including mid-drag.
@@ -879,6 +946,76 @@ function Index() {
     if (!any) return null;
     const pad = 12;
     return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+  };
+
+  // Transform handles (corner = scale, top = rotate). Each handle owns its whole drag lifecycle —
+  // pointer capture + down/move/up all live directly on the handle element via stopPropagation —
+  // rather than routing through the big shared onDown/onMove/onUp used for drawing/marquee/move,
+  // which keeps this from having to duplicate their brush-tool branches or risk a stray marquee
+  // starting underneath a handle click.
+  const startScaleDrag = (e: React.PointerEvent, corner: "nw" | "ne" | "sw" | "se") => {
+    e.stopPropagation();
+    const bbox = getSelectionBBox();
+    const layer = layersRef.current.find(l => l.id === activeLayerId);
+    if (!bbox || !layer) return;
+    (e.currentTarget as Element).setPointerCapture(e.pointerId);
+    const startCorner = { x: corner.includes("w") ? bbox.x0 : bbox.x1, y: corner.includes("n") ? bbox.y0 : bbox.y1 };
+    // Pivot is the OPPOSITE corner — dragging a corner handle stretches from the far corner, the
+    // same way every other image editor's resize handles behave, instead of scaling from the
+    // shape's own center (which would move the shape's edges even on the side you're not touching).
+    const pivot = { x: corner.includes("w") ? bbox.x1 : bbox.x0, y: corner.includes("n") ? bbox.y1 : bbox.y0 };
+    const snapshot = layer.strokes.filter(s => selectedIdsRef.current.has(s.id)).map(s => ({ s, pts: s.points.map(p => ({ x: p.x, y: p.y })) }));
+    transformRef.current = { kind: "scale", cx: pivot.x, cy: pivot.y, startCorner, startAngle: 0, snapshot };
+  };
+  const startRotateDrag = (e: React.PointerEvent) => {
+    e.stopPropagation();
+    const bbox = getSelectionBBox();
+    const layer = layersRef.current.find(l => l.id === activeLayerId);
+    if (!bbox || !layer) return;
+    (e.currentTarget as Element).setPointerCapture(e.pointerId);
+    const cx = (bbox.x0 + bbox.x1) / 2, cy = (bbox.y0 + bbox.y1) / 2;
+    const { x, y } = getPoint(e);
+    const snapshot = layer.strokes.filter(s => selectedIdsRef.current.has(s.id)).map(s => ({ s, pts: s.points.map(p => ({ x: p.x, y: p.y })) }));
+    transformRef.current = { kind: "rotate", cx, cy, startCorner: { x: 0, y: 0 }, startAngle: Math.atan2(y - cy, x - cx), snapshot };
+  };
+  const onHandleMove = (e: React.PointerEvent) => {
+    e.stopPropagation();
+    const tr = transformRef.current;
+    if (!tr) return;
+    const { x, y } = getPoint(e);
+    if (tr.kind === "scale") {
+      // Guard against a near-zero-width/height starting box (e.g. a single-point selection) —
+      // dividing by a near-zero span would blow the scale factor up to something absurd from a
+      // tiny mouse movement.
+      const denomX = tr.startCorner.x - tr.cx, denomY = tr.startCorner.y - tr.cy;
+      const sx = Math.abs(denomX) < 1 ? 1 : (x - tr.cx) / denomX;
+      const sy = Math.abs(denomY) < 1 ? 1 : (y - tr.cy) / denomY;
+      for (const { s, pts } of tr.snapshot) {
+        for (let i = 0; i < s.points.length; i++) {
+          s.points[i].x = tr.cx + (pts[i].x - tr.cx) * sx;
+          s.points[i].y = tr.cy + (pts[i].y - tr.cy) * sy;
+        }
+        s.segCache = undefined; s.bakedCache = null;
+      }
+    } else {
+      const ang = Math.atan2(y - tr.cy, x - tr.cx) - tr.startAngle;
+      const cos = Math.cos(ang), sin = Math.sin(ang);
+      for (const { s, pts } of tr.snapshot) {
+        for (let i = 0; i < s.points.length; i++) {
+          const dx = pts[i].x - tr.cx, dy = pts[i].y - tr.cy;
+          s.points[i].x = tr.cx + dx * cos - dy * sin;
+          s.points[i].y = tr.cy + dx * sin + dy * cos;
+        }
+        s.segCache = undefined; s.bakedCache = null;
+      }
+    }
+    bumpOverlay(v => v + 1);
+  };
+  const onHandleUp = (e: React.PointerEvent) => {
+    e.stopPropagation();
+    if (!transformRef.current) return;
+    transformRef.current = null;
+    pushHistory();
   };
 
   useEffect(() => {
@@ -2046,6 +2183,7 @@ function Index() {
           }
         }
         moveDragRef.current = { lastX: x, lastY: y };
+        bumpOverlay(v => v + 1);
       } else if (marqueeStartRef.current) {
         setMarquee({ x0: marqueeStartRef.current.x, y0: marqueeStartRef.current.y, x1: x, y1: y });
       }
@@ -2190,6 +2328,14 @@ function Index() {
     historyRef.current = [serializeLayers(next)];
     historyIdxRef.current = 0;
     setHistoryVer(v => v + 1);
+    // The old layer's strokes are gone — any selection/marquee/in-progress transform pointing at
+    // them needs clearing too, or the selection overlay and its handles keep trying to read strokes
+    // that no longer exist in any layer.
+    setSelectedIds(new Set());
+    setMarquee(null);
+    marqueeStartRef.current = null;
+    moveDragRef.current = null;
+    transformRef.current = null;
   };
 
   // === Export ===
@@ -2470,7 +2616,7 @@ function Index() {
             <span className="text-white/40">×</span>
             <input type="number" min={64} max={4096} value={newH} onChange={(e) => setNewH(+e.target.value || 0)} className="w-full rounded border border-white/10 bg-black/40 px-1.5 py-1 text-white" />
           </div>
-          <button onClick={newCanvas} className="w-full rounded-md border border-white/15 bg-white/10 px-2 py-1.5 text-[11px] tracking-wider hover:bg-white/15">+ Новый холст</button>
+          <button onClick={newCanvas} disabled={!!recording} className="w-full rounded-md border border-white/15 bg-white/10 px-2 py-1.5 text-[11px] tracking-wider transition hover:bg-white/15 disabled:opacity-30">+ Новый холст</button>
           <div className="mt-1.5 text-[9px] text-white/40">Текущий: {canvasSize.w}×{canvasSize.h}</div>
         </section>
 
@@ -2538,7 +2684,7 @@ function Index() {
           </div>
           {selectTool && (
             <div className="mt-1.5 text-[9px] text-white/40">
-              {selectedIds.size > 0 ? `Выбрано мазков: ${selectedIds.size} — тяните внутри рамки` : "Обведите рамкой мазки на активном слое"}
+              {selectedIds.size > 0 ? `Выбрано мазков: ${selectedIds.size} — тяните внутри рамки (перенос), за угол (размер) или за верхнюю точку (поворот)` : "Обведите рамкой мазки на активном слое"}
             </div>
           )}
         </section>
@@ -2857,16 +3003,48 @@ function Index() {
           {selectTool && !marquee && selectedIds.size > 0 && (() => {
             const bbox = getSelectionBBox();
             if (!bbox) return null;
+            const left = bbox.x0 * zoom, top = bbox.y0 * zoom;
+            const width = (bbox.x1 - bbox.x0) * zoom, height = (bbox.y1 - bbox.y0) * zoom;
+            const cx = left + width / 2;
+            const HS = 10; // handle size in screen px — fixed regardless of zoom, like every other editor's handles
+            const corners: { key: "nw" | "ne" | "sw" | "se"; x: number; y: number; cursor: string }[] = [
+              { key: "nw", x: left, y: top, cursor: "nwse-resize" },
+              { key: "ne", x: left + width, y: top, cursor: "nesw-resize" },
+              { key: "sw", x: left, y: top + height, cursor: "nesw-resize" },
+              { key: "se", x: left + width, y: top + height, cursor: "nwse-resize" },
+            ];
             return (
-              <div
-                className="pointer-events-none absolute border border-dashed border-cyan-300/80"
-                style={{
-                  left: bbox.x0 * zoom,
-                  top: bbox.y0 * zoom,
-                  width: (bbox.x1 - bbox.x0) * zoom,
-                  height: (bbox.y1 - bbox.y0) * zoom,
-                }}
-              />
+              <>
+                <div
+                  className="pointer-events-none absolute border border-dashed border-cyan-300/80"
+                  style={{ left, top, width, height }}
+                />
+                {/* Rotate handle — a short stalk above the box's top-center, ending in a circular
+                    grip. Distance from the box is in fixed screen px (not scaled by zoom) so it
+                    stays a comfortable, constant grab target at any zoom level. */}
+                <div className="pointer-events-none absolute bg-cyan-300/80" style={{ left: cx - 0.5, top: top - 22, width: 1, height: 22 }} />
+                <div
+                  onPointerDown={startRotateDrag}
+                  onPointerMove={onHandleMove}
+                  onPointerUp={onHandleUp}
+                  onPointerCancel={onHandleUp}
+                  className="absolute touch-none rounded-full border border-cyan-300 bg-cyan-300/90"
+                  style={{ left: cx - HS / 2, top: top - 22 - HS / 2, width: HS, height: HS, cursor: "grab" }}
+                  title="Повернуть"
+                />
+                {corners.map(c => (
+                  <div
+                    key={c.key}
+                    onPointerDown={(e) => startScaleDrag(e, c.key)}
+                    onPointerMove={onHandleMove}
+                    onPointerUp={onHandleUp}
+                    onPointerCancel={onHandleUp}
+                    className="absolute touch-none border border-cyan-300 bg-cyan-300/90"
+                    style={{ left: c.x - HS / 2, top: c.y - HS / 2, width: HS, height: HS, cursor: c.cursor }}
+                    title="Изменить размер"
+                  />
+                ))}
+              </>
             );
           })()}
         </div>
