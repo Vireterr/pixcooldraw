@@ -1518,15 +1518,23 @@ function Index() {
           const startX = baseX - tx * (widthLine / 2) + tx * shift;
           const startY = baseY - ty * (widthLine / 2) + ty * shift;
           // Color is no exception here vs any other brush: this brush only shapes the slices
-          // (position/width/count below) and paints them through the same shared paint() every
-          // other brush uses — so it picks up hueAt()'s color/mode handling identically (plain
-          // hue in "Обычный", rotating hue in "Глитч", gradient sampling in "Градиент", and a real
-          // r/g/b channel split in "RGB сдвиг" via target.rgbShift, all for free). No brush-specific
-          // color special-casing left; the brush's own character is entirely in its shape.
-          for (let xb = 0; xb < widthLine; xb += grid) {
-            if (Math.random() > 0.4 + s.intensity * 0.5) continue;
-            const px = startX + tx * xb, py = startY + ty * xb;
-            paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
+          // (position/width/count/density below) and paints them through the same shared paint()
+          // every other brush uses — so it picks up hueAt()'s color/mode handling identically
+          // (plain hue in "Обычный", rotating hue in "Глитч", gradient sampling in "Градиент", a
+          // real r/g/b channel split in "RGB сдвиг" via target.rgbShift, all for free). No
+          // brush-specific color special-casing left; the brush's own character is entirely in
+          // its shape. The triple pass at [-grid,0,grid] below is exactly that shape — three
+          // interleaved offset copies per slice, which is what gives it its original rough,
+          // scattered density (dropping this made it read as too smooth/even, since it cut the
+          // painted-cell count per slice to a third).
+          const offs = [-grid, 0, grid];
+          for (let c2 = 0; c2 < 3; c2++) {
+            for (let xb = 0; xb < widthLine; xb += grid) {
+              if (Math.random() > 0.4 + s.intensity * 0.5) continue;
+              const off = xb + offs[c2];
+              const px = startX + tx * off, py = startY + ty * off;
+              paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
+            }
           }
         }
       }
