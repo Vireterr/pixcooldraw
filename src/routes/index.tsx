@@ -1517,28 +1517,16 @@ function Index() {
           const baseX = p.x + nx * yOff, baseY = p.y + ny * yOff;
           const startX = baseX - tx * (widthLine / 2) + tx * shift;
           const startY = baseY - ty * (widthLine / 2) + ty * shift;
-          const offs = [-grid, 0, grid];
-          // Real r/g/b channel isolation of the ONE picked color — the actual "RGB shift" look
-          // (each slice-channel offset shows only that channel of the true color, like a
-          // misregistered color-print or chromatic aberration), as opposed to the synthetic
-          // +120°/+240° hue-rotation palette, which now lives exclusively in the "Глитч" MODE
-          // (see glitchShift above) so it stays available for any brush that mode is applied to.
-          // Keeping both means this brush's own color glitch and the mode's color glitch are two
-          // independent, switchable looks instead of the same effect duplicated in two places.
-          const [rBase, gBase, bBase] = getHslRgb(hueG, 100, 55);
-          const channels: [number, number, number][] = [
-            [rBase, 0, 0],
-            [0, gBase, 0],
-            [0, 0, bBase],
-          ];
-          for (let c2 = 0; c2 < 3; c2++) {
-            const [rC, gC, bC] = channels[c2];
-            for (let xb = 0; xb < widthLine; xb += grid) {
-              if (Math.random() > 0.4 + s.intensity * 0.5) continue;
-              const off = xb + offs[c2];
-              const px = startX + tx * off, py = startY + ty * off;
-              paintRGB(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, rC, gC, bC, alphaMul * 0.55);
-            }
+          // Color is no exception here vs any other brush: this brush only shapes the slices
+          // (position/width/count below) and paints them through the same shared paint() every
+          // other brush uses — so it picks up hueAt()'s color/mode handling identically (plain
+          // hue in "Обычный", rotating hue in "Глитч", gradient sampling in "Градиент", and a real
+          // r/g/b channel split in "RGB сдвиг" via target.rgbShift, all for free). No brush-specific
+          // color special-casing left; the brush's own character is entirely in its shape.
+          for (let xb = 0; xb < widthLine; xb += grid) {
+            if (Math.random() > 0.4 + s.intensity * 0.5) continue;
+            const px = startX + tx * xb, py = startY + ty * xb;
+            paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
           }
         }
       }
