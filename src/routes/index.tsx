@@ -1259,14 +1259,29 @@ function Index() {
       target.rgbShift = Math.max(1, s.size * (0.05 + s.dynamics * 0.35) * (0.4 + breathe * 0.6));
     }
     // "Глитч" mode — generic spatial tri-hue split, works with ANY brush the same way it used to
-    // work only for the pixelGlitch brush. Offset reach follows "Динамика" like the other
-    // position-based mode effects above, with a per-stroke jitter tied to "Скорость режима" so the
-    // spacing itself flickers a little frame to frame instead of sitting at one static distance.
+    // work only for the pixelGlitch brush. FIX: this used to scale up with "Динамика" (up to
+    // ~0.38x brush size), which for tile-based brushes (Дизеринг, Мозаика — cells sit edge to
+    // edge with no overlap) pushed the offset past the tile's own size, tearing gaps BETWEEN the
+    // three shifted copies that the near-black canvas showed straight through — reading as "the
+    // brush went black". Kept small and fixed instead (not tied to brush size or Динамика at all)
+    // so it stays comfortably smaller than any brush's own tile/grid step — visible fringing at
+    // edges, never real gaps in solid coverage.
     const glitchSplitSet = glitchOn;
     if (glitchSplitSet) {
       const jitter = 0.6 + 0.4 * Math.sin(mt * (2 + ms * 10) + phaseOffset);
-      target.glitchSplit = Math.max(1, s.size * (0.08 + s.dynamics * 0.3) * jitter);
+      target.glitchSplit = 1.5 * jitter;
     }
+
+    // FIX (root cause of the intermittent "canvas goes black/negative regardless of mode" bug):
+    // this whole per-brush dispatch below is wrapped in try/finally now because at least one
+    // brush (pixelGlitch, see its own early `return` for <2 points) can exit BEFORE reaching the
+    // spraySet/rgbShiftSet/glitchSplitSet reset at the end of this function. Since `target` is one
+    // shared object reused across EVERY stroke drawn in a frame, a leaked flag (say, glitchSplit
+    // left set from a single click that started a "Глитч" stroke but hadn't moved yet) then silently
+    // applies to every OTHER stroke rendered afterward — any brush, any mode — until something else
+    // happens to overwrite it. That's exactly why it looked random and mode-independent: it wasn't
+    // the CURRENT stroke's mode causing it, it was a PAST stroke's flag never getting cleaned up.
+    try {
 
     if (s.kind === "ink") {
       // Pixelated animated line — pixel dots along smooth path with breathing thickness
@@ -1655,9 +1670,11 @@ function Index() {
       }
     }
 
-    if (spraySet) { target.spray = undefined; target.sprayKeep = undefined; }
-    if (rgbShiftSet) { target.rgbShift = undefined; }
-    if (glitchSplitSet) { target.glitchSplit = undefined; }
+    } finally {
+      if (spraySet) { target.spray = undefined; target.sprayKeep = undefined; }
+      if (rgbShiftSet) { target.rgbShift = undefined; }
+      if (glitchSplitSet) { target.glitchSplit = undefined; }
+    }
   }
 
   // PERF: build a frozen stroke's render ONCE and cache it, instead of re-running its full
