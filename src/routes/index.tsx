@@ -27,7 +27,7 @@ type BrushKind =
   | "fill"
   | "eraser";
 
-type ModeKind = "normal" | "rainbow" | "gradient" | "pulse" | "spray" | "mirror" | "glitch";
+type ModeKind = "normal" | "rainbow" | "gradient" | "pulse" | "spray" | "mirror" | "glitch" | "rgbShift";
 
 interface StrokePoint { x: number; y: number; t: number }
 
@@ -144,6 +144,7 @@ const MODES: { id: ModeKind; label: string }[] = [
   { id: "spray", label: "Распыление" },
   { id: "mirror", label: "Зеркало" },
   { id: "glitch", label: "Глитч" },
+  { id: "rgbShift", label: "RGB сдвиг" },
 ];
 
 const GIF_PRESETS = {
@@ -295,6 +296,12 @@ interface PaintTarget {
   // skipped — set alongside `spray` above. Without this every brush's spray looked identical
   // regardless of the "Плотность" (density) slider, since the skip chance was a hardcoded constant.
   sprayKeep?: number;
+  // Set for the duration of one stroke's render pass when its MODE is "RGB сдвиг" — same generic
+  // pattern as spray/sprayKeep above, so it works for every brush automatically instead of needing
+  // brush-specific code. Holds the pixel offset magnitude; paint() then splits that one call's
+  // color into its real r/g/b channels and blits each channel at a slightly different position
+  // (true chromatic-aberration-style misregistration), instead of tinting everything one flat hue.
+  rgbShift?: number;
 }
 function hslToRgb(h: number, s: number, l: number): [number, number, number] {
   h = ((h % 360) + 360) % 360;
@@ -395,13 +402,26 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
     x += (Math.random() - 0.5) * target.spray;
     y += (Math.random() - 0.5) * target.spray;
   }
+  const [r, g, b] = getHslRgb(h, s, l);
+  // Generic "RGB сдвиг" mode: instead of one flat-colored blit, split the real color into its r/g/b
+  // channels and paint each one offset a few pixels apart — a genuine channel misregistration
+  // (magenta/cyan fringing) rather than a hue-rotation trick, and because it lives here inside the
+  // one paint() every brush already calls through, it works for any brush, not just one dedicated
+  // glitch brush. Mirrors the pixelGlitch brush's own real r/g/b split (see there), just applied
+  // generically at the shared color-plotting call site instead of that one brush's bespoke loop.
+  if (target.rgbShift) {
+    const off = target.rgbShift;
+    paintRGB(target, x - off, y, sizeW, sizeH, r, 0, 0, a);
+    paintRGB(target, x, y, sizeW, sizeH, 0, g, 0, a);
+    paintRGB(target, x + off, y, sizeW, sizeH, 0, 0, b, a);
+    return;
+  }
   if (target.mode === "ctx") {
     target.ctx!.fillStyle = `hsla(${h}, ${s}%, ${l}%, ${a})`;
     target.ctx!.fillRect(x, y, sizeW, sizeH);
     return;
   }
   const buf = target.buf!, bw = target.bw!, bh = target.bh!;
-  const [r, g, b] = getHslRgb(h, s, l);
   const x0 = Math.max(0, Math.floor(x));
   const y0 = Math.max(0, Math.floor(y));
   const x1 = Math.min(bw, Math.floor(x) + Math.max(1, Math.round(sizeW)));
@@ -1212,6 +1232,15 @@ function Index() {
       // scatter looked for every brush except ink. Now density genuinely thins it out or fills it in.
       target.sprayKeep = 0.25 + s.density * 0.6;
     }
+    // "RGB сдвиг" mode — generic real channel-split, works with ANY brush (unlike the pixelGlitch
+    // brush's own built-in split, which only fires for that one brush). Offset reach follows
+    // "Динамика" (same knob the pixelGlitch brush uses for its own reach), and gently breathes over
+    // time at the "Скорость режима" rate so it reads as a live flicker instead of a static fringe.
+    const rgbShiftSet = s.mode === "rgbShift";
+    if (rgbShiftSet) {
+      const breathe = 0.5 + 0.5 * Math.sin(mt * (0.5 + ms * 3));
+      target.rgbShift = Math.max(1, s.size * (0.05 + s.dynamics * 0.35) * (0.4 + breathe * 0.6));
+    }
 
     if (s.kind === "ink") {
       // Pixelated animated line — pixel dots along smooth path with breathing thickness
@@ -1489,18 +1518,26 @@ function Index() {
           const startX = baseX - tx * (widthLine / 2) + tx * shift;
           const startY = baseY - ty * (widthLine / 2) + ty * shift;
           const offs = [-grid, 0, grid];
-          // Back to the original synthetic +120°/+240° hue rotation per slice-channel — this is the
-          // color palette that was here before the "real r/g/b channel isolation" change, and the
-          // one that was actually liked. The "Глитч" MODE (added separately) reuses this same idea
-          // for other brushes; this brush's own coloring is independent of that mode.
-          const hues: number[] = [hueG, hueG + 120, hueG + 240];
+          // Real r/g/b channel isolation of the ONE picked color — the actual "RGB shift" look
+          // (each slice-channel offset shows only that channel of the true color, like a
+          // misregistered color-print or chromatic aberration), as opposed to the synthetic
+          // +120°/+240° hue-rotation palette, which now lives exclusively in the "Глитч" MODE
+          // (see glitchShift above) so it stays available for any brush that mode is applied to.
+          // Keeping both means this brush's own color glitch and the mode's color glitch are two
+          // independent, switchable looks instead of the same effect duplicated in two places.
+          const [rBase, gBase, bBase] = getHslRgb(hueG, 100, 55);
+          const channels: [number, number, number][] = [
+            [rBase, 0, 0],
+            [0, gBase, 0],
+            [0, 0, bBase],
+          ];
           for (let c2 = 0; c2 < 3; c2++) {
-            const hueC = hues[c2];
+            const [rC, gC, bC] = channels[c2];
             for (let xb = 0; xb < widthLine; xb += grid) {
               if (Math.random() > 0.4 + s.intensity * 0.5) continue;
               const off = xb + offs[c2];
               const px = startX + tx * off, py = startY + ty * off;
-              paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hueC, 100, 55, alphaMul * 0.55);
+              paintRGB(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, rC, gC, bC, alphaMul * 0.55);
             }
           }
         }
@@ -1588,6 +1625,7 @@ function Index() {
     }
 
     if (spraySet) { target.spray = undefined; target.sprayKeep = undefined; }
+    if (rgbShiftSet) { target.rgbShift = undefined; }
   }
 
   // PERF: build a frozen stroke's render ONCE and cache it, instead of re-running its full
@@ -2304,7 +2342,7 @@ function Index() {
               <ParamSlider label="Скорость мигания" value={rainbowBlinkSpeed} set={setRainbowBlinkSpeed} />
             </div>
           )}
-          {(mode === "pulse" || mode === "glitch") && (
+          {(mode === "pulse" || mode === "glitch" || mode === "rgbShift") && (
             <div className="mt-2 border-t border-white/10 pt-2">
               <ParamSlider label="Скорость режима" value={modeSpeed} set={setModeSpeed} />
             </div>
