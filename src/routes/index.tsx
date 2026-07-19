@@ -20,7 +20,6 @@ type BrushKind =
   | "ribbon"
   | "lightning"
   | "pixelRain"
-  | "pixelDither"
   | "pixelGlitch"
   | "mosaic"
   | "embers"
@@ -132,7 +131,6 @@ const BRUSHES: { id: BrushKind; label: string }[] = [
   { id: "ribbon", label: "Лента" },
   { id: "lightning", label: "Молния" },
   { id: "pixelRain", label: "Пикс. дождь" },
-  { id: "pixelDither", label: "Дизеринг" },
   { id: "pixelGlitch", label: "Глитч" },
   { id: "mosaic", label: "Мозаика" },
   { id: "embers", label: "Угли" },
@@ -777,35 +775,6 @@ function strokeAutoAngleDeg(pts: StrokePoint[]): number {
   const dx = p1.x - p0.x, dy = p1.y - p0.y;
   if (Math.hypot(dx, dy) < 1) return 0;
   return ((Math.atan2(dy, dx) * 180) / Math.PI + 360) % 360;
-}
-
-// Standard 4×4 ordered (Bayer) dither matrix — 16 fixed threshold ranks, purely spatial (a lookup
-// on a cell's own grid position, nothing else). Used by the pixelDither brush.
-const BAYER_4X4 = [
-  [0, 8, 2, 10],
-  [12, 4, 14, 6],
-  [3, 11, 1, 9],
-  [15, 7, 13, 5],
-];
-
-// PERF: cached pixelDither offset patterns — the set of grid cells within `radius` of a sampled
-// point only depends on (grid, radius), which are fixed for the whole stroke, so build it once per
-// (grid, radius) pair and reuse across every sampled point/frame instead of a nested dx/dy loop +
-// Math.hypot per point per frame.
-const ditherOffsetCache = new Map<string, { dx: number; dy: number; dist: number }[]>();
-function getDitherOffsets(grid: number, radius: number) {
-  const key = `${grid}_${Math.round(radius)}`;
-  let cached = ditherOffsetCache.get(key);
-  if (cached) return cached;
-  const list: { dx: number; dy: number; dist: number }[] = [];
-  for (let dx = -radius; dx <= radius; dx += grid) {
-    for (let dy = -radius; dy <= radius; dy += grid) {
-      if (dx * dx + dy * dy > radius * radius) continue;
-      list.push({ dx, dy, dist: Math.hypot(dx, dy) / radius });
-    }
-  }
-  ditherOffsetCache.set(key, list);
-  return list;
 }
 
 let strokeIdCounter = 0;
@@ -1885,48 +1854,6 @@ function IndexInner() {
         for (let k = 0; k < r.len; k++) {
           const a = alphaMul * (1 - k / r.len);
           paint(target, Math.round((r.x) / grid) * grid, Math.round((r.y - k * grid) / grid) * grid, grid, grid, hueP, 95, 55 + k * 3, a);
-        }
-      }
-    }
-
-    else if (s.kind === "pixelDither") {
-      // REBUILT with a real 4×4 ordered (Bayer) dither matrix — 16 brightness/coverage levels
-      // instead of the earlier 2×2 rewrite's 4. The on/off decision for a cell is a lookup on
-      // BAYER_4X4 compared against `litRanks` (from the density slider) — always exactly `litRanks`
-      // out of 16 possible ranks are lit, every single frame, no matter what. That count never
-      // changes, so the total painted coverage/shape can never collapse toward black the way the
-      // old sweep+bayer+noise SUM threshold could.
-      // LIVING AGAIN: `shift` scrolls which physical cells map to which rank, diagonally, over
-      // time (a classic "marching dither" look) — it changes WHERE the 16 ranks land, never HOW
-      // MANY are lit, so the shape/coverage stays exactly as stable as a fully static version while
-      // the texture itself visibly crawls. Purely an index rotation (mod 4), not a sum of terms
-      // that could ever add up to "nothing clears the threshold" — structurally as safe as no
-      // animation at all.
-      const grid = Math.max(4, Math.round(s.size / 4));
-      const stepPts = Math.max(1, Math.floor(pts.length / 40));
-      const radius = s.size * (1 + s.dynamics * 1.5);
-      const offsets = getDitherOffsets(grid, radius);
-      // density picks how many of the 16 Bayer ranks are lit: density=0 still lights rank 0 (a
-      // real, visible sparse 1-in-16 texture, never zero coverage), density=1 lights all 16 (solid).
-      const litRanks = Math.max(1, Math.round(1 + s.density * 15));
-      const shift = Math.floor(tt * (1.5 + s.speed * 6));
-      for (let pi = 0; pi < pts.length; pi += stepPts) {
-        const p = pts[pi];
-        const hueD = hueAt(pi);
-        const cx = Math.round(p.x / grid) * grid;
-        const cy = Math.round(p.y / grid) * grid;
-        for (const off of offsets) {
-          const gx = cx + off.dx, gy = cy + off.dy;
-          const dist = off.dist; // 0 (center) .. 1 (brush edge) — fixed per offset, never animated
-          const bx = (((gx / grid + shift) % 4) + 4) % 4;
-          const by = (((gy / grid + shift) % 4) + 4) % 4;
-          const rank = BAYER_4X4[bx][by];
-          if (rank >= litRanks) continue;
-          const edgeFade = 1 - dist; // static round brush-edge falloff
-          if (edgeFade <= 0) continue;
-          const grain = noiseAt(gx + gy * 7); // purely spatial — no time term, can't flicker
-          const lit = 46 + grain * 16;
-          paint(target, gx, gy, grid, grid, hueD + (rank % 2 ? 20 : 0), 85, lit, alphaMul * edgeFade);
         }
       }
     }
