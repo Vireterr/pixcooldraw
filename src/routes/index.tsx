@@ -20,7 +20,6 @@ type BrushKind =
   | "ribbon"
   | "lightning"
   | "pixelRain"
-  | "pixelDither"
   | "pixelGlitch"
   | "mosaic"
   | "embers"
@@ -28,7 +27,7 @@ type BrushKind =
   | "eraser"
   | "eyedropper";
 
-type ModeKind = "normal" | "rainbow" | "gradient" | "pulse" | "spray" | "mirror" | "glitch" | "rgbShift";
+type ModeKind = "normal" | "rainbow" | "gradient" | "pulse" | "spray" | "mirror" | "glitch" | "rgbShift" | "chrome";
 
 interface StrokePoint { x: number; y: number; t: number; pressure?: number }
 
@@ -129,10 +128,16 @@ const BRUSHES: { id: BrushKind; label: string }[] = [
   { id: "ribbon", label: "Лента" },
   { id: "lightning", label: "Молния" },
   { id: "pixelRain", label: "Пикс. дождь" },
-  { id: "pixelDither", label: "Дизеринг" },
   { id: "pixelGlitch", label: "Глитч" },
   { id: "mosaic", label: "Мозаика" },
   { id: "embers", label: "Угли" },
+];
+
+// Not brushes in the "animated stroke" sense — one-shot/utility actions on the canvas. Kept as a
+// separate list/UI section from BRUSHES purely for organization; `brush` state and every render/
+// pointer-handling code path that switches on BrushKind is untouched, since fill/eraser/eyedropper
+// are still members of the same BrushKind union.
+const TOOLS: { id: BrushKind; label: string }[] = [
   { id: "fill", label: "Заливка" },
   { id: "eraser", label: "Ластик" },
   { id: "eyedropper", label: "Пипетка" },
@@ -147,6 +152,7 @@ const MODES: { id: ModeKind; label: string }[] = [
   { id: "mirror", label: "Зеркало" },
   { id: "glitch", label: "Глитч" },
   { id: "rgbShift", label: "RGB сдвиг" },
+  { id: "chrome", label: "Хром" },
 ];
 
 const GIF_PRESETS = {
@@ -311,6 +317,20 @@ interface PaintTarget {
   // actually reads as glitch. This used to be baked into just the pixelGlitch brush; now every
   // brush that calls paint() gets it automatically when this mode is selected.
   glitchSplit?: number;
+  // Set for the duration of one stroke's render pass when its MODE is "Хром" — same generic
+  // per-paint-call pattern as spray/rgbShift/glitchSplit above. Simulates a metallic sheen: a
+  // traveling bright/dark band (a sine wave projected along the stroke's own direction) drains
+  // saturation toward silver and pushes lightness toward the band's highlight/shadow extremes,
+  // independent of whichever hue the brush/mode would otherwise have painted. chromeFreq being
+  // unset/0 means the mode is off — checked instead of a separate boolean so there's only one
+  // thing to clear in the cleanup below.
+  chromeCos?: number;
+  chromeSin?: number;
+  chromeFreq?: number;
+  chromePhase?: number;
+  // 0..1 — how much the "Хром" sheen's hue rotates as it sweeps (see paint()'s chrome branch).
+  // Driven by the stroke's own "Шум" slider; 0 = plain single-hue metal.
+  chromeColorAmt?: number;
 }
 function hslToRgb(h: number, s: number, l: number): [number, number, number] {
   h = ((h % 360) + 360) % 360;
@@ -426,6 +446,28 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
     if (Math.random() > (target.sprayKeep ?? 0.55)) return;
     x += (Math.random() - 0.5) * target.spray;
     y += (Math.random() - 0.5) * target.spray;
+  }
+  // Generic "Хром" mode: recolor toward a metallic sheen BEFORE the real color is computed —
+  // unlike spray/glitchSplit/rgbShift above, this doesn't fork into multiple paint calls, it just
+  // reshapes h/s/l for the one call about to happen. `band` is a plain sine of a spatial
+  // projection — always a real -1..1 swing, so the highlight/shadow range can never collapse to a
+  // single flat value the way an accumulated multi-term threshold could (see the pixelDither
+  // rewrite for why that failure mode matters).
+  // Colorfulness rides the existing "Шум" slider (target.chromeColorAmt, set from s.noise below) —
+  // reuses a control that otherwise does nothing in this mode instead of adding a new one. At 0 the
+  // sheen stays a single metallic hue (silver/gold/copper depending on the brush's own hue); turned
+  // up, a SECOND sine (`colorBand`, a different frequency and phase so its bands don't line up with
+  // the brightness bands) rotates the hue as it sweeps — an iridescent/oil-slick chrome instead of
+  // flat metal. Saturation rises alongside it so the color shift is actually visible instead of
+  // washed out by the same silver-desaturation used at colorAmt=0.
+  if (target.chromeFreq) {
+    const proj = (x * (target.chromeCos ?? 1) + y * (target.chromeSin ?? 0)) * target.chromeFreq + (target.chromePhase ?? 0);
+    const band = Math.sin(proj);
+    const colorAmt = target.chromeColorAmt ?? 0;
+    const colorBand = Math.sin(proj * 1.7 + 2.1);
+    h = h + colorBand * 70 * colorAmt;
+    l = Math.max(4, Math.min(96, l * 0.3 + 50 + band * 42));
+    s = s * (0.25 + 0.55 * colorAmt);
   }
   const [r, g, b] = getHslRgb(h, s, l);
   // Generic "Глитч" mode: paint the SAME call three times, tinted 0°/+120°/+240° off the real
@@ -692,25 +734,6 @@ function deserializeLayers(str: string): Layer[] {
 }
 
 
-// ==== PERF: cached pixelDither offset patterns ====
-// Previously recomputed a nested dx/dy loop with Math.hypot for EVERY sampled point, EVERY frame.
-// The offset pattern only depends on (grid, radius), which are fixed per-stroke — so cache it once
-// per (grid, radius) pair and reuse across frames/strokes.
-const ditherOffsetCache = new Map<string, { dx: number; dy: number; dist: number }[]>();
-function getDitherOffsets(grid: number, radius: number) {
-  const key = `${grid}_${Math.round(radius)}`;
-  let cached = ditherOffsetCache.get(key);
-  if (cached) return cached;
-  const list: { dx: number; dy: number; dist: number }[] = [];
-  for (let dx = -radius; dx <= radius; dx += grid) {
-    for (let dy = -radius; dy <= radius; dy += grid) {
-      if (dx * dx + dy * dy > radius * radius) continue;
-      list.push({ dx, dy, dist: Math.hypot(dx, dy) / radius });
-    }
-  }
-  ditherOffsetCache.set(key, list);
-  return list;
-}
 
 // ==== PERF: render options ====
 // step: for ink/ribbon, how many points to skip per iteration during LIVE preview (1 = full quality,
@@ -1518,6 +1541,24 @@ function IndexInner() {
       const jitter = 0.6 + 0.4 * Math.sin(mt * (2 + ms * 10) + phaseOffset);
       target.glitchSplit = 1.5 * jitter;
     }
+    // "Хром" mode — generic metallic sheen, works with ANY brush the same way rgbShift/glitch do.
+    // Sweep direction follows the stroke's own drawn direction (same strokeAutoAngleDeg already
+    // used by the gradient mode), rotated 90° so the bands run ACROSS the stroke rather than along
+    // it — that's what reads as a reflection sweeping over a metal surface instead of a stripe
+    // painted down its length. Band tightness scales with brush size (bigger brush = a few broad
+    // bands; thin brush = tighter banding, same relative look at any scale).
+    const chromeSet = s.mode === "chrome";
+    if (chromeSet) {
+      const angleRad = ((strokeAutoAngleDeg(pts) + 90) * Math.PI) / 180;
+      target.chromeCos = Math.cos(angleRad);
+      target.chromeSin = Math.sin(angleRad);
+      target.chromeFreq = (2 * Math.PI) / Math.max(20, s.size * 3);
+      // Travels slowly over time so the highlight visibly sweeps across the shape — a living
+      // reflection, not a static gradient — at the same adjustable "Скорость режима" rate every
+      // other mode-speed-driven effect (pulse/glitch/rgbShift) already uses.
+      target.chromePhase = mt * (0.4 + ms * 1.5);
+      target.chromeColorAmt = s.noise;
+    }
 
     // FIX (root cause of the intermittent "canvas goes black/negative regardless of mode" bug):
     // this whole per-brush dispatch below is wrapped in try/finally now because at least one
@@ -1699,58 +1740,6 @@ function IndexInner() {
       }
     }
 
-    else if (s.kind === "pixelDither") {
-      // REWRITE (not another patch): the old version drove which cells got painted off a formula
-      // summing several time-varying terms (a sine "sweep", a per-point phase jitter, a bayer term,
-      // a noise "grain" term, all then scaled by a coverage factor) into one threshold, compared
-      // against distance. Every one of those terms had already been individually "fixed" at least
-      // once for causing exactly this "fades to black" symptom, and it kept coming back — a sign
-      // the whole approach was fragile, not that any single constant was wrong. Some combination of
-      // slider values + wherever the sine landed at a given moment could always still sum to a
-      // threshold that (almost) nothing clears.
-      // This version's on/off decision is PURELY SPATIAL — a fixed 2x2 Bayer ordered-dither pattern
-      // keyed only by each cell's own grid position — with NO time term in it at all. So which cells
-      // are eligible to paint can never drift as the animation clock runs, no matter how long the
-      // stroke has been alive or what the sliders are set to. Time only affects the hue (a color
-      // shift, via modeHueShift below like every other brush) and a gentle brightness flicker — never
-      // whether a cell paints at all.
-      const grid = Math.max(4, Math.round(s.size / 4));
-      const stepPts = Math.max(1, Math.floor(pts.length / 40));
-      const radius = s.size * (1 + s.dynamics * 1.5);
-      const offsets = getDitherOffsets(grid, radius);
-      // 2x2 Bayer matrix, expressed as a 0..3 "on rank" per cell: density picks how many of those 4
-      // ranks are lit. density=0 still lights rank 0 (1-in-4 cells — a real, visible sparse texture,
-      // never zero), density=1 lights all 4 (fully solid). Purely a lookup on fixed integers — no
-      // sum of floats that could round to something degenerate.
-      const bayer2x2 = [[0, 2], [3, 1]];
-      const litRanks = Math.max(1, Math.round(1 + s.density * 3)); // 1..4 ranks lit
-      for (let pi = 0; pi < pts.length; pi += stepPts) {
-        const p = pts[pi];
-        const hueD = hueAt(pi);
-        const cx = Math.round(p.x / grid) * grid;
-        const cy = Math.round(p.y / grid) * grid;
-        for (const off of offsets) {
-          const gx = cx + off.dx, gy = cy + off.dy;
-          const dist = off.dist; // 0 (center) .. 1 (brush edge)
-          const bx = (((gx / grid) % 2) + 2) % 2;
-          const by = (((gy / grid) % 2) + 2) % 2;
-          const rank = bayer2x2[bx][by];
-          if (rank >= litRanks) continue;
-          // Soft round brush edge — independent of the on/off pattern above, so it only ever makes
-          // the shape's rim fade out, never removes the solid core in the middle.
-          const edgeFade = 1 - dist;
-          if (edgeFade <= 0) continue;
-          // Stable per-cell brightness variation (purely spatial, same noiseAt already used
-          // elsewhere) plus a gentle time-based flicker for visual life — this only ever brightens
-          // or dims an already-painted cell, it can't be the reason a cell fails to paint.
-          const grain = noiseAt(gx + gy * 7);
-          const flicker = 0.85 + 0.15 * Math.sin(tt * (0.6 + s.speed * 1.5) + grain * 6.28);
-          const lit = (46 + grain * 16) * flicker;
-          paint(target, gx, gy, grid, grid, hueD + modeHueShift + (rank % 2 ? 20 : 0), 85, lit, alphaMul * edgeFade);
-        }
-      }
-    }
-
     else if (s.kind === "pixelGlitch") {
       // With just one point (right after pointer-down, before any movement), the full slice
       // pattern was still drawn stacked around that single spot — there's no real direction yet,
@@ -1907,6 +1896,7 @@ function IndexInner() {
       if (spraySet) { target.spray = undefined; target.sprayKeep = undefined; }
       if (rgbShiftSet) { target.rgbShift = undefined; }
       if (glitchSplitSet) { target.glitchSplit = undefined; }
+      if (chromeSet) { target.chromeFreq = undefined; target.chromeCos = undefined; target.chromeSin = undefined; target.chromePhase = undefined; target.chromeColorAmt = undefined; }
     }
   }
 
@@ -2689,7 +2679,9 @@ function IndexInner() {
 
         {/* Selection / move tool — a real, separate mode from painting so drags move strokes
             instead of drawing them. Only strokes on the active layer are selectable, same as fill
-            and eraser already only ever touch it. */}
+            and eraser already only ever touch it. Fill/eraser/eyedropper live here too — one-shot
+            canvas actions rather than animated brushes, so grouped with draw/select instead of the
+            brush grid below. */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
           <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Инструмент</div>
           <div className="grid grid-cols-2 gap-1">
@@ -2705,6 +2697,9 @@ function IndexInner() {
             >
               Выделение
             </button>
+            {TOOLS.map(b => (
+              <button key={b.id} onClick={() => { setSelectTool(false); setSelectedIds(new Set()); setMarquee(null); setBrush(b.id); }} className={`rounded border px-2 py-1 text-[10px] tracking-wider transition ${!selectTool && brush === b.id ? "border-white/60 bg-white/15" : "border-white/10 bg-white/[0.02] text-white/60 hover:bg-white/[0.06]"}`}>{b.label}</button>
+            ))}
           </div>
           {selectTool && (
             <div className="mt-1.5 text-[9px] text-white/40">
@@ -3085,4 +3080,3 @@ function IndexInner() {
     </main>
   );
 }
-
