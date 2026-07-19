@@ -647,26 +647,50 @@ function strokeAutoAngleDeg(pts: StrokePoint[]): number {
 let strokeIdCounter = 0;
 let layerIdCounter = 0;
 
-// Strip transient fields for history snapshots
+// PERF: history used to re-JSON.stringify EVERY stroke's full point list on EVERY pushHistory()
+// call, even for strokes that hadn't changed since the last snapshot — cost grew with the whole
+// picture's total data, not with what was actually drawn since the last undo step. This cache
+// keyed by stroke object identity (WeakMap — entries vanish on their own once a stroke is
+// discarded, no manual cleanup needed) remembers each stroke's serialized JSON fragment and only
+// recomputes it when the stroke's geometry actually changes.
+// Safe because strokes are effectively append-only once created: after a stroke is finished
+// (pushHistory happens once per completed stroke, at pointer-up — never mid-draw), its style
+// fields (hue/size/mode/etc.) are never mutated again — only its POINTS can still change later,
+// via erase/move/rotate/scale. Every one of those mutation sites already resets segCache/bakedCache
+// to invalidate cached geometry/render state (search "s.segCache = undefined") — this cache is
+// invalidated at those exact same sites, so it can never go stale.
+const strokeSerCache = new WeakMap<Stroke, string>();
+function serializeStroke(s: Stroke): string {
+  const cached = strokeSerCache.get(s);
+  if (cached !== undefined) return cached;
+  const json = JSON.stringify({
+    id: s.id, kind: s.kind, mode: s.mode, size: s.size, hue: s.hue,
+    speed: s.speed, density: s.density, noise: s.noise,
+    intensity: s.intensity, dynamics: s.dynamics, modeSpeed: s.modeSpeed,
+    rainbowFlow: s.rainbowFlow, rainbowFlowSpeed: s.rainbowFlowSpeed, rainbowBlinkSpeed: s.rainbowBlinkSpeed, gradientSpeed: s.gradientSpeed, gradientScale: s.gradientScale,
+    gradientColors: s.gradientColors, gradientAngle: s.gradientAngle,
+    frozen: s.frozen,
+    points: s.points, born: s.born,
+    fillRuns: s.fillRuns, fillW: s.fillW, fillH: s.fillH,
+  });
+  strokeSerCache.set(s, json);
+  return json;
+}
+
+// Strip transient fields for history snapshots. Layer-level JSON is still rebuilt fresh every
+// call (layers/strokes-array shape changes constantly — adds/removes/reorders), but each
+// individual stroke's fragment comes from the cache above instead of being re-stringified.
 function serializeLayers(layers: Layer[]): string {
-  return JSON.stringify(layers.map(l => ({
-    id: l.id, name: l.name, visible: l.visible,
-    image: l.image ?? null,
-    strokes: l.strokes.map(s => ({
-      id: s.id, kind: s.kind, mode: s.mode, size: s.size, hue: s.hue,
-      speed: s.speed, density: s.density, noise: s.noise,
-      intensity: s.intensity, dynamics: s.dynamics, modeSpeed: s.modeSpeed,
-      rainbowFlow: s.rainbowFlow, rainbowFlowSpeed: s.rainbowFlowSpeed, rainbowBlinkSpeed: s.rainbowBlinkSpeed, gradientSpeed: s.gradientSpeed, gradientScale: s.gradientScale,
-      gradientColors: s.gradientColors, gradientAngle: s.gradientAngle,
-      frozen: s.frozen,
-      points: s.points, born: s.born,
-      fillRuns: s.fillRuns, fillW: s.fillW, fillH: s.fillH,
-    })),
-  })));
+  const layerParts = layers.map(l => {
+    const strokeParts = l.strokes.map(serializeStroke).join(",");
+    return `{"id":${l.id},"name":${JSON.stringify(l.name)},"visible":${l.visible},"image":${JSON.stringify(l.image ?? null)},"strokes":[${strokeParts}]}`;
+  });
+  return `[${layerParts.join(",")}]`;
 }
 function deserializeLayers(str: string): Layer[] {
   return JSON.parse(str) as Layer[];
 }
+
 
 // ==== PERF: cached pixelDither offset patterns ====
 // Previously recomputed a nested dx/dy loop with Math.hypot for EVERY sampled point, EVERY frame.
@@ -802,6 +826,22 @@ function IndexInner() {
   const historyIdxRef = useRef(0);
   const [historyVer, setHistoryVer] = useState(0);
 
+  // PERF: running total of live pixelRain particles across the whole scene, updated incrementally
+  // at every spawn/despawn point instead of re-scanned by summing every stroke's s.rain.length on
+  // every single animation frame (that full scan used to run 60x/sec regardless of scene size).
+  // Kept accurate by: (1) ++ on spawn and -- on despawn/erase — the normal per-frame paths — and
+  // (2) an explicit recomputeRainCount() call at every place that removes strokes WITHOUT going
+  // through those paths (undo, redo, clear layer/canvas, delete layer) — those are rare, one-off
+  // events, so a full recount there is free, unlike doing it every frame.
+  const rainCountRef = useRef(0);
+  const recomputeRainCount = useCallback(() => {
+    let total = 0;
+    for (const layer of layersRef.current) {
+      for (const s of layer.strokes) if (s.rain) total += s.rain.length;
+    }
+    rainCountRef.current = total;
+  }, []);
+
   const pushHistory = useCallback(() => {
     const snap = serializeLayers(layersRef.current);
     const stack = historyRef.current;
@@ -820,7 +860,8 @@ function IndexInner() {
     layersRef.current = restored;
     setLayers(restored);
     setHistoryVer(v => v + 1);
-  }, []);
+    recomputeRainCount();
+  }, [recomputeRainCount]);
   const redo = useCallback(() => {
     if (historyIdxRef.current >= historyRef.current.length - 1) return;
     historyIdxRef.current += 1;
@@ -828,7 +869,8 @@ function IndexInner() {
     layersRef.current = restored;
     setLayers(restored);
     setHistoryVer(v => v + 1);
-  }, []);
+    recomputeRainCount();
+  }, [recomputeRainCount]);
 
   const canUndo = historyIdxRef.current > 0;
   const canRedo = historyIdxRef.current < historyRef.current.length - 1;
@@ -997,7 +1039,7 @@ function IndexInner() {
           s.points[i].x = tr.cx + (pts[i].x - tr.cx) * sx;
           s.points[i].y = tr.cy + (pts[i].y - tr.cy) * sy;
         }
-        s.segCache = undefined; s.bakedCache = null;
+        s.segCache = undefined; s.bakedCache = null; strokeSerCache.delete(s);
       }
     } else {
       const ang = Math.atan2(y - tr.cy, x - tr.cx) - tr.startAngle;
@@ -1008,7 +1050,7 @@ function IndexInner() {
           s.points[i].x = tr.cx + dx * cos - dy * sin;
           s.points[i].y = tr.cy + dx * sin + dy * cos;
         }
-        s.segCache = undefined; s.bakedCache = null;
+        s.segCache = undefined; s.bakedCache = null; strokeSerCache.delete(s);
       }
     }
     bumpOverlay(v => v + 1);
@@ -1155,8 +1197,12 @@ function IndexInner() {
       });
       // Erasing removes points from arbitrary positions, so cached segment indices no longer line
       // up with the (now shorter/reindexed) points array — drop the cache, it'll rebuild lazily.
-      if (s.points.length !== before) { s.segCache = undefined; s.bakedCache = null; }
-      if (s.rain) s.rain = s.rain.filter(i => (i.x - x) ** 2 + (i.y - y) ** 2 > r2);
+      if (s.points.length !== before) { s.segCache = undefined; s.bakedCache = null; strokeSerCache.delete(s); }
+      if (s.rain) {
+        const rainBefore = s.rain.length;
+        s.rain = s.rain.filter(i => (i.x - x) ** 2 + (i.y - y) ** 2 > r2);
+        rainCountRef.current -= rainBefore - s.rain.length;
+      }
     }
     layer.strokes = layer.strokes.filter(s => s.points.length > 0);
   }, []);
@@ -1191,20 +1237,11 @@ function IndexInner() {
       const t = now / 1000;
 
       // Rain shares one global budget across the scene (caps total particle COUNT once truly
-      // enormous — doesn't touch any individual particle's look). Kept as an exact scan rather than
-      // an incrementally-tracked running total: undo/redo, clear, and layer deletion can all remove
-      // whole strokes (and their rain) without going through pixelRain's own spawn/despawn code, so
-      // a running counter could silently drift and change how much rain is allowed to spawn later —
-      // a real visual difference, not just a performance one. This scan itself is cheap compared to
-      // the actual per-particle rendering below.
-      let existingRain = 0;
-      for (const layer of layersRef.current) {
-        if (!layer.visible) continue;
-        for (const s of layer.strokes) {
-          if (s.rain) existingRain += s.rain.length;
-        }
-      }
-      bufObj.rainBudget.left = Math.max(0, GLOBAL_RAIN_CAP - existingRain);
+      // enormous — doesn't touch any individual particle's look). PERF: reads the incrementally
+      // maintained rainCountRef instead of re-scanning every stroke on every layer every frame —
+      // see rainCountRef/recomputeRainCount above for how it's kept accurate across spawn/despawn
+      // AND the rare wholesale-removal paths (undo/redo/clear/delete-layer).
+      bufObj.rainBudget.left = Math.max(0, GLOBAL_RAIN_CAP - rainCountRef.current);
       const liveOpts: RenderOpts = { step: 1, rainBudget: bufObj.rainBudget };
       const bufferTarget = bufObj.bufferTarget;
 
@@ -1638,6 +1675,7 @@ function IndexInner() {
           seed: Math.random() * 1000,
         });
         opts.rainBudget.left--;
+        rainCountRef.current++;
       }
       for (let i = s.rain.length - 1; i >= 0; i--) {
         const r = s.rain[i];
@@ -1650,6 +1688,7 @@ function IndexInner() {
           const last = s.rain.length - 1;
           if (i !== last) s.rain[i] = s.rain[last];
           s.rain.pop();
+          rainCountRef.current--;
           continue;
         }
         const hueP = (r.hue + modeHueShift) % 360;
@@ -1661,92 +1700,53 @@ function IndexInner() {
     }
 
     else if (s.kind === "pixelDither") {
+      // REWRITE (not another patch): the old version drove which cells got painted off a formula
+      // summing several time-varying terms (a sine "sweep", a per-point phase jitter, a bayer term,
+      // a noise "grain" term, all then scaled by a coverage factor) into one threshold, compared
+      // against distance. Every one of those terms had already been individually "fixed" at least
+      // once for causing exactly this "fades to black" symptom, and it kept coming back — a sign
+      // the whole approach was fragile, not that any single constant was wrong. Some combination of
+      // slider values + wherever the sine landed at a given moment could always still sum to a
+      // threshold that (almost) nothing clears.
+      // This version's on/off decision is PURELY SPATIAL — a fixed 2x2 Bayer ordered-dither pattern
+      // keyed only by each cell's own grid position — with NO time term in it at all. So which cells
+      // are eligible to paint can never drift as the animation clock runs, no matter how long the
+      // stroke has been alive or what the sliders are set to. Time only affects the hue (a color
+      // shift, via modeHueShift below like every other brush) and a gentle brightness flicker — never
+      // whether a cell paints at all.
       const grid = Math.max(4, Math.round(s.size / 4));
-      // Amplitude was a full 0..1 swing, meaning at the extremes of every cycle a large fraction of
-      // cells simultaneously turned on/off together — that's what read as "glowing/straining the
-      // eyes" on top of the abruptness already fixed above. Narrowing the swing further (still
-      // centered so coverage/density keep their same average meaning) means fewer cells change
-      // state at once per cycle.
-      // FIX (this is the real cause of the brush intermittently going near-invisible/"black"
-      // regardless of any mode/brush setting elsewhere): the WHOLE canvas buffer is cleared to the
-      // background color every single frame and every stroke is fully repainted from scratch each
-      // time (see the buf32.fill(BG_PACKED) at the top of the render loop) — so this sweep isn't
-      // just a subtle texture wobble, it's the ONLY thing standing between "solid dithered fill"
-      // and "background shows through almost everywhere" on any given frame. At the bottom of the
-      // old ±0.14 swing, combined with a low/mid "Плотность", `threshold` could fall low enough
-      // that nearly every cell failed the distance check that frame — the whole stroke would go
-      // dark for that slice of the cycle, then "come back" as the sweep rose again. Narrower swing
-      // + a real coverage floor (never below 0.4) means there's always a solid core no matter where
-      // in the breathing cycle or density setting you are — it can still visibly pulse, just never
-      // collapse to nothing.
-      const sweep = 0.5 + 0.08 * Math.sin(tt * (0.35 + s.speed * 1.2) * Math.PI * 2);
       const stepPts = Math.max(1, Math.floor(pts.length / 40));
       const radius = s.size * (1 + s.dynamics * 1.5);
-      // PERF: offsets used to be recomputed with a nested dx/dy loop + Math.hypot EVERY frame for
-      // EVERY sampled point. They only depend on (grid, radius) which are constant for this stroke,
-      // so fetch the cached list once per stroke per frame instead.
       const offsets = getDitherOffsets(grid, radius);
-      // Balanced density: one knob, one effect. `coverage` now directly widens/narrows how much of
-      // the dither pattern fills in (density=0 → sparse, density=1 → fully solid), instead of density
-      // being applied TWICE — once via the sweep/threshold reveal below, AND again via an unrelated
-      // Math.random() cut re-rolled every single frame. That double gate is what made the brush look
-      // sparse and flickery even at max density (structurally capped around ~45% coverage no matter
-      // what) and barely visible at low density. The existing per-cell hash (`grain`) now stands in
-      // for the old Math.random() texture too, so a cell's on/off state holds steady frame to frame
-      // instead of strobing randomly.
-      const coverage = 0.4 + s.density * 0.6;
-      // A cell used to be a hard 0/1 (dist <= threshold ? fully painted : nothing), so as `sweep`
-      // moved, cells popped in/out fully-formed from one frame to the next — the "too sharp" part
-      // of the flicker. Fade each cell in/out over a narrow band instead of an instant cutoff, so
-      // the same motion reads as a soft edge — but kept NARROW: a wide fade band means, at some
-      // point in the sweep cycle, a large fraction of the whole painted area sits simultaneously
-      // in mid-transition (partially transparent) all at once, which is what read as sitewide
-      // "blur" during playback. Narrower band = far fewer cells in transition at any one instant.
-      // FIX: this had grown to 1.4x, which for a typical brush size makes edgeWidth (0.3-0.4) cover
-      // most of dist's whole 0..1 range — almost every painted cell then sits somewhere in the soft
-      // fade band and never reaches fade=1 (full opacity). Composited over the near-black canvas
-      // background, that reads as "draws solid black" — the color is technically there, just at
-      // alpha low enough to be invisible. Back to a narrow band: enough to still avoid the old hard
-      // pop-in/out flicker, but small enough that most of the covered area is a real solid core.
-      const edgeWidth = Math.max(1e-4, (grid / radius) * 0.3);
+      // 2x2 Bayer matrix, expressed as a 0..3 "on rank" per cell: density picks how many of those 4
+      // ranks are lit. density=0 still lights rank 0 (1-in-4 cells — a real, visible sparse texture,
+      // never zero), density=1 lights all 4 (fully solid). Purely a lookup on fixed integers — no
+      // sum of floats that could round to something degenerate.
+      const bayer2x2 = [[0, 2], [3, 1]];
+      const litRanks = Math.max(1, Math.round(1 + s.density * 3)); // 1..4 ranks lit
       for (let pi = 0; pi < pts.length; pi += stepPts) {
         const p = pts[pi];
         const hueD = hueAt(pi);
         const cx = Math.round(p.x / grid) * grid;
         const cy = Math.round(p.y / grid) * grid;
-        // Every sampled point used the exact same `sweep` value, so each point's "fade ring" (the
-        // cells currently mid-transition, at dist ~= threshold) sat at the identical relative
-        // distance from its own center. When points are close together (dense/solid coverage),
-        // those rings line up across neighboring points into one continuous seam of dimmer cells
-        // cutting through an otherwise solid area — the "band of dark circles" artifact. A small
-        // per-point phase offset (stable across frames, since it's derived from the point's own
-        // index rather than time) staggers each point's ring to a slightly different radius, so
-        // adjacent points' rings no longer align into a straight seam.
-        const pointJitter = (noiseAt(pi * 17 + 3) - 0.5) * 0.16;
-        const sweepP = sweep + pointJitter;
         for (const off of offsets) {
           const gx = cx + off.dx, gy = cy + off.dy;
-          const bayer = (((gx / grid) & 1) ^ ((gy / grid) & 1));
-          const dist = off.dist;
+          const dist = off.dist; // 0 (center) .. 1 (brush edge)
+          const bx = (((gx / grid) % 2) + 2) % 2;
+          const by = (((gy / grid) % 2) + 2) % 2;
+          const rank = bayer2x2[bx][by];
+          if (rank >= litRanks) continue;
+          // Soft round brush edge — independent of the on/off pattern above, so it only ever makes
+          // the shape's rim fade out, never removes the solid core in the middle.
+          const edgeFade = 1 - dist;
+          if (edgeFade <= 0) continue;
+          // Stable per-cell brightness variation (purely spatial, same noiseAt already used
+          // elsewhere) plus a gentle time-based flicker for visual life — this only ever brightens
+          // or dims an already-painted cell, it can't be the reason a cell fails to paint.
           const grain = noiseAt(gx + gy * 7);
-          // grain's weight no longer depends ENTIRELY on the noise slider — a small fixed baseline
-          // (0.15) is always present, so even at noise=0 cells don't all sit at the identical
-          // threshold and flip in lockstep across the whole area; noise still adds MORE per-cell
-          // variation on top of that baseline.
-          const threshold = (sweepP + bayer * 0.4 + grain * (0.15 + s.noise * 0.4)) * coverage;
-          const edge = threshold - dist;
-          if (edge <= -edgeWidth) continue;
-          const fade = Math.max(0, Math.min(1, (edge + edgeWidth) / (2 * edgeWidth)));
-          if (fade <= 0) continue;
-          // FIX: lit AND alpha both used to also scale by (1-dist) on top of `fade` — the same
-          // "radial blur" bug already found and fixed in Мозаика, just missed here. Nearly every
-          // covered cell sits at some real distance from its sample point, so almost the whole
-          // shape was getting darkened twice (once by the edge fade, once by raw distance) — on the
-          // near-black canvas background that reads as "draws solid black" even though `fade` alone
-          // was already fixed. Flat now: brightness varies only by the tile's own fixed grain, alpha
-          // only by the actual edge transition — a real solid dithered fill, not a radial smudge.
-          const lit = 48 + grain * 14;
-          paint(target, gx, gy, grid, grid, hueD + (bayer ? 30 : 0), 85, lit, alphaMul * fade);
+          const flicker = 0.85 + 0.15 * Math.sin(tt * (0.6 + s.speed * 1.5) + grain * 6.28);
+          const lit = (46 + grain * 16) * flicker;
+          paint(target, gx, gy, grid, grid, hueD + modeHueShift + (rank % 2 ? 20 : 0), 85, lit, alphaMul * edgeFade);
         }
       }
     }
@@ -2036,6 +2036,7 @@ function IndexInner() {
       // Indices are completely reshuffled by decimation — drop the segment cache, it rebuilds
       // lazily from the new point layout on the next frame.
       s.segCache = undefined;
+      strokeSerCache.delete(s);
     }
   };
 
@@ -2198,7 +2199,7 @@ function IndexInner() {
             if (!selectedIdsRef.current.has(s.id)) continue;
             for (const p of s.points) { p.x += dx; p.y += dy; }
             // Geometry moved — cached per-segment offsets/baked pixels no longer line up.
-            s.segCache = undefined; s.bakedCache = null;
+            s.segCache = undefined; s.bakedCache = null; strokeSerCache.delete(s);
           }
         }
         moveDragRef.current = { lastX: x, lastY: y };
@@ -2271,6 +2272,7 @@ function IndexInner() {
     layersRef.current = next;
     setLayers(next);
     if (activeLayerIdRef.current === id) setActiveLayerId(next[0].id);
+    recomputeRainCount();
     pushHistory();
   };
   const toggleLayer = (id: number) => {
@@ -2282,12 +2284,14 @@ function IndexInner() {
     const next = layersRef.current.map(l => l.id === activeLayerIdRef.current ? { ...l, strokes: [] } : l);
     layersRef.current = next;
     setLayers(next);
+    recomputeRainCount();
     pushHistory();
   };
   const clearAll = () => {
     const next = layersRef.current.map(l => ({ ...l, strokes: [] }));
     layersRef.current = next;
     setLayers(next);
+    recomputeRainCount();
     pushHistory();
   };
 
@@ -2347,6 +2351,7 @@ function IndexInner() {
     historyRef.current = [serializeLayers(next)];
     historyIdxRef.current = 0;
     setHistoryVer(v => v + 1);
+    recomputeRainCount();
     // The old layer's strokes are gone — any selection/marquee/in-progress transform pointing at
     // them needs clearing too, or the selection overlay and its handles keep trying to read strokes
     // that no longer exist in any layer.
@@ -3080,3 +3085,4 @@ function IndexInner() {
     </main>
   );
 }
+
