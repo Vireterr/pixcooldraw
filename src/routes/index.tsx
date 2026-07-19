@@ -54,10 +54,7 @@ interface Stroke {
   rainbowBlinkSpeed: number;
   gradientSpeed: number;
   gradientScale: number;
-  // `alpha` optional per-stop, defaulting to 1 for strokes/presets saved before this field existed
-  // — lets a stop fade toward transparent (e.g. a gradient that dissolves at one end), matching
-  // the reference project's per-stop alpha.
-  gradientColors: { hue: number; weight: number; alpha?: number }[];
+  gradientColors: { hue: number; weight: number }[];
   gradientAngle: number;
   // Set once when the stroke is created from the "Анимация" toggle's state at that moment — frozen
   // strokes render with time locked to their birth instant, so they paint once and never animate
@@ -272,47 +269,6 @@ function sampleGradient(stops: { hue: number; weight: number }[], t: number): nu
   return (c0 + diff * frac + 360) % 360;
 }
 
-// Reference-project-style gradient color: unlike sampleGradient above (hue only, shortest
-// angular path — good for the live hue-only ramp used elsewhere), this blends the STOPS' full
-// color in RGB space, exactly like a canvas createLinearGradient does between color stops — which
-// is what the reference project's gradient actually looked like (it rendered into an offscreen
-// canvas and used a real linear gradient). Rebuilt here as plain math instead of an offscreen
-// canvas + composite, since most of our paint targets are raw pixel buffers, not a 2D context.
-// `fallbackS`/`fallbackL` cover stops saved before per-stop saturation/lightness existed (there
-// still isn't a UI control for those — every stop currently shares the stroke's own Насыщенность/
-// Светлота — so this parameter exists for forward-compatibility if that's ever added, not because
-// stops carry it yet). Alpha per stop DOES already have a UI control, defaulting to 1.
-function sampleGradientRGB(
-  stops: { hue: number; weight: number; alpha?: number }[],
-  t: number, fallbackS: number, fallbackL: number,
-): [number, number, number, number] {
-  const n = stops.length;
-  if (n === 0) return [255, 255, 255, 1];
-  const totalW = stops.reduce((a, s) => a + Math.max(0.05, s.weight), 0);
-  const norm = ((t % 1) + 1) % 1;
-  if (n === 1) { const [r, g, b] = hslToRgb(stops[0].hue, fallbackS, fallbackL); return [r, g, b, stops[0].alpha ?? 1]; }
-  let acc = 0;
-  let idx = n - 1;
-  let segStart = 0, segEnd = 1;
-  for (let i = 0; i < n; i++) {
-    const w = Math.max(0.05, stops[i].weight) / totalW;
-    const next = acc + w;
-    if (norm < next || i === n - 1) { idx = i; segStart = acc; segEnd = next; break; }
-    acc = next;
-  }
-  const frac = segEnd > segStart ? (norm - segStart) / (segEnd - segStart) : 0;
-  const s0 = stops[idx], s1 = stops[(idx + 1) % n];
-  const [r0, g0, b0] = hslToRgb(s0.hue, fallbackS, fallbackL);
-  const [r1, g1, b1] = hslToRgb(s1.hue, fallbackS, fallbackL);
-  const a0 = s0.alpha ?? 1, a1 = s1.alpha ?? 1;
-  return [
-    r0 + (r1 - r0) * frac,
-    g0 + (g1 - g0) * frac,
-    b0 + (b1 - b0) * frac,
-    a0 + (a1 - a0) * frac,
-  ];
-}
-
 // ==== PERF: pixel-buffer painting (replaces per-pixel ctx.fillStyle/fillRect calls) ====
 // Every brush used to do `ctx.fillStyle = \`hsla(...)\`; ctx.fillRect(x,y,w,h);` per pixel-block —
 // building and parsing a color string on the canvas API is real, measurable overhead at thousands
@@ -375,18 +331,6 @@ interface PaintTarget {
   // 0..1 — how much the "Хром" sheen's hue rotates as it sweeps (see paint()'s chrome branch).
   // Driven by the stroke's own "Шум" slider; 0 = plain single-hue metal.
   chromeColorAmt?: number;
-  // Full-color (RGB+alpha) gradient ramp for "Градиент" mode — see the gradientSet block in
-  // renderStroke for how these are built (once per stroke per frame) and the target.gradR branch
-  // in paint() for how they're consumed. gradR being unset means the mode is off.
-  gradR?: Float32Array;
-  gradG?: Float32Array;
-  gradB?: Float32Array;
-  gradA?: Float32Array;
-  gradCos?: number;
-  gradSin?: number;
-  gradExtent?: number;
-  gradScale?: number;
-  gradTravel?: number;
 }
 function hslToRgb(h: number, s: number, l: number): [number, number, number] {
   h = ((h % 360) + 360) % 360;
@@ -503,19 +447,6 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
     x += (Math.random() - 0.5) * target.spray;
     y += (Math.random() - 0.5) * target.spray;
   }
-  // Generic "Градиент" mode: full per-stop RGB+alpha color, looked up from the ramp built once per
-  // stroke per frame (see the gradientSet block in renderStroke) — reproduces the reference
-  // project's real linear-gradient look without needing an offscreen canvas per stroke. Early
-  // return like glitchSplit/rgbShift below: this REPLACES the color entirely rather than
-  // reshaping h/s/l, since the gradient's own stops decide the real color, not whatever the brush
-  // happened to compute for this pixel.
-  if (target.gradR) {
-    const proj = ((x * (target.gradCos ?? 1) + y * (target.gradSin ?? 0)) / (target.gradExtent ?? 1)) * (target.gradScale ?? 1) + (target.gradTravel ?? 0);
-    const norm = ((proj % 1) + 1) % 1;
-    const idx = Math.min(target.gradR.length - 1, Math.floor(norm * target.gradR.length));
-    paintRGB(target, x, y, sizeW, sizeH, target.gradR[idx], target.gradG![idx], target.gradB![idx], a * target.gradA![idx]);
-    return;
-  }
   // Generic "Хром" mode: recolor toward a metallic sheen BEFORE the real color is computed —
   // unlike spray/glitchSplit/rgbShift above, this doesn't fork into multiple paint calls, it just
   // reshapes h/s/l for the one call about to happen. `band` is a plain sine of a spatial
@@ -549,19 +480,13 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
   // hue, each copy offset a few pixels apart along x — a spatial misalignment (like a badly
   // registered color print), not a color that cycles over time. This is exactly what the
   // pixelGlitch brush used to do only for itself; living here means every brush gets it.
-  // Coloring matches the reference project's version exactly: each of the 3 copies uses a FIXED
-  // lightness (55%) and a flat 0.55 alpha multiplier, rather than passing the stroke's own l/a
-  // straight through — that's what gives the punchy, consistent "misregistered print" look instead
-  // of the tri-color split just looking like the same brush with three faint hue-shifted echoes.
   if (target.glitchSplit) {
     const off = target.glitchSplit;
-    const [r0, g0, b0] = getHslRgb(h, s, 55);
-    const [r1, g1, b1] = getHslRgb((h + 120) % 360, s, 55);
-    const [r2, g2, b2] = getHslRgb((h + 240) % 360, s, 55);
-    const aG = a * 0.55;
-    paintRGB(target, x - off, y, sizeW, sizeH, r0, g0, b0, aG);
-    paintRGB(target, x, y, sizeW, sizeH, r1, g1, b1, aG);
-    paintRGB(target, x + off, y, sizeW, sizeH, r2, g2, b2, aG);
+    const [r1, g1, b1] = getHslRgb((h + 120) % 360, s, l);
+    const [r2, g2, b2] = getHslRgb((h + 240) % 360, s, l);
+    paintRGB(target, x - off, y, sizeW, sizeH, r, g, b, a);
+    paintRGB(target, x, y, sizeW, sizeH, r1, g1, b1, a);
+    paintRGB(target, x + off, y, sizeW, sizeH, r2, g2, b2, a);
     return;
   }
   // Generic "RGB сдвиг" mode: instead of one flat-colored blit, split the real color into its r/g/b
@@ -695,19 +620,9 @@ function computeFloodMask(
 ): Uint8Array {
   const mask = new Uint8Array(w * h);
   const [tr, tg, tb] = pixelAt(buf, w, sx, sy);
-  // REWORKED (per reference project): real Euclidean color distance instead of taking the max of
-  // the three channel differences. With max(), one channel being far off was enough to reject a
-  // pixel outright even if the other two channels matched closely — e.g. an anti-aliased edge
-  // pixel that's mostly the fill color but nudged in blue would fail purely on that one channel.
-  // Euclidean combines all three into one overall "how different is this color, really" measure,
-  // which is what "Допуск" actually reads as intuitively — a single combined similarity budget,
-  // not three independent per-channel gates. tolerance²×3 keeps the same per-channel scale as
-  // before (a tolerance of T still exactly passes a pixel that's off by T in only one channel).
-  const tol2 = tolerance * tolerance * 3;
   const matches = (x: number, y: number) => {
     const idx = (y * w + x) * 4;
-    const dr = buf[idx] - tr, dg = buf[idx + 1] - tg, db = buf[idx + 2] - tb;
-    return dr * dr + dg * dg + db * db <= tol2;
+    return Math.max(Math.abs(buf[idx] - tr), Math.abs(buf[idx + 1] - tg), Math.abs(buf[idx + 2] - tb)) <= tolerance;
   };
   if (!contiguous) {
     for (let i = 0, y = 0; y < h; y++) for (let x = 0; x < w; x++, i++) if (matches(x, y)) mask[i] = 1;
@@ -1017,7 +932,7 @@ function IndexInner() {
   // the same cycle more times (a tighter, more compressed band pattern), lower values stretch a
   // single cycle out past the visible area.
   const [gradientScale, setGradientScale] = useState(1);
-  const [gradientColors, setGradientColors] = useState<{ hue: number; weight: number; alpha?: number }[]>([
+  const [gradientColors, setGradientColors] = useState<{ hue: number; weight: number }[]>([
     { hue: 200, weight: 1 }, { hue: 320, weight: 1 }, { hue: 60, weight: 1 },
   ]);
   const [gradientAngle, setGradientAngle] = useState(0);
@@ -1465,28 +1380,6 @@ function IndexInner() {
       const proj = ((x * gradCos + y * gradSin) / gradExtent) * s.gradientScale;
       return gradHueRampAt(proj + gradTravel);
     };
-    // Full-color (RGB+alpha, not just hue) gradient, generic at the paint()-call level — same
-    // pattern as chrome/glitch/rgbShift above, and reusing the exact same "build a small ramp once
-    // per stroke per frame" trick as gradHueRamp just above, just carrying real color instead of a
-    // single hue channel. This is the piece that actually reproduces the reference project's look
-    // (real per-stop color+alpha blended in RGB space) — gradHueRamp above stays untouched/still
-    // used by a few brushes for their OWN hue pick, but whatever hue those brushes compute gets
-    // overridden the instant paint() sees this ramp is set (see the target.gradR branch there), so
-    // there's no double-application, just some now-unused hue math left harmlessly in place.
-    const gradientSet = s.mode === "gradient";
-    if (gradientSet) {
-      const gradR = new Float32Array(GRAD_RAMP_N), gradG = new Float32Array(GRAD_RAMP_N);
-      const gradB = new Float32Array(GRAD_RAMP_N), gradA = new Float32Array(GRAD_RAMP_N);
-      for (let k = 0; k < GRAD_RAMP_N; k++) {
-        // No per-stroke saturation/lightness field exists to fall back to (each brush hardcodes
-        // its own, e.g. 85/55) — 85/60 matches the typical values already used across brushes.
-        const [r, g, bch, av] = sampleGradientRGB(s.gradientColors, k / GRAD_RAMP_N, 85, 60);
-        gradR[k] = r; gradG[k] = g; gradB[k] = bch; gradA[k] = av;
-      }
-      target.gradR = gradR; target.gradG = gradG; target.gradB = gradB; target.gradA = gradA;
-      target.gradCos = gradCos; target.gradSin = gradSin; target.gradExtent = gradExtent;
-      target.gradScale = s.gradientScale; target.gradTravel = gradTravel;
-    }
     // "Глитч" mode: moved here from the brush per feedback — this used to be baked into the
     // pixelGlitch BRUSH's own coloring (three offset copies of the same paint() call, tinted
     // 0°/+120°/+240°, drawn a few pixels apart). That's exactly why it read as a real misaligned
@@ -2015,7 +1908,6 @@ function IndexInner() {
       if (rgbShiftSet) { target.rgbShift = undefined; }
       if (glitchSplitSet) { target.glitchSplit = undefined; }
       if (chromeSet) { target.chromeFreq = undefined; target.chromeCos = undefined; target.chromeSin = undefined; target.chromePhase = undefined; target.chromeColorAmt = undefined; }
-      if (gradientSet) { target.gradR = undefined; target.gradG = undefined; target.gradB = undefined; target.gradA = undefined; target.gradCos = undefined; target.gradSin = undefined; target.gradExtent = undefined; target.gradScale = undefined; target.gradTravel = undefined; }
     }
   }
 
@@ -2945,18 +2837,6 @@ function IndexInner() {
                     className="w-full accent-white"
                     title="Тяжесть этого цвета в смеси"
                   />
-                  <input
-                    type="range"
-                    min={0}
-                    max={100}
-                    value={Math.round((c.alpha ?? 1) * 100)}
-                    onChange={(e) => {
-                      const alpha = +e.target.value / 100;
-                      setGradientColors(cols => cols.map((cc, ci) => ci === i ? { ...cc, alpha } : cc));
-                    }}
-                    className="w-full accent-white"
-                    title="Прозрачность этого цвета"
-                  />
                   <span className="w-8 shrink-0 text-right text-[10px] tabular-nums text-white/50">{sharePct}%</span>
                   {gradientColors.length > 2 && (
                     <button
@@ -2972,7 +2852,7 @@ function IndexInner() {
               })}
               {gradientColors.length < 6 && (
                 <button
-                  onClick={() => setGradientColors(cols => [...cols, { hue: Math.round(Math.random() * 360), weight: 1, alpha: 1 }])}
+                  onClick={() => setGradientColors(cols => [...cols, { hue: Math.round(Math.random() * 360), weight: 1 }])}
                   className="w-full rounded border border-dashed border-white/30 py-1 text-[10px] text-white/50 hover:border-white/60 hover:text-white"
                 >
                   + Добавить цвет
