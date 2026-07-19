@@ -2093,31 +2093,57 @@ function IndexInner() {
     }
 
     if (refs.brush.current === "fill") {
-      // Bucket fill is a single click, not a draggable stroke — it reads whatever is actually
-      // composited on screen right now (not brush history) and commits its result immediately.
       pointerRef.current.down = false;
       const layerF = layersRef.current.find(l => l.id === activeLayerIdRef.current);
       if (!layerF || !layerF.visible) return;
-      const bufObj = pixelBufRef.current;
-      if (!bufObj) return;
+
       const w = canvasSize.w, h = canvasSize.h;
       const sx = Math.min(w - 1, Math.max(0, Math.round(x)));
       const sy = Math.min(h - 1, Math.max(0, Math.round(y)));
-      const mask = computeFloodMask(bufObj.data, w, h, sx, sy, refs.fillTolerance.current, refs.fillContiguous.current);
-      // Re-filling the same spot used to just stack another animated fill stroke on top forever —
-      // every earlier fill of that area stayed alive, fully hidden under the new one but still
-      // fully rendered (and for gradient/rainbow, fully re-animated: its own per-pixel ramp +
-      // bbox loop) every single frame from then on. Click fill in the same place 5 times and 5
-      // fills' worth of invisible-but-not-free work was happening every frame forever after. A real
-      // bucket-fill tool REPLACES what was there — so any existing fill on this layer whose mask
-      // already covers the point just clicked is removed here: you're standing inside it, so it's
-      // about to be completely covered by the new one anyway.
+
+      // === Рисуем только текущий слой отдельно, без других слоёв ===
+      const tmpBuf = new Uint8ClampedArray(w * h * 4);
+      tmpBuf.fill(0);
+      const tmpTarget: PaintTarget = {
+        mode: "buffer",
+        buf: tmpBuf,
+        buf32: new Uint32Array(tmpBuf.buffer),
+        bw: w,
+        bh: h
+      };
+
+      // Картинка слоя
+      if (layerF.image) {
+        const imgPixels = ensureLayerImagePixels(layerF, w, h);
+        if (imgPixels) {
+          for (let i = 0; i < imgPixels.length; i++) {
+            tmpBuf[i] = imgPixels[i];
+          }
+        }
+      }
+
+      // Все мазки текущего слоя
+      const nowF = performance.now();
+      for (const s of layerF.strokes) {
+        if (s.points.length === 0) continue;
+        const effT = s.frozen ? s.born / 1000 : nowF / 1000;
+        const effDt = s.frozen ? 0 : 16;
+        const effNow = s.frozen ? s.born : nowF;
+        renderStroke(tmpTarget, s, w, h, effT, effDt, effNow, FULL_QUALITY_OPTS);
+      }
+      // === Конец отдельного рендера ===
+
+      // Заливка смотрит только на текущий слой, а не на весь экран
+      const mask = computeFloodMask(tmpBuf, w, h, sx, sy, refs.fillTolerance.current, refs.fillContiguous.current);
+
+      // Удаляем старые заливки в этой же точке
       for (let i = layerF.strokes.length - 1; i >= 0; i--) {
         const old = layerF.strokes[i];
         if (old.kind !== "fill" || old.fillW !== w || old.fillH !== h) continue;
         const oldMask = old.fillMaskCache ?? (old.fillRuns ? decodeMaskRLE(old.fillRuns, w * h) : null);
         if (oldMask && oldMask[sy * w + sx]) layerF.strokes.splice(i, 1);
       }
+
       const fillStroke: Stroke = {
         id: ++strokeIdCounter,
         kind: "fill",
@@ -2138,8 +2164,6 @@ function IndexInner() {
         gradientColors: refs.gradientColors.current.map(c => ({ ...c })),
         gradientAngle: refs.gradientAngle.current,
         frozen: !refs.animEnabled.current,
-        // Single point, purely so the generic "empty stroke" skip-checks elsewhere don't drop this
-        // fill — its actual painted area comes entirely from fillRuns, never from points/segments.
         points: [{ x: sx, y: sy, t: 0 }],
         born: performance.now(),
         fillRuns: encodeMaskRLE(mask),
