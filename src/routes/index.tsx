@@ -1403,10 +1403,8 @@ function IndexInner() {
 
     if (s.kind === "fill") {
       const bw = w, bh = h;
-      // Canvas was resized since this fill was made — the mask no longer lines up with pixel
-      // positions, so skip rather than smear stale data across a differently-sized canvas.
       if (s.fillW !== bw || s.fillH !== bh) return;
-      if (!s.fillMaskCache) {
+      if (!s.fillMaskCache || s.fillMaskCache.length !== bw * bh) {
         s.fillMaskCache = decodeMaskRLE(s.fillRuns!, bw * bh);
         let bx0 = bw, by0 = bh, bx1 = -1, by1 = -1;
         const m = s.fillMaskCache;
@@ -1423,12 +1421,12 @@ function IndexInner() {
       }
       const mask = s.fillMaskCache;
       const { x0: bx0, y0: by0, x1: bx1, y1: by1 } = s.fillBBox!;
-      const alpha = Math.min(1, 0.3 + s.intensity * 0.8) * modePulse;
+      if (bx1 <= bx0 || by1 <= by0) return;
+
+      // Fill всегда полностью непрозрачный — перекрывает всё под ним
+      const alpha = 1.0;
 
       if (s.mode === "gradient") {
-        // Precompute a coarse hue ramp along the gradient's projection axis ONCE per frame instead
-        // of calling sampleGradient()+hslToRgb() per pixel — a fill can cover hundreds of thousands
-        // of pixels, so per-pixel trig/interpolation every frame would be far too slow.
         const RAMP = 96;
         const ramp: [number, number, number][] = new Array(RAMP);
         for (let k = 0; k < RAMP; k++) {
@@ -1437,29 +1435,25 @@ function IndexInner() {
         }
         if (target.mode === "buffer") {
           const buf = target.buf!;
-          const ia = 1 - alpha;
           for (let yy = by0; yy < by1; yy++) {
-            let mi = yy * bw + bx0;
-            for (let xx = bx0; xx < bx1; xx++, mi++) {
+            for (let xx = bx0; xx < bx1; xx++) {
+              const mi = yy * bw + xx;
               if (!mask[mi]) continue;
               const proj = ((xx * gradCos + yy * gradSin) / gradExtent) * s.gradientScale + gradTravel;
               const norm = ((proj % 1) + 1) % 1;
               const [r, g, b] = ramp[Math.min(RAMP - 1, Math.floor(norm * RAMP))];
               const idx = mi * 4;
-              buf[idx] = r * alpha + buf[idx] * ia;
-              buf[idx + 1] = g * alpha + buf[idx + 1] * ia;
-              buf[idx + 2] = b * alpha + buf[idx + 2] * ia;
+              buf[idx] = r;
+              buf[idx + 1] = g;
+              buf[idx + 2] = b;
               buf[idx + 3] = 255;
             }
           }
         } else if (target.mode === "iso") {
-          // Bake path — runs once per frozen fill instead of every frame, so real per-pixel alpha
-          // compositing (needed to seed the isolated buffer correctly) is affordable here even
-          // though the "buffer" fast path above skips it as unnecessary overhead for live redraw.
           const buf = target.buf!, alphaBuf = target.alphaBuf!;
           for (let yy = by0; yy < by1; yy++) {
-            let mi = yy * bw + bx0;
-            for (let xx = bx0; xx < bx1; xx++, mi++) {
+            for (let xx = bx0; xx < bx1; xx++) {
+              const mi = yy * bw + xx;
               if (!mask[mi]) continue;
               const proj = ((xx * gradCos + yy * gradSin) / gradExtent) * s.gradientScale + gradTravel;
               const norm = ((proj % 1) + 1) % 1;
@@ -1468,8 +1462,6 @@ function IndexInner() {
             }
           }
         } else {
-          // Export path — runs far less often than live playback, fine to go through the shared
-          // paint() helper at full per-pixel precision.
           for (let yy = by0; yy < by1; yy++) {
             for (let xx = bx0; xx < bx1; xx++) {
               if (!mask[yy * bw + xx]) continue;
@@ -1478,21 +1470,18 @@ function IndexInner() {
           }
         }
       } else {
-        // normal / rainbow / pulse: one solid (possibly time-shifting) color for the whole fill —
-        // same "wash" behavior these modes always had for Заливка, just restricted to the mask.
         const hueF = hueAt(0, 0);
         if (target.mode === "buffer") {
           const [r, g, b] = getHslRgb(hueF, 85, 55);
           const buf = target.buf!;
-          const ia = 1 - alpha;
           for (let yy = by0; yy < by1; yy++) {
-            let mi = yy * bw + bx0;
-            for (let xx = bx0; xx < bx1; xx++, mi++) {
+            for (let xx = bx0; xx < bx1; xx++) {
+              const mi = yy * bw + xx;
               if (!mask[mi]) continue;
               const idx = mi * 4;
-              buf[idx] = r * alpha + buf[idx] * ia;
-              buf[idx + 1] = g * alpha + buf[idx + 1] * ia;
-              buf[idx + 2] = b * alpha + buf[idx + 2] * ia;
+              buf[idx] = r;
+              buf[idx + 1] = g;
+              buf[idx + 2] = b;
               buf[idx + 3] = 255;
             }
           }
@@ -1500,8 +1489,8 @@ function IndexInner() {
           const [r, g, b] = getHslRgb(hueF, 85, 55);
           const buf = target.buf!, alphaBuf = target.alphaBuf!;
           for (let yy = by0; yy < by1; yy++) {
-            let mi = yy * bw + bx0;
-            for (let xx = bx0; xx < bx1; xx++, mi++) {
+            for (let xx = bx0; xx < bx1; xx++) {
+              const mi = yy * bw + xx;
               if (!mask[mi]) continue;
               blendIsoPixel(buf, alphaBuf, mi * 4, mi, r, g, b, alpha);
             }
